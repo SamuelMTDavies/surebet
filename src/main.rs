@@ -8,7 +8,6 @@
 //! since it's unlikely the user will rapidly cause new fetches, but it's something to keep in mind.
 
 use dioxus::prelude::*;
-use std::collections::HashMap;
 
 fn main() {
     launch(app);
