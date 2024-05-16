@@ -16,7 +16,7 @@ fn main() {
 fn app() -> Element {
     // Breed is a signal that will be updated when the user clicks a breed in the list
     // `deerhound` is just a default that we know will exist. We could also use a `None` instead
-    let mut breed = use_signal(|| "kelpie".to_string());
+    let breed = use_signal(|| "kelpie".to_string());
 
     // Fetch the list of breeds from the Dog API
     // Since there are no dependencies, this will never restart
