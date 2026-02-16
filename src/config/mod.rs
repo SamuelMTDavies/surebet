@@ -20,6 +20,8 @@ pub struct Config {
     #[serde(default)]
     pub arb: ArbConfig,
     #[serde(default)]
+    pub maker: MakerStrategyConfig,
+    #[serde(default)]
     pub feeds: FeedsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -89,6 +91,64 @@ pub struct ArbConfig {
     /// Max total USDC exposure.
     #[serde(default = "default_max_exposure")]
     pub max_total_exposure: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MakerStrategyConfig {
+    /// Enable the passive maker strategy.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Target bid sum as fraction of $1.00 (lower = more edge, less fill).
+    #[serde(default = "default_target_bid_sum")]
+    pub target_bid_sum: f64,
+    /// Order size in shares per leg.
+    #[serde(default = "default_order_size")]
+    pub order_size: f64,
+    /// Minimum spread to post into.
+    #[serde(default = "default_maker_min_spread")]
+    pub min_spread: f64,
+    /// Maximum inventory imbalance before pausing.
+    #[serde(default = "default_max_imbalance")]
+    pub max_inventory_imbalance: f64,
+    /// Requote interval in seconds.
+    #[serde(default = "default_requote_interval")]
+    pub requote_interval_secs: u64,
+    /// Minimum price change to trigger requote.
+    #[serde(default = "default_requote_threshold")]
+    pub requote_threshold: f64,
+}
+
+fn default_target_bid_sum() -> f64 {
+    0.97
+}
+fn default_order_size() -> f64 {
+    10.0
+}
+fn default_maker_min_spread() -> f64 {
+    0.02
+}
+fn default_max_imbalance() -> f64 {
+    50.0
+}
+fn default_requote_interval() -> u64 {
+    5
+}
+fn default_requote_threshold() -> f64 {
+    0.01
+}
+
+impl Default for MakerStrategyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_bid_sum: default_target_bid_sum(),
+            order_size: default_order_size(),
+            min_spread: default_maker_min_spread(),
+            max_inventory_imbalance: default_max_imbalance(),
+            requote_interval_secs: default_requote_interval(),
+            requote_threshold: default_requote_threshold(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,6 +307,7 @@ impl Config {
             },
             filters: FilterConfig::default(),
             arb: ArbConfig::default(),
+            maker: MakerStrategyConfig::default(),
             feeds: FeedsConfig::default(),
             logging: LoggingConfig::default(),
         }

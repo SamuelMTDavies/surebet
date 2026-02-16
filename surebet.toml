@@ -34,6 +34,22 @@ max_position_usd = 100.0
 # Max total USDC across all open positions
 max_total_exposure = 500.0
 
+[maker]
+# Enable passive market-making strategy (posts bids on both sides of binary markets)
+enabled = false
+# Target bid sum as fraction of $1.00 (0.97 = $0.03 edge per round-trip)
+target_bid_sum = 0.97
+# Order size in shares per leg
+order_size = 10.0
+# Minimum spread to post into (won't make in very tight markets)
+min_spread = 0.02
+# Maximum inventory imbalance before pausing a side
+max_inventory_imbalance = 50.0
+# Requote interval in seconds
+requote_interval_secs = 5
+# Minimum price change to trigger a requote
+requote_threshold = 0.01
+
 [feeds]
 # Enable Binance/Coinbase price feeds for Chainlink oracle prediction
 enabled = false

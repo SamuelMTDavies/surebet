@@ -7,6 +7,7 @@ mod orderbook;
 mod ws;
 
 use crate::arb::executor::{ArbExecutor, RiskLimits};
+use crate::arb::maker::{MakerConfig, MakerEvent, MakerStrategy};
 use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
 use crate::auth::{ClobApiClient, L2Credentials};
 use crate::config::Config;
@@ -174,6 +175,61 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("arb executor in paper mode (set arb.execute=true to go live)");
+    }
+
+    // --- Maker Strategy ---
+    let (maker_tx, mut maker_rx) = mpsc::unbounded_channel::<MakerEvent>();
+
+    // The maker needs its own tracked_markets clone since it moves into a task
+    let maker_markets: Vec<TrackedMarket> = markets
+        .iter()
+        .filter_map(TrackedMarket::from_gamma)
+        .collect();
+
+    if config.maker.enabled {
+        if let Some(ref api) = api_client {
+            let mc = &config.maker;
+            let maker_config = MakerConfig {
+                target_bid_sum: Decimal::from_str(&mc.target_bid_sum.to_string())
+                    .unwrap_or(Decimal::from_str("0.97").unwrap()),
+                order_size: Decimal::from_str(&mc.order_size.to_string())
+                    .unwrap_or(Decimal::from(10)),
+                min_spread: Decimal::from_str(&mc.min_spread.to_string())
+                    .unwrap_or(Decimal::from_str("0.02").unwrap()),
+                max_inventory_imbalance: Decimal::from_str(&mc.max_inventory_imbalance.to_string())
+                    .unwrap_or(Decimal::from(50)),
+                requote_interval: Duration::from_secs(mc.requote_interval_secs),
+                requote_threshold: Decimal::from_str(&mc.requote_threshold.to_string())
+                    .unwrap_or(Decimal::from_str("0.01").unwrap()),
+            };
+
+            let mut maker = MakerStrategy::new(
+                api.clone(),
+                store.clone(),
+                maker_config,
+                maker_tx,
+            );
+            maker.add_markets(&maker_markets);
+
+            let tick_interval = Duration::from_secs(mc.requote_interval_secs);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tick_interval);
+                loop {
+                    interval.tick().await;
+                    maker.tick().await;
+                }
+            });
+
+            info!(
+                markets = maker_markets.len(),
+                target_sum = %config.maker.target_bid_sum,
+                "maker strategy enabled"
+            );
+        } else {
+            warn!("maker.enabled=true but no API credentials");
+        }
+    } else {
+        info!("maker strategy disabled (set maker.enabled=true in config)");
     }
 
     // --- Exchange Feeds (Binance + Coinbase) ---
@@ -387,6 +443,56 @@ async fn main() -> anyhow::Result<()> {
                         confidence = %agg.confidence,
                         "price signal"
                     );
+                }
+            }
+
+            Some(maker_event) = maker_rx.recv() => {
+                match maker_event {
+                    MakerEvent::QuotesPosted { question, bid_sum, edge, .. } => {
+                        info!(
+                            market = %question,
+                            bid_sum = %bid_sum,
+                            edge = %edge,
+                            "maker quotes posted"
+                        );
+                    }
+                    MakerEvent::QuotesUpdated { condition_id, bid_sum } => {
+                        info!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            bid_sum = %bid_sum,
+                            "maker quotes updated"
+                        );
+                    }
+                    MakerEvent::QuotesCancelled { condition_id, reason } => {
+                        warn!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            reason = %reason,
+                            "maker quotes cancelled"
+                        );
+                    }
+                    MakerEvent::LegFilled { condition_id, label, price, size, .. } => {
+                        info!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            label = %label,
+                            price = %price,
+                            size = %size,
+                            "maker leg filled"
+                        );
+                    }
+                    MakerEvent::InventoryAlert { condition_id, imbalance } => {
+                        warn!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            imbalance = %imbalance,
+                            "maker inventory alert"
+                        );
+                    }
+                    MakerEvent::RoundTripComplete { condition_id, profit } => {
+                        info!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            profit = %profit,
+                            "ROUND-TRIP COMPLETE"
+                        );
+                    }
                 }
             }
 
