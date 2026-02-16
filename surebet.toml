@@ -68,6 +68,16 @@ coinbase_products = ["BTC-USD", "ETH-USD"]
 # Max age (seconds) before a price observation is stale
 max_observation_age_secs = 5
 
+[valkey]
+# Valkey/Redis connection URL (also supports VALKEY_URL env var)
+url = "redis://127.0.0.1:6379"
+
+[dashboard]
+# Enable the HTTP monitoring dashboard
+enabled = true
+# Dashboard bind address
+bind = "127.0.0.1:3030"
+
 [logging]
 level = "info"
 json = false

@@ -189,32 +189,58 @@ impl ClobApiClient {
         Ok(resp.json().await?)
     }
 
-    /// Place a single limit order.
+    /// Place a single limit order. Returns a typed response with order_id.
     pub async fn place_order(
         &self,
         token_id: &str,
         price: &str,
         size: &str,
         side: OrderSide,
-    ) -> Result<serde_json::Value, AuthError> {
+    ) -> Result<PlaceOrderResponse, AuthError> {
         let body = serde_json::json!({
             "tokenID": token_id,
             "price": price,
             "size": size,
             "side": side.as_str(),
         });
-        self.post("/order", &body).await
+        let resp = self.post("/order", &body).await?;
+        let parsed: PlaceOrderResponse =
+            serde_json::from_value(resp).unwrap_or_else(|_| PlaceOrderResponse {
+                success: false,
+                error_msg: "failed to parse response".to_string(),
+                order_id: String::new(),
+                status: String::new(),
+            });
+        Ok(parsed)
     }
 
-    /// Place a batch of orders (up to 15).
+    /// Place a batch of orders (up to 15). Returns typed responses with order_ids.
     pub async fn place_orders(
         &self,
         orders: &[OrderRequest],
-    ) -> Result<serde_json::Value, AuthError> {
+    ) -> Result<Vec<PlaceOrderResponse>, AuthError> {
         let body = serde_json::json!({
             "orders": orders,
         });
-        self.post("/orders", &body).await
+        let resp = self.post("/orders", &body).await?;
+
+        // Batch response can be an array or an object wrapping an array
+        let responses = if let Some(arr) = resp.as_array() {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<PlaceOrderResponse>(v.clone()).ok())
+                .collect()
+        } else if let Some(arr) = resp.get("orderResponses").and_then(|v| v.as_array()) {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<PlaceOrderResponse>(v.clone()).ok())
+                .collect()
+        } else {
+            // Single response wrapped
+            match serde_json::from_value::<PlaceOrderResponse>(resp) {
+                Ok(r) => vec![r],
+                Err(_) => vec![],
+            }
+        };
+        Ok(responses)
     }
 
     /// Cancel a single order.
@@ -276,4 +302,17 @@ pub struct OrderRequest {
     pub price: String,
     pub size: String,
     pub side: String,
+}
+
+/// Response from the CLOB API when placing an order.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct PlaceOrderResponse {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default, rename = "errorMsg")]
+    pub error_msg: String,
+    #[serde(default, rename = "orderID")]
+    pub order_id: String,
+    #[serde(default)]
+    pub status: String,
 }

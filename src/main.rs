@@ -1,9 +1,11 @@
 mod arb;
 mod auth;
 mod config;
+mod dashboard;
 mod feeds;
 mod market;
 mod orderbook;
+mod store;
 mod ws;
 
 use crate::arb::executor::{ArbExecutor, RiskLimits};
@@ -11,11 +13,13 @@ use crate::arb::maker::{MakerConfig, MakerEvent, MakerStrategy};
 use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
 use crate::auth::{ClobApiClient, L2Credentials};
 use crate::config::Config;
+use crate::dashboard::DashboardState;
 use crate::feeds::aggregator::{AggregatorEvent, PriceAggregator};
 use crate::feeds::binance::{BinanceEvent, BinanceFeed};
 use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
 use crate::market::{classify_edge_profile, MarketDiscovery};
 use crate::orderbook::OrderBookStore;
+use crate::store::{FillRecord, OrderRecord, OrderStatus, PositionLeg, PositionRecord, StateStore};
 use crate::ws::clob::{ClobEvent, ClobWsClient};
 use crate::ws::rtds::{RtdsEvent, RtdsSubscription, RtdsWsClient};
 use rust_decimal::Decimal;
@@ -55,6 +59,47 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("surebet v{} starting", env!("CARGO_PKG_VERSION"));
+
+    // --- Valkey State Store ---
+    let activity_ttl = Duration::from_secs(config.maker.min_activity_age_secs);
+    let state_store = match StateStore::connect(&config.valkey.url, activity_ttl).await {
+        Ok(mut s) => {
+            if let Err(e) = s.ping().await {
+                error!(error = %e, "Valkey ping failed — continuing without state store");
+                None
+            } else {
+                info!(url = %config.valkey.url, "Valkey state store connected");
+                Some(Arc::new(Mutex::new(s)))
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                url = %config.valkey.url,
+                "failed to connect to Valkey — running without persistent state"
+            );
+            None
+        }
+    };
+
+    // --- Dashboard ---
+    if config.dashboard.enabled {
+        if let Some(ref store_ref) = state_store {
+            let dash_state = DashboardState {
+                store: store_ref.clone(),
+            };
+            let bind = config.dashboard.bind.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dashboard::serve(dash_state, &bind).await {
+                    error!(error = %e, "dashboard server error");
+                }
+            });
+        } else {
+            warn!("dashboard enabled but Valkey not available — dashboard disabled");
+        }
+    } else {
+        info!("dashboard disabled (set dashboard.enabled=true in config)");
+    }
 
     // --- L2 Auth Setup ---
     let creds = L2Credentials::from_config(
@@ -389,9 +434,12 @@ async fn main() -> anyhow::Result<()> {
                             side = %t.side,
                             "RTDS trade"
                         );
-                        // Feed trade activity to maker for pre-flight liquidity checks
+                        // Feed trade activity to maker + Valkey
                         if let Some(ref m) = maker {
                             m.lock().await.record_activity(&t.asset_id);
+                        }
+                        if let Some(ref ss) = state_store {
+                            let _ = ss.lock().await.record_activity(&t.asset_id).await;
                         }
                     }
                     RtdsEvent::OrderMatch(m) => {
@@ -401,9 +449,11 @@ async fn main() -> anyhow::Result<()> {
                             size = %m.size,
                             "RTDS match"
                         );
-                        // Feed match activity to maker too
                         if let Some(ref mkr) = maker {
                             mkr.lock().await.record_activity(&m.asset_id);
+                        }
+                        if let Some(ref ss) = state_store {
+                            let _ = ss.lock().await.record_activity(&m.asset_id).await;
                         }
                     }
                     RtdsEvent::CryptoPrice { symbol, price } => {
@@ -470,6 +520,44 @@ async fn main() -> anyhow::Result<()> {
             }
 
             Some(maker_event) = maker_rx.recv() => {
+                // Persist maker events to Valkey
+                if let Some(ref ss) = state_store {
+                    let mut vk = ss.lock().await;
+                    match &maker_event {
+                        MakerEvent::QuotesPosted { condition_id, question, bid_sum, edge } => {
+                            let pos = PositionRecord {
+                                condition_id: condition_id.clone(),
+                                question: question.clone(),
+                                legs: vec![], // updated when fills come in
+                                bid_sum: bid_sum.to_string(),
+                                edge: edge.to_string(),
+                                pending_fill: false,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                            };
+                            let _ = vk.set_position(&pos).await;
+                        }
+                        MakerEvent::LegFilled { order_id, condition_id, token_id, label, price, size } => {
+                            let fill = FillRecord {
+                                order_id: order_id.clone(),
+                                condition_id: condition_id.clone(),
+                                token_id: token_id.clone(),
+                                label: label.clone(),
+                                side: "BUY".to_string(),
+                                price: price.to_string(),
+                                size: size.to_string(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                strategy: "maker".to_string(),
+                            };
+                            let _ = vk.record_fill(&fill).await;
+                        }
+                        MakerEvent::RoundTripComplete { profit, .. } => {
+                            let _ = vk.add_pnl(*profit).await;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Log maker events
                 match maker_event {
                     MakerEvent::QuotesPosted { question, bid_sum, edge, .. } => {
                         info!(

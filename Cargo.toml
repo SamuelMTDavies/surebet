@@ -44,3 +44,10 @@ anyhow = "1"
 # Misc
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+# State store (Valkey/Redis)
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+
+# Dashboard HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }

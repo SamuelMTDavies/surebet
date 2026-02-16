@@ -110,6 +110,7 @@ pub enum MakerEvent {
         reason: String,
     },
     LegFilled {
+        order_id: String,
         condition_id: String,
         token_id: String,
         label: String,
@@ -686,7 +687,15 @@ impl MakerStrategy {
             "maker leg filled"
         );
 
+        // Get the order_id if we have it
+        let order_id = state
+            .live_orders
+            .get(token_id)
+            .map(|o| o.order_id.clone())
+            .unwrap_or_default();
+
         let _ = self.event_tx.send(MakerEvent::LegFilled {
+            order_id,
             condition_id: condition_id.to_string(),
             token_id: token_id.to_string(),
             label,

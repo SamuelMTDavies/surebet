@@ -24,6 +24,10 @@ pub struct Config {
     #[serde(default)]
     pub feeds: FeedsConfig,
     #[serde(default)]
+    pub valkey: ValkeyConfig,
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -189,6 +193,52 @@ pub struct FeedsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ValkeyConfig {
+    /// Valkey/Redis connection URL.
+    #[serde(default = "default_valkey_url")]
+    pub url: String,
+}
+
+fn default_valkey_url() -> String {
+    "redis://127.0.0.1:6379".to_string()
+}
+
+impl Default for ValkeyConfig {
+    fn default() -> Self {
+        Self {
+            url: default_valkey_url(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DashboardConfig {
+    /// Enable the HTTP dashboard.
+    #[serde(default = "default_dashboard_enabled")]
+    pub enabled: bool,
+    /// Bind address for the dashboard server.
+    #[serde(default = "default_dashboard_bind")]
+    pub bind: String,
+}
+
+fn default_dashboard_enabled() -> bool {
+    true
+}
+
+fn default_dashboard_bind() -> String {
+    "127.0.0.1:3030".to_string()
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dashboard_enabled(),
+            bind: default_dashboard_bind(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -330,6 +380,10 @@ impl Config {
             arb: ArbConfig::default(),
             maker: MakerStrategyConfig::default(),
             feeds: FeedsConfig::default(),
+            valkey: ValkeyConfig {
+                url: std::env::var("VALKEY_URL").unwrap_or_else(|_| default_valkey_url()),
+            },
+            dashboard: DashboardConfig::default(),
             logging: LoggingConfig::default(),
         }
     }

@@ -155,7 +155,7 @@ impl ArbExecutor {
             Ok(resp) => {
                 info!(
                     market = %opp.question,
-                    response = %resp,
+                    num_orders = resp.len(),
                     "batch order submitted"
                 );
 
