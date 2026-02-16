@@ -1,14 +1,27 @@
+mod arb;
+mod auth;
 mod config;
+mod feeds;
 mod market;
 mod orderbook;
 mod ws;
 
+use crate::arb::executor::{ArbExecutor, RiskLimits};
+use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
+use crate::auth::{ClobApiClient, L2Credentials};
 use crate::config::Config;
+use crate::feeds::aggregator::{AggregatorEvent, PriceAggregator};
+use crate::feeds::binance::{BinanceEvent, BinanceFeed};
+use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
 use crate::market::{classify_edge_profile, MarketDiscovery};
 use crate::orderbook::OrderBookStore;
 use crate::ws::clob::{ClobEvent, ClobWsClient};
 use crate::ws::rtds::{RtdsEvent, RtdsSubscription, RtdsWsClient};
+use rust_decimal::Decimal;
 use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -42,14 +55,28 @@ async fn main() -> anyhow::Result<()> {
 
     info!("surebet v{} starting", env!("CARGO_PKG_VERSION"));
 
-    if !config.has_credentials() {
+    // --- L2 Auth Setup ---
+    let creds = L2Credentials::from_config(
+        &config.polymarket.api_key,
+        &config.polymarket.api_secret,
+        &config.polymarket.api_passphrase,
+    );
+
+    if creds.is_none() {
         warn!(
             "no API credentials configured - running in read-only mode \
              (set POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE for trading)"
         );
     }
 
-    // Phase 1: Discover markets
+    let api_client = creds.as_ref().map(|c| {
+        Arc::new(ClobApiClient::new(
+            config.polymarket.clob_url.clone(),
+            c.clone(),
+        ))
+    });
+
+    // --- Market Discovery ---
     info!("discovering active markets...");
     let discovery = MarketDiscovery::new(
         config.polymarket.gamma_url.clone(),
@@ -63,8 +90,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Log market profiles
-    info!("--- Market Edge Profiles ---");
+    // Build tracked markets for arb scanner
+    let tracked_markets: Vec<TrackedMarket> = markets
+        .iter()
+        .filter_map(TrackedMarket::from_gamma)
+        .collect();
+
+    info!("--- Market Edge Profiles ({} markets) ---", markets.len());
     for m in &markets {
         let profile = classify_edge_profile(m);
         info!(
@@ -78,27 +110,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Phase 2: Set up order book store
+    // --- Order Book Store ---
     let store = OrderBookStore::new();
 
-    // Phase 3: Connect CLOB WebSocket for order book data
+    // --- CLOB WebSocket ---
     let (clob_tx, mut clob_rx) = mpsc::unbounded_channel::<ClobEvent>();
     let clob_client = ClobWsClient::new(
         config.polymarket.clob_ws_url.clone(),
         store.clone(),
         clob_tx,
     );
-
-    info!(
-        assets = asset_ids.len(),
-        "subscribing to CLOB market channel"
-    );
+    info!(assets = asset_ids.len(), "subscribing to CLOB market channel");
     clob_client.subscribe(asset_ids).await?;
 
-    // Phase 4: Connect RTDS WebSocket for trade activity
+    // --- RTDS WebSocket ---
     let (rtds_tx, mut rtds_rx) = mpsc::unbounded_channel::<RtdsEvent>();
     let rtds_client = RtdsWsClient::new(config.polymarket.rtds_ws_url.clone(), rtds_tx);
-
     let rtds_subs = vec![
         RtdsSubscription {
             topic: "activity".to_string(),
@@ -111,18 +138,74 @@ async fn main() -> anyhow::Result<()> {
             filters: None,
         },
     ];
-
     info!("subscribing to RTDS activity feed");
     rtds_client.subscribe(rtds_subs).await?;
 
-    // Phase 5: Event processing loop
-    info!("entering main event loop - press Ctrl+C to stop");
+    // --- Arb Scanner ---
+    let (arb_tx, mut arb_rx) = mpsc::unbounded_channel::<ArbEvent>();
+    let min_net_edge =
+        Decimal::from_str(&config.arb.min_net_edge.to_string()).unwrap_or(Decimal::ZERO);
+    let mut arb_scanner = ArbScanner::new(
+        store.clone(),
+        tracked_markets,
+        arb_tx,
+        min_net_edge,
+    );
 
+    // --- Arb Executor ---
+    let executor = api_client.as_ref().map(|api| {
+        let limits = RiskLimits {
+            max_position_usd: Decimal::from_str(&config.arb.max_position_usd.to_string())
+                .unwrap_or(Decimal::from(100)),
+            max_total_exposure: Decimal::from_str(&config.arb.max_total_exposure.to_string())
+                .unwrap_or(Decimal::from(500)),
+            min_net_edge,
+            ..RiskLimits::default()
+        };
+        Arc::new(ArbExecutor::new(api.clone(), limits))
+    });
+
+    if config.arb.execute {
+        if let Some(ref exec) = executor {
+            exec.enable();
+            info!("arb executor enabled - LIVE EXECUTION MODE");
+        } else {
+            warn!("arb.execute=true but no API credentials - staying in paper mode");
+        }
+    } else {
+        info!("arb executor in paper mode (set arb.execute=true to go live)");
+    }
+
+    // --- Exchange Feeds (Binance + Coinbase) ---
+    let (binance_tx, mut binance_rx) = mpsc::unbounded_channel::<BinanceEvent>();
+    let (coinbase_tx, mut coinbase_rx) = mpsc::unbounded_channel::<CoinbaseEvent>();
+    let (agg_tx, mut agg_rx) = mpsc::unbounded_channel::<AggregatorEvent>();
+
+    let tracked_symbols = vec!["BTCUSD".to_string(), "ETHUSD".to_string()];
+    let aggregator = Arc::new(PriceAggregator::new(
+        agg_tx,
+        tracked_symbols,
+        Duration::from_secs(config.feeds.max_observation_age_secs),
+    ));
+
+    if config.feeds.enabled {
+        info!("starting exchange price feeds");
+
+        let binance_feed = BinanceFeed::new(binance_tx);
+        binance_feed.subscribe(config.feeds.binance_symbols.clone());
+
+        let coinbase_feed = CoinbaseFeed::new(coinbase_tx);
+        coinbase_feed.subscribe(config.feeds.coinbase_products.clone());
+    } else {
+        info!("exchange feeds disabled (set feeds.enabled=true in config)");
+    }
+
+    // --- Periodic Tasks ---
+
+    // Order book summary every 30s
     let store_for_summary = store.clone();
-
-    // Periodic summary printer
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             let summaries = store_for_summary.summary();
@@ -135,17 +218,68 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Main event loop
+    // Arb scanner on configured interval
+    let scan_interval = Duration::from_millis(config.arb.scan_interval_ms);
+    let arb_enabled = config.arb.enabled;
+    tokio::spawn(async move {
+        if !arb_enabled {
+            info!("arb scanner disabled");
+            return;
+        }
+        let mut interval = tokio::time::interval(scan_interval);
+        loop {
+            interval.tick().await;
+            arb_scanner.scan_all();
+        }
+    });
+
+    // Aggregator price snapshot every 10s
+    let agg_for_snapshot = aggregator.clone();
+    let feeds_enabled = config.feeds.enabled;
+    tokio::spawn(async move {
+        if !feeds_enabled {
+            return;
+        }
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let snap = agg_for_snapshot.snapshot();
+            for agg in &snap {
+                info!(
+                    symbol = %agg.symbol,
+                    price = %agg.price,
+                    sources = agg.source_count,
+                    spread = %agg.source_spread,
+                    confidence = %agg.confidence,
+                    "aggregated price"
+                );
+            }
+        }
+    });
+
+    // Executor position cleanup every 60s
+    if let Some(ref exec) = executor {
+        let exec_cleanup = exec.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                exec_cleanup.cleanup_stale(Duration::from_secs(300)).await;
+                let summary = exec_cleanup.exposure_summary().await;
+                info!("executor: {}", summary);
+            }
+        });
+    }
+
+    // --- Main Event Loop ---
+    info!("entering main event loop - press Ctrl+C to stop");
+
     loop {
         tokio::select! {
             Some(clob_event) = clob_rx.recv() => {
                 match clob_event {
-                    ClobEvent::Connected => {
-                        info!("CLOB WebSocket connected");
-                    }
-                    ClobEvent::Disconnected => {
-                        warn!("CLOB WebSocket disconnected");
-                    }
+                    ClobEvent::Connected => info!("CLOB connected"),
+                    ClobEvent::Disconnected => warn!("CLOB disconnected"),
                     ClobEvent::BookSnapshot { asset_id, bid_levels, ask_levels } => {
                         info!(
                             asset = %asset_id[..12.min(asset_id.len())],
@@ -171,14 +305,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
             Some(rtds_event) = rtds_rx.recv() => {
                 match rtds_event {
-                    RtdsEvent::Connected => {
-                        info!("RTDS WebSocket connected");
-                    }
-                    RtdsEvent::Disconnected => {
-                        warn!("RTDS WebSocket disconnected");
-                    }
+                    RtdsEvent::Connected => info!("RTDS connected"),
+                    RtdsEvent::Disconnected => warn!("RTDS disconnected"),
                     RtdsEvent::Trade(t) => {
                         info!(
                             asset = %t.asset_id,
@@ -193,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
                             asset = %m.asset_id,
                             price = %m.price,
                             size = %m.size,
-                            "RTDS order match"
+                            "RTDS match"
                         );
                     }
                     RtdsEvent::CryptoPrice { symbol, price } => {
@@ -202,8 +333,73 @@ async fn main() -> anyhow::Result<()> {
                     RtdsEvent::RawEvent(_) => {}
                 }
             }
+
+            Some(arb_event) = arb_rx.recv() => {
+                match arb_event {
+                    ArbEvent::OpportunityDetected(opp) => {
+                        info!(
+                            market = %opp.question,
+                            ask_sum = %opp.ask_sum,
+                            gross = %opp.gross_edge,
+                            net = %opp.net_edge,
+                            fillable = %opp.max_fillable_size,
+                            "ARB OPPORTUNITY"
+                        );
+                        if let Some(ref exec) = executor {
+                            match exec.try_execute(&opp).await {
+                                Ok(true) => info!(market = %opp.question, "arb executed"),
+                                Ok(false) => {}
+                                Err(e) => error!(error = %e, "arb execution error"),
+                            }
+                        }
+                    }
+                    ArbEvent::OpportunityGone { condition_id } => {
+                        info!(condition_id = %condition_id, "arb opportunity gone");
+                    }
+                    ArbEvent::ScanComplete { markets_scanned, opportunities } => {
+                        if opportunities > 0 {
+                            info!(scanned = markets_scanned, opps = opportunities, "arb scan");
+                        }
+                    }
+                }
+            }
+
+            Some(binance_event) = binance_rx.recv() => {
+                aggregator.handle_binance(&binance_event);
+                if let BinanceEvent::Connected = binance_event {
+                    info!("Binance feed connected");
+                }
+            }
+
+            Some(coinbase_event) = coinbase_rx.recv() => {
+                aggregator.handle_coinbase(&coinbase_event);
+                if let CoinbaseEvent::Connected = coinbase_event {
+                    info!("Coinbase feed connected");
+                }
+            }
+
+            Some(agg_event) = agg_rx.recv() => {
+                if let AggregatorEvent::PriceUpdate(agg) = agg_event {
+                    info!(
+                        symbol = %agg.symbol,
+                        price = %agg.price,
+                        sources = agg.source_count,
+                        confidence = %agg.confidence,
+                        "price signal"
+                    );
+                }
+            }
+
             _ = tokio::signal::ctrl_c() => {
                 info!("shutting down...");
+                if let Some(ref exec) = executor {
+                    if exec.is_enabled() {
+                        info!("cancelling all open orders...");
+                        if let Err(e) = exec.cancel_all().await {
+                            error!(error = %e, "failed to cancel orders on shutdown");
+                        }
+                    }
+                }
                 break;
             }
         }

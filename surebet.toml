@@ -20,6 +20,30 @@ categories = []
 # Categories to exclude
 exclude_categories = []
 
+[arb]
+# Enable cross-outcome arb scanner
+enabled = true
+# Enable live execution (false = scan-only / paper mode)
+execute = false
+# Minimum net edge after fees to report/execute (0.005 = $0.005 per $1)
+min_net_edge = 0.005
+# Scan interval in milliseconds
+scan_interval_ms = 1000
+# Max USDC per arb position
+max_position_usd = 100.0
+# Max total USDC across all open positions
+max_total_exposure = 500.0
+
+[feeds]
+# Enable Binance/Coinbase price feeds for Chainlink oracle prediction
+enabled = false
+# Binance WebSocket symbols (lowercase)
+binance_symbols = ["btcusdt", "ethusdt"]
+# Coinbase product IDs
+coinbase_products = ["BTC-USD", "ETH-USD"]
+# Max age (seconds) before a price observation is stale
+max_observation_age_secs = 5
+
 [logging]
 level = "info"
 json = false

@@ -18,6 +18,10 @@ pub struct Config {
     #[serde(default)]
     pub filters: FilterConfig,
     #[serde(default)]
+    pub arb: ArbConfig,
+    #[serde(default)]
+    pub feeds: FeedsConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -66,6 +70,44 @@ pub struct FilterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ArbConfig {
+    /// Enable the arb scanner.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Enable live execution (false = scan-only / paper mode).
+    #[serde(default)]
+    pub execute: bool,
+    /// Minimum net edge after fees to report/execute.
+    #[serde(default = "default_min_edge")]
+    pub min_net_edge: f64,
+    /// Scan interval in milliseconds.
+    #[serde(default = "default_scan_interval_ms")]
+    pub scan_interval_ms: u64,
+    /// Max USDC per position.
+    #[serde(default = "default_max_position")]
+    pub max_position_usd: f64,
+    /// Max total USDC exposure.
+    #[serde(default = "default_max_exposure")]
+    pub max_total_exposure: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedsConfig {
+    /// Enable external exchange feeds (Binance, Coinbase).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Binance symbols to track, e.g. ["btcusdt", "ethusdt"].
+    #[serde(default = "default_binance_symbols")]
+    pub binance_symbols: Vec<String>,
+    /// Coinbase product IDs to track, e.g. ["BTC-USD", "ETH-USD"].
+    #[serde(default = "default_coinbase_products")]
+    pub coinbase_products: Vec<String>,
+    /// Max observation age in seconds before considered stale.
+    #[serde(default = "default_max_obs_age")]
+    pub max_observation_age_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -97,6 +139,30 @@ fn default_max_spread() -> f64 {
 fn default_log_level() -> String {
     "info".to_string()
 }
+fn default_true() -> bool {
+    true
+}
+fn default_min_edge() -> f64 {
+    0.005
+}
+fn default_scan_interval_ms() -> u64 {
+    1000
+}
+fn default_max_position() -> f64 {
+    100.0
+}
+fn default_max_exposure() -> f64 {
+    500.0
+}
+fn default_binance_symbols() -> Vec<String> {
+    vec!["btcusdt".to_string(), "ethusdt".to_string()]
+}
+fn default_coinbase_products() -> Vec<String> {
+    vec!["BTC-USD".to_string(), "ETH-USD".to_string()]
+}
+fn default_max_obs_age() -> u64 {
+    5
+}
 
 impl Default for FilterConfig {
     fn default() -> Self {
@@ -106,6 +172,30 @@ impl Default for FilterConfig {
             max_spread_pct: default_max_spread(),
             categories: Vec::new(),
             exclude_categories: Vec::new(),
+        }
+    }
+}
+
+impl Default for ArbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            execute: false,
+            min_net_edge: default_min_edge(),
+            scan_interval_ms: default_scan_interval_ms(),
+            max_position_usd: default_max_position(),
+            max_total_exposure: default_max_exposure(),
+        }
+    }
+}
+
+impl Default for FeedsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binance_symbols: default_binance_symbols(),
+            coinbase_products: default_coinbase_products(),
+            max_observation_age_secs: default_max_obs_age(),
         }
     }
 }
@@ -156,6 +246,8 @@ impl Config {
                 api_passphrase: std::env::var("POLY_API_PASSPHRASE").unwrap_or_default(),
             },
             filters: FilterConfig::default(),
+            arb: ArbConfig::default(),
+            feeds: FeedsConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
