@@ -233,60 +233,66 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared maker: Arc<Mutex> so both the tick task and RTDS fill handler can access it
     let maker: Option<Arc<Mutex<MakerStrategy>>> = if config.maker.enabled {
-        if let Some(ref api) = api_client {
-            let mc = &config.maker;
-            let maker_config = MakerConfig {
-                target_bid_sum: Decimal::from_str(&mc.target_bid_sum.to_string())
-                    .unwrap_or(Decimal::from_str("0.97").unwrap()),
-                order_size: Decimal::from_str(&mc.order_size.to_string())
-                    .unwrap_or(Decimal::from(10)),
-                min_spread: Decimal::from_str(&mc.min_spread.to_string())
-                    .unwrap_or(Decimal::from_str("0.02").unwrap()),
-                max_inventory_imbalance: Decimal::from_str(&mc.max_inventory_imbalance.to_string())
-                    .unwrap_or(Decimal::from(50)),
-                requote_interval: Duration::from_secs(mc.requote_interval_secs),
-                requote_threshold: Decimal::from_str(&mc.requote_threshold.to_string())
-                    .unwrap_or(Decimal::from_str("0.01").unwrap()),
-                fill_timeout: Duration::from_secs(mc.fill_timeout_secs),
-                aggressive_reprice_pct: Decimal::from_str(&mc.aggressive_reprice_pct.to_string())
-                    .unwrap_or(Decimal::from_str("0.50").unwrap()),
-                min_activity_age: Duration::from_secs(mc.min_activity_age_secs),
-            };
+        let mc = &config.maker;
+        let maker_config = MakerConfig {
+            execute: mc.execute,
+            target_bid_sum: Decimal::from_str(&mc.target_bid_sum.to_string())
+                .unwrap_or(Decimal::from_str("0.97").unwrap()),
+            order_size: Decimal::from_str(&mc.order_size.to_string())
+                .unwrap_or(Decimal::from(10)),
+            min_spread: Decimal::from_str(&mc.min_spread.to_string())
+                .unwrap_or(Decimal::from_str("0.02").unwrap()),
+            max_inventory_imbalance: Decimal::from_str(&mc.max_inventory_imbalance.to_string())
+                .unwrap_or(Decimal::from(50)),
+            requote_interval: Duration::from_secs(mc.requote_interval_secs),
+            requote_threshold: Decimal::from_str(&mc.requote_threshold.to_string())
+                .unwrap_or(Decimal::from_str("0.01").unwrap()),
+            fill_timeout: Duration::from_secs(mc.fill_timeout_secs),
+            aggressive_reprice_pct: Decimal::from_str(&mc.aggressive_reprice_pct.to_string())
+                .unwrap_or(Decimal::from_str("0.50").unwrap()),
+            min_activity_age: Duration::from_secs(mc.min_activity_age_secs),
+        };
 
-            let mut strategy = MakerStrategy::new(
-                api.clone(),
-                store.clone(),
-                maker_config,
-                maker_tx,
-            );
-            strategy.add_markets(&maker_markets);
+        // Maker can run without API credentials (paper mode)
+        let mut strategy = MakerStrategy::new(
+            api_client.clone(),
+            store.clone(),
+            maker_config,
+            maker_tx,
+        );
+        strategy.add_markets(&maker_markets);
 
-            let shared = Arc::new(Mutex::new(strategy));
+        let shared = Arc::new(Mutex::new(strategy));
 
-            // Spawn the tick task with a clone of the shared maker
-            let maker_for_tick = shared.clone();
-            let tick_interval = Duration::from_secs(mc.requote_interval_secs);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(tick_interval);
-                loop {
-                    interval.tick().await;
-                    maker_for_tick.lock().await.tick().await;
-                }
-            });
+        // Spawn the tick task with a clone of the shared maker
+        let maker_for_tick = shared.clone();
+        let tick_interval = Duration::from_secs(mc.requote_interval_secs);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick_interval);
+            loop {
+                interval.tick().await;
+                maker_for_tick.lock().await.tick().await;
+            }
+        });
 
-            info!(
-                markets = maker_markets.len(),
-                target_sum = %config.maker.target_bid_sum,
-                fill_timeout_secs = mc.fill_timeout_secs,
-                reprice_pct = %mc.aggressive_reprice_pct,
-                activity_age_secs = mc.min_activity_age_secs,
-                "maker strategy enabled"
-            );
-            Some(shared)
+        let mode = if mc.execute && api_client.is_some() {
+            "LIVE EXECUTION"
+        } else if api_client.is_some() {
+            "PAPER (set maker.execute=true to go live)"
         } else {
-            warn!("maker.enabled=true but no API credentials");
-            None
-        }
+            "PAPER (no API credentials)"
+        };
+
+        info!(
+            markets = maker_markets.len(),
+            target_sum = %config.maker.target_bid_sum,
+            fill_timeout_secs = mc.fill_timeout_secs,
+            reprice_pct = %mc.aggressive_reprice_pct,
+            activity_age_secs = mc.min_activity_age_secs,
+            mode = mode,
+            "maker strategy enabled"
+        );
+        Some(shared)
     } else {
         info!("maker strategy disabled (set maker.enabled=true in config)");
         None

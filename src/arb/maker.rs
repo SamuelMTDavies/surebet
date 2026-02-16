@@ -28,6 +28,8 @@ use tracing::{debug, error, info, warn};
 /// Configuration for the maker strategy.
 #[derive(Debug, Clone)]
 pub struct MakerConfig {
+    /// Enable live execution (false = paper mode, logs without placing orders).
+    pub execute: bool,
     /// Target bid_sum as fraction of $1.00 (e.g., 0.97 = $0.03 edge per round-trip).
     pub target_bid_sum: Decimal,
     /// Size per order in shares.
@@ -54,6 +56,7 @@ pub struct MakerConfig {
 impl Default for MakerConfig {
     fn default() -> Self {
         Self {
+            execute: false,
             target_bid_sum: Decimal::from_str("0.97").unwrap(),
             order_size: Decimal::from(10),
             min_spread: Decimal::from_str("0.02").unwrap(),
@@ -167,7 +170,7 @@ impl ActivityTracker {
 
 /// The market maker engine.
 pub struct MakerStrategy {
-    api: Arc<ClobApiClient>,
+    api: Option<Arc<ClobApiClient>>,
     store: OrderBookStore,
     config: MakerConfig,
     states: HashMap<String, MarketState>,
@@ -177,7 +180,7 @@ pub struct MakerStrategy {
 
 impl MakerStrategy {
     pub fn new(
-        api: Arc<ClobApiClient>,
+        api: Option<Arc<ClobApiClient>>,
         store: OrderBookStore,
         config: MakerConfig,
         event_tx: mpsc::UnboundedSender<MakerEvent>,
@@ -190,6 +193,11 @@ impl MakerStrategy {
             event_tx,
             activity: ActivityTracker::default(),
         }
+    }
+
+    /// Whether the strategy can execute live orders.
+    fn can_execute(&self) -> bool {
+        self.config.execute && self.api.is_some()
     }
 
     /// Register markets to make.
@@ -289,7 +297,12 @@ impl MakerStrategy {
             .unwrap()
             .market
             .condition_id;
-        self.api.cancel_market_orders(market_cid).await?;
+
+        if self.can_execute() {
+            self.api.as_ref().unwrap().cancel_market_orders(market_cid).await?;
+        } else {
+            info!(condition_id = condition_id, "PAPER: would cancel market orders for unwind");
+        }
 
         let _ = self.event_tx.send(MakerEvent::QuotesCancelled {
             condition_id: condition_id.to_string(),
@@ -308,30 +321,40 @@ impl MakerStrategy {
             // Get the current best bid for the filled token to sell into
             if let Some(book) = self.store.get_book(&filled_token) {
                 if let Some((best_bid, _)) = book.bids.best(true) {
-                    info!(
-                        condition_id = condition_id,
-                        token = %filled_token,
-                        size = %filled_inv,
-                        sell_price = %best_bid,
-                        "unwinding filled leg"
-                    );
-
                     let _ = self.event_tx.send(MakerEvent::Unwinding {
                         condition_id: condition_id.to_string(),
                         token_id: filled_token.clone(),
                         size: filled_inv,
                     });
 
-                    // Place a sell order at the best bid to unwind quickly
-                    let _resp = self
-                        .api
-                        .place_order(
-                            &filled_token,
-                            &best_bid.to_string(),
-                            &filled_inv.to_string(),
-                            OrderSide::Sell,
-                        )
-                        .await?;
+                    if self.can_execute() {
+                        info!(
+                            condition_id = condition_id,
+                            token = %filled_token,
+                            size = %filled_inv,
+                            sell_price = %best_bid,
+                            "unwinding filled leg"
+                        );
+                        let _resp = self
+                            .api
+                            .as_ref()
+                            .unwrap()
+                            .place_order(
+                                &filled_token,
+                                &best_bid.to_string(),
+                                &filled_inv.to_string(),
+                                OrderSide::Sell,
+                            )
+                            .await?;
+                    } else {
+                        info!(
+                            condition_id = condition_id,
+                            token = %filled_token,
+                            size = %filled_inv,
+                            sell_price = %best_bid,
+                            "PAPER: would unwind filled leg"
+                        );
+                    }
                 }
             }
         }
@@ -387,9 +410,15 @@ impl MakerStrategy {
         // Cancel existing orders if we have any
         let state = self.states.get(condition_id).unwrap();
         if !state.live_orders.is_empty() {
-            self.api
-                .cancel_market_orders(&state.market.condition_id)
-                .await?;
+            if self.can_execute() {
+                self.api
+                    .as_ref()
+                    .unwrap()
+                    .cancel_market_orders(&state.market.condition_id)
+                    .await?;
+            } else {
+                debug!(condition_id = condition_id, "PAPER: would cancel existing orders for requote");
+            }
 
             let _ = self.event_tx.send(MakerEvent::QuotesCancelled {
                 condition_id: condition_id.to_string(),
@@ -397,7 +426,7 @@ impl MakerStrategy {
             });
         }
 
-        // Post new bids on all outcomes
+        // Build new bids on all outcomes
         let orders: Vec<OrderRequest> = new_prices
             .iter()
             .map(|(tid, price)| OrderRequest {
@@ -420,62 +449,90 @@ impl MakerStrategy {
             return Ok(());
         }
 
-        let result = self.api.place_orders(&orders).await;
-
-        match result {
-            Ok(_resp) => {
-                let state = self.states.get_mut(condition_id).unwrap();
-                let is_first = state.live_orders.is_empty() && state.last_prices.is_empty();
-
-                // Update state
-                state.last_requote = Instant::now();
-                state.last_prices = new_prices.clone();
-
-                // TODO: parse order IDs from response and track in live_orders
-                // For now we track by market-level cancel
-                state.live_orders.clear();
-                for (tid, price) in &new_prices {
-                    state.live_orders.insert(
-                        tid.clone(),
-                        LiveOrder {
-                            order_id: String::new(), // populated when we parse response
-                            price: *price,
-                            size: self.config.order_size,
-                        },
+        // In paper mode, log what we'd place. In live mode, call the API.
+        let order_responses: Vec<(String, String)> = if self.can_execute() {
+            let result = self.api.as_ref().unwrap().place_orders(&orders).await;
+            match result {
+                Ok(resp) => {
+                    // Match responses to orders by position (API returns in same order)
+                    orders
+                        .iter()
+                        .zip(resp.iter())
+                        .map(|(req, r)| (req.token_id.clone(), r.order_id.clone()))
+                        .collect()
+                }
+                Err(e) => {
+                    error!(
+                        condition_id = condition_id,
+                        error = %e,
+                        "failed to post maker orders"
                     );
+                    return Err(e);
                 }
-
-                if is_first {
-                    let _ = self.event_tx.send(MakerEvent::QuotesPosted {
-                        condition_id: condition_id.to_string(),
-                        question: state.market.question.clone(),
-                        bid_sum,
-                        edge,
-                    });
-                } else {
-                    let _ = self.event_tx.send(MakerEvent::QuotesUpdated {
-                        condition_id: condition_id.to_string(),
-                        bid_sum,
-                    });
-                }
-
-                info!(
-                    market = %state.market.question,
-                    bid_sum = %bid_sum,
-                    edge = %edge,
-                    n_legs = orders.len(),
-                    "quotes posted"
-                );
             }
-            Err(e) => {
-                error!(
-                    condition_id = condition_id,
-                    error = %e,
-                    "failed to post maker orders"
+        } else {
+            // Paper mode: generate synthetic order IDs for internal tracking
+            orders
+                .iter()
+                .enumerate()
+                .map(|(i, req)| {
+                    let paper_id = format!("paper-{}-{}-{}", condition_id.get(..8).unwrap_or(condition_id), i, chrono::Utc::now().timestamp_millis());
+                    info!(
+                        token = %req.token_id.get(..12).unwrap_or(&req.token_id),
+                        price = %req.price,
+                        size = %req.size,
+                        paper_id = %paper_id,
+                        "PAPER: would place BUY order"
+                    );
+                    (req.token_id.clone(), paper_id)
+                })
+                .collect()
+        };
+
+        // Update internal state regardless of paper/live mode
+        let mode = if self.can_execute() { "" } else { " [PAPER]" };
+        let order_size = self.config.order_size;
+        let state = self.states.get_mut(condition_id).unwrap();
+        let is_first = state.live_orders.is_empty() && state.last_prices.is_empty();
+
+        state.last_requote = Instant::now();
+        state.last_prices = new_prices.clone();
+
+        // Populate live_orders with real or paper order IDs
+        state.live_orders.clear();
+        for (tid, order_id) in &order_responses {
+            if let Some(price) = new_prices.get(tid) {
+                state.live_orders.insert(
+                    tid.clone(),
+                    LiveOrder {
+                        order_id: order_id.clone(),
+                        price: *price,
+                        size: order_size,
+                    },
                 );
-                return Err(e);
             }
         }
+        if is_first {
+            let _ = self.event_tx.send(MakerEvent::QuotesPosted {
+                condition_id: condition_id.to_string(),
+                question: state.market.question.clone(),
+                bid_sum,
+                edge,
+            });
+        } else {
+            let _ = self.event_tx.send(MakerEvent::QuotesUpdated {
+                condition_id: condition_id.to_string(),
+                bid_sum,
+            });
+        }
+
+        info!(
+            market = %state.market.question,
+            bid_sum = %bid_sum,
+            edge = %edge,
+            n_legs = orders.len(),
+            "quotes posted{}", mode
+        );
 
         Ok(())
     }
@@ -822,31 +879,24 @@ impl MakerStrategy {
 
         // Cancel existing orders in this market, then post the aggressive bids
         let market_cid = &state.market.condition_id;
-        self.api.cancel_market_orders(market_cid).await?;
 
-        // Re-post filled legs at their original prices + unfilled legs at aggressive prices
-        let state = self.states.get(condition_id).unwrap();
-        let mut all_orders: Vec<OrderRequest> = Vec::new();
-
-        // Keep the filled legs' existing orders (they shouldn't need to change)
-        for (tid, order) in &state.live_orders {
-            let inv = state.inventory.get(tid).copied().unwrap_or(Decimal::ZERO);
-            if inv > Decimal::ZERO {
-                // This leg is already filled, skip re-posting
-                continue;
+        if self.can_execute() {
+            self.api.as_ref().unwrap().cancel_market_orders(market_cid).await?;
+            self.api.as_ref().unwrap().place_orders(&reprice_orders).await?;
+        } else {
+            for order in &reprice_orders {
+                info!(
+                    condition_id = condition_id,
+                    token = %order.token_id.get(..12).unwrap_or(&order.token_id),
+                    price = %order.price,
+                    "PAPER: would reprice unfilled leg"
+                );
             }
-        }
-
-        // Add the aggressively priced unfilled legs
-        all_orders.extend(reprice_orders);
-
-        if !all_orders.is_empty() {
-            self.api.place_orders(&all_orders).await?;
         }
 
         // Update live_orders with new prices
         let state = self.states.get_mut(condition_id).unwrap();
-        for order in &all_orders {
+        for order in &reprice_orders {
             if let Some(live) = state.live_orders.get_mut(&order.token_id) {
                 live.price = Decimal::from_str(&order.price).unwrap_or(live.price);
             }
@@ -914,8 +964,12 @@ impl MakerStrategy {
 
     /// Cancel all maker orders across all markets.
     pub async fn cancel_all(&self) -> Result<(), AuthError> {
-        warn!("cancelling all maker orders");
-        self.api.cancel_all().await?;
+        if let Some(ref api) = self.api {
+            warn!("cancelling all maker orders");
+            api.cancel_all().await?;
+        } else {
+            info!("PAPER: would cancel all maker orders (no API client)");
+        }
         Ok(())
     }
 

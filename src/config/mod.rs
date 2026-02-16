@@ -102,6 +102,9 @@ pub struct MakerStrategyConfig {
     /// Enable the passive maker strategy.
     #[serde(default)]
     pub enabled: bool,
+    /// Enable live execution (false = paper mode, logs orders without placing them).
+    #[serde(default)]
+    pub execute: bool,
     /// Target bid sum as fraction of $1.00 (lower = more edge, less fill).
     #[serde(default = "default_target_bid_sum")]
     pub target_bid_sum: f64,
@@ -163,6 +166,7 @@ impl Default for MakerStrategyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            execute: false,
             target_bid_sum: default_target_bid_sum(),
             order_size: default_order_size(),
             min_spread: default_maker_min_spread(),

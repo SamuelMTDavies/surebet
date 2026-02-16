@@ -37,6 +37,8 @@ max_total_exposure = 500.0
 [maker]
 # Enable passive market-making strategy (posts bids on both sides of binary markets)
 enabled = false
+# Enable live execution (false = paper mode, logs orders without placing them)
+execute = false
 # Target bid sum as fraction of $1.00 (0.97 = $0.03 edge per round-trip)
 target_bid_sum = 0.97
 # Order size in shares per leg
