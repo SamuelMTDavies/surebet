@@ -1,22 +1,46 @@
 [package]
-name = "surebet-wasm"
-version = "0.1.0"
+name = "surebet"
+version = "0.2.0"
 authors = ["Sam Davies <sam@uown.co>"]
 edition = "2021"
-
-
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Polymarket WebSocket trading engine for prediction market arbitrage"
 
 [dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 
-dioxus = { version = "0.5", features = ["web", "router"] }
+# HTTP client for REST API
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
-# Debug
-tracing = "0.1.40"
-dioxus-logger = "0.5.0"
-dioxus-html-macro = "0.3.0"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-futures = "0.3"
+
+# Crypto (for HMAC auth signing)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+# Data structures
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+dashmap = "6"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+toml = "0.8"
+dotenvy = "0.15"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Misc
+url = "2"
+uuid = { version = "1", features = ["v4"] }

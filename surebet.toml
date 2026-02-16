@@ -1,0 +1,25 @@
+# Surebet - Polymarket Trading Engine Configuration
+# Secrets should be set via environment variables, not here.
+# See .env.example for required env vars.
+
+[polymarket]
+clob_url = "https://clob.polymarket.com"
+clob_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+rtds_ws_url = "wss://ws-live-data.polymarket.com"
+gamma_url = "https://gamma-api.polymarket.com"
+
+[filters]
+# Minimum 24h volume (USDC) to consider a market
+min_volume_usd = 10000.0
+# Minimum liquidity depth (USDC)
+min_depth_usd = 1000.0
+# Maximum spread percentage
+max_spread_pct = 5.0
+# Categories to watch (empty = all). Examples: "crypto", "politics", "sports"
+categories = []
+# Categories to exclude
+exclude_categories = []
+
+[logging]
+level = "info"
+json = false
