@@ -23,7 +23,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -186,7 +186,8 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(TrackedMarket::from_gamma)
         .collect();
 
-    if config.maker.enabled {
+    // Shared maker: Arc<Mutex> so both the tick task and RTDS fill handler can access it
+    let maker: Option<Arc<Mutex<MakerStrategy>>> = if config.maker.enabled {
         if let Some(ref api) = api_client {
             let mc = &config.maker;
             let maker_config = MakerConfig {
@@ -201,36 +202,50 @@ async fn main() -> anyhow::Result<()> {
                 requote_interval: Duration::from_secs(mc.requote_interval_secs),
                 requote_threshold: Decimal::from_str(&mc.requote_threshold.to_string())
                     .unwrap_or(Decimal::from_str("0.01").unwrap()),
+                fill_timeout: Duration::from_secs(mc.fill_timeout_secs),
+                aggressive_reprice_pct: Decimal::from_str(&mc.aggressive_reprice_pct.to_string())
+                    .unwrap_or(Decimal::from_str("0.50").unwrap()),
+                min_activity_age: Duration::from_secs(mc.min_activity_age_secs),
             };
 
-            let mut maker = MakerStrategy::new(
+            let mut strategy = MakerStrategy::new(
                 api.clone(),
                 store.clone(),
                 maker_config,
                 maker_tx,
             );
-            maker.add_markets(&maker_markets);
+            strategy.add_markets(&maker_markets);
 
+            let shared = Arc::new(Mutex::new(strategy));
+
+            // Spawn the tick task with a clone of the shared maker
+            let maker_for_tick = shared.clone();
             let tick_interval = Duration::from_secs(mc.requote_interval_secs);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(tick_interval);
                 loop {
                     interval.tick().await;
-                    maker.tick().await;
+                    maker_for_tick.lock().await.tick().await;
                 }
             });
 
             info!(
                 markets = maker_markets.len(),
                 target_sum = %config.maker.target_bid_sum,
+                fill_timeout_secs = mc.fill_timeout_secs,
+                reprice_pct = %mc.aggressive_reprice_pct,
+                activity_age_secs = mc.min_activity_age_secs,
                 "maker strategy enabled"
             );
+            Some(shared)
         } else {
             warn!("maker.enabled=true but no API credentials");
+            None
         }
     } else {
         info!("maker strategy disabled (set maker.enabled=true in config)");
-    }
+        None
+    };
 
     // --- Exchange Feeds (Binance + Coinbase) ---
     let (binance_tx, mut binance_rx) = mpsc::unbounded_channel::<BinanceEvent>();
@@ -374,6 +389,10 @@ async fn main() -> anyhow::Result<()> {
                             side = %t.side,
                             "RTDS trade"
                         );
+                        // Feed trade activity to maker for pre-flight liquidity checks
+                        if let Some(ref m) = maker {
+                            m.lock().await.record_activity(&t.asset_id);
+                        }
                     }
                     RtdsEvent::OrderMatch(m) => {
                         info!(
@@ -382,6 +401,10 @@ async fn main() -> anyhow::Result<()> {
                             size = %m.size,
                             "RTDS match"
                         );
+                        // Feed match activity to maker too
+                        if let Some(ref mkr) = maker {
+                            mkr.lock().await.record_activity(&m.asset_id);
+                        }
                     }
                     RtdsEvent::CryptoPrice { symbol, price } => {
                         info!(symbol = %symbol, price = %price, "crypto price");
@@ -493,6 +516,38 @@ async fn main() -> anyhow::Result<()> {
                             "ROUND-TRIP COMPLETE"
                         );
                     }
+                    MakerEvent::AggressiveReprice { condition_id, token_id, old_price, new_price } => {
+                        warn!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            token = %token_id[..12.min(token_id.len())],
+                            old = %old_price,
+                            new = %new_price,
+                            "aggressive reprice — chasing fill"
+                        );
+                    }
+                    MakerEvent::FillTimeout { condition_id, filled_token, unfilled_tokens } => {
+                        error!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            filled = %filled_token[..12.min(filled_token.len())],
+                            unfilled = ?unfilled_tokens,
+                            "FILL TIMEOUT — unwinding position"
+                        );
+                    }
+                    MakerEvent::Unwinding { condition_id, token_id, size } => {
+                        warn!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            token = %token_id[..12.min(token_id.len())],
+                            size = %size,
+                            "unwinding filled leg"
+                        );
+                    }
+                    MakerEvent::MarketSkipped { condition_id, reason } => {
+                        info!(
+                            condition = %condition_id[..12.min(condition_id.len())],
+                            reason = %reason,
+                            "market skipped — insufficient activity"
+                        );
+                    }
                 }
             }
 
@@ -500,10 +555,16 @@ async fn main() -> anyhow::Result<()> {
                 info!("shutting down...");
                 if let Some(ref exec) = executor {
                     if exec.is_enabled() {
-                        info!("cancelling all open orders...");
+                        info!("cancelling all arb orders...");
                         if let Err(e) = exec.cancel_all().await {
-                            error!(error = %e, "failed to cancel orders on shutdown");
+                            error!(error = %e, "failed to cancel arb orders on shutdown");
                         }
+                    }
+                }
+                if let Some(ref m) = maker {
+                    info!("cancelling all maker orders...");
+                    if let Err(e) = m.lock().await.cancel_all().await {
+                        error!(error = %e, "failed to cancel maker orders on shutdown");
                     }
                 }
                 break;

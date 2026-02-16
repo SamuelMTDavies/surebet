@@ -116,6 +116,15 @@ pub struct MakerStrategyConfig {
     /// Minimum price change to trigger requote.
     #[serde(default = "default_requote_threshold")]
     pub requote_threshold: f64,
+    /// Seconds to wait for second leg after first fill before unwinding.
+    #[serde(default = "default_fill_timeout_secs")]
+    pub fill_timeout_secs: u64,
+    /// Fraction of spread to chase on unfilled leg after partial fill (0.0-1.0).
+    #[serde(default = "default_aggressive_reprice_pct")]
+    pub aggressive_reprice_pct: f64,
+    /// Max seconds since last trade on an outcome before skipping that market.
+    #[serde(default = "default_min_activity_age_secs")]
+    pub min_activity_age_secs: u64,
 }
 
 fn default_target_bid_sum() -> f64 {
@@ -136,6 +145,15 @@ fn default_requote_interval() -> u64 {
 fn default_requote_threshold() -> f64 {
     0.01
 }
+fn default_fill_timeout_secs() -> u64 {
+    30
+}
+fn default_aggressive_reprice_pct() -> f64 {
+    0.50
+}
+fn default_min_activity_age_secs() -> u64 {
+    300
+}
 
 impl Default for MakerStrategyConfig {
     fn default() -> Self {
@@ -147,6 +165,9 @@ impl Default for MakerStrategyConfig {
             max_inventory_imbalance: default_max_imbalance(),
             requote_interval_secs: default_requote_interval(),
             requote_threshold: default_requote_threshold(),
+            fill_timeout_secs: default_fill_timeout_secs(),
+            aggressive_reprice_pct: default_aggressive_reprice_pct(),
+            min_activity_age_secs: default_min_activity_age_secs(),
         }
     }
 }

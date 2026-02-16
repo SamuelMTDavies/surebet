@@ -49,6 +49,14 @@ max_inventory_imbalance = 50.0
 requote_interval_secs = 5
 # Minimum price change to trigger a requote
 requote_threshold = 0.01
+# Seconds to wait for second leg fill before unwinding (leg risk timeout)
+fill_timeout_secs = 30
+# Fraction of spread to chase on unfilled leg after partial fill (0.0-1.0)
+# 0.5 = move halfway to the ask; 1.0 = match the ask (aggressive)
+aggressive_reprice_pct = 0.50
+# Max seconds since last trade on an outcome before skipping that market
+# Prevents posting in markets with no taker flow on one side
+min_activity_age_secs = 300
 
 [feeds]
 # Enable Binance/Coinbase price feeds for Chainlink oracle prediction
