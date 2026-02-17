@@ -29,6 +29,8 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub anomaly: AnomalyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,6 +261,78 @@ pub struct LoggingConfig {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnomalyConfig {
+    /// Enable the anomaly detector.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Scan interval in milliseconds.
+    #[serde(default = "default_anomaly_scan_interval")]
+    pub scan_interval_ms: u64,
+    /// Rolling window for trade history per asset (seconds).
+    #[serde(default = "default_anomaly_window")]
+    pub window_secs: u64,
+    /// A single trade this many times the average trade size is a "whale" trade.
+    #[serde(default = "default_whale_multiplier")]
+    pub whale_size_multiplier: f64,
+    /// Trade size as fraction of top-5 depth to flag as "thin-book aggression".
+    #[serde(default = "default_depth_fraction")]
+    pub depth_aggression_fraction: f64,
+    /// Volume in window must exceed this multiple of the previous window to flag "volume spike".
+    #[serde(default = "default_volume_spike")]
+    pub volume_spike_multiplier: f64,
+    /// Price must move this many percent from the rolling mean to flag "price dislocation".
+    #[serde(default = "default_price_move_pct")]
+    pub price_move_pct: f64,
+    /// Bid/ask depth ratio threshold to flag "book imbalance" (e.g. 5.0 means one side 5x heavier).
+    #[serde(default = "default_imbalance_ratio")]
+    pub book_imbalance_ratio: f64,
+    /// Maximum number of anomalies to keep in memory for the dashboard.
+    #[serde(default = "default_max_anomalies")]
+    pub max_anomalies: usize,
+}
+
+fn default_anomaly_scan_interval() -> u64 {
+    5000
+}
+fn default_anomaly_window() -> u64 {
+    300
+}
+fn default_whale_multiplier() -> f64 {
+    10.0
+}
+fn default_depth_fraction() -> f64 {
+    0.20
+}
+fn default_volume_spike() -> f64 {
+    5.0
+}
+fn default_price_move_pct() -> f64 {
+    10.0
+}
+fn default_imbalance_ratio() -> f64 {
+    5.0
+}
+fn default_max_anomalies() -> usize {
+    200
+}
+
+impl Default for AnomalyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_interval_ms: default_anomaly_scan_interval(),
+            window_secs: default_anomaly_window(),
+            whale_size_multiplier: default_whale_multiplier(),
+            depth_aggression_fraction: default_depth_fraction(),
+            volume_spike_multiplier: default_volume_spike(),
+            price_move_pct: default_price_move_pct(),
+            book_imbalance_ratio: default_imbalance_ratio(),
+            max_anomalies: default_max_anomalies(),
+        }
+    }
+}
+
 fn default_clob_url() -> String {
     "https://clob.polymarket.com".to_string()
 }
@@ -399,6 +473,7 @@ impl Config {
             },
             dashboard: DashboardConfig::default(),
             logging: LoggingConfig::default(),
+            anomaly: AnomalyConfig::default(),
         }
     }
 

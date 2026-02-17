@@ -1,3 +1,4 @@
+mod anomaly;
 mod arb;
 mod auth;
 mod config;
@@ -9,6 +10,7 @@ mod orderbook;
 mod store;
 mod ws;
 
+use crate::anomaly::{AnomalyDetector, AnomalyEvent};
 use crate::arb::executor::{ArbExecutor, RiskLimits};
 use crate::maker::{MakerConfig, MakerEvent, MakerStrategy};
 use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
@@ -89,24 +91,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // --- Dashboard ---
-    if config.dashboard.enabled {
-        if let Some(ref store_ref) = state_store {
-            let dash_state = DashboardState {
-                store: store_ref.clone(),
-            };
-            let bind = config.dashboard.bind.clone();
-            tokio::spawn(async move {
-                if let Err(e) = dashboard::serve(dash_state, &bind).await {
-                    error!(error = %e, "dashboard server error");
-                }
-            });
-        } else {
-            warn!("dashboard enabled but Valkey not available — dashboard disabled");
-        }
-    } else {
-        info!("dashboard disabled (set dashboard.enabled=true in config)");
-    }
+    // Dashboard is launched after anomaly detector is created (see below).
 
     // --- L2 Auth Setup ---
     let creds = L2Credentials::from_config(
@@ -300,6 +285,65 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Anomaly Detector ---
+    let (anomaly_tx, mut anomaly_rx) = mpsc::unbounded_channel::<AnomalyEvent>();
+    let anomaly_markets: Vec<TrackedMarket> = markets
+        .iter()
+        .filter_map(TrackedMarket::from_discovered)
+        .collect();
+    let anomaly: Option<Arc<Mutex<AnomalyDetector>>> = if config.anomaly.enabled {
+        let detector = AnomalyDetector::new(
+            store.clone(),
+            &anomaly_markets,
+            config.anomaly.clone(),
+            anomaly_tx,
+        );
+        let shared = Arc::new(Mutex::new(detector));
+
+        // Spawn periodic scan task
+        let detector_for_scan = shared.clone();
+        let scan_interval = Duration::from_millis(config.anomaly.scan_interval_ms);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(scan_interval);
+            loop {
+                interval.tick().await;
+                detector_for_scan.lock().await.scan();
+            }
+        });
+
+        info!(
+            scan_interval_ms = config.anomaly.scan_interval_ms,
+            window_secs = config.anomaly.window_secs,
+            whale_multiplier = config.anomaly.whale_size_multiplier,
+            volume_spike = config.anomaly.volume_spike_multiplier,
+            "anomaly detector enabled"
+        );
+        Some(shared)
+    } else {
+        info!("anomaly detector disabled (set anomaly.enabled=true in config)");
+        None
+    };
+
+    // --- Dashboard (launched after anomaly detector so it can reference it) ---
+    if config.dashboard.enabled {
+        if let Some(ref store_ref) = state_store {
+            let dash_state = DashboardState {
+                store: store_ref.clone(),
+                anomaly_detector: anomaly.clone(),
+            };
+            let bind = config.dashboard.bind.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dashboard::serve(dash_state, &bind).await {
+                    error!(error = %e, "dashboard server error");
+                }
+            });
+        } else {
+            warn!("dashboard enabled but Valkey not available — dashboard disabled");
+        }
+    } else {
+        info!("dashboard disabled (set dashboard.enabled=true in config)");
+    }
+
     // --- Exchange Feeds (Binance + Coinbase) ---
     let (binance_tx, mut binance_rx) = mpsc::unbounded_channel::<BinanceEvent>();
     let (coinbase_tx, mut coinbase_rx) = mpsc::unbounded_channel::<CoinbaseEvent>();
@@ -442,6 +486,10 @@ async fn main() -> anyhow::Result<()> {
                             side = %t.side,
                             "RTDS trade"
                         );
+                        // Feed trade to anomaly detector
+                        if let Some(ref det) = anomaly {
+                            det.lock().await.record_trade(&t.asset_id, &t.price, &t.size, &t.side);
+                        }
                         // Feed trade activity to maker + Valkey
                         if let Some(ref m) = maker {
                             let mut mkr = m.lock().await;
@@ -772,6 +820,31 @@ async fn main() -> anyhow::Result<()> {
                             reason = %reason,
                             "market skipped — insufficient activity"
                         );
+                    }
+                }
+            }
+
+            Some(anomaly_event) = anomaly_rx.recv() => {
+                match anomaly_event {
+                    AnomalyEvent::Detected(a) => {
+                        // Already logged in the detector, but we can persist to Valkey here
+                        info!(
+                            kind = %a.kind,
+                            severity = %a.severity,
+                            market = %a.market_question[..a.market_question.len().min(50)],
+                            price = ?a.price,
+                            size = ?a.size,
+                            "anomaly alert"
+                        );
+                    }
+                    AnomalyEvent::ScanComplete { assets_scanned, anomalies_found } => {
+                        if anomalies_found > 0 {
+                            info!(
+                                scanned = assets_scanned,
+                                found = anomalies_found,
+                                "anomaly scan"
+                            );
+                        }
                     }
                 }
             }

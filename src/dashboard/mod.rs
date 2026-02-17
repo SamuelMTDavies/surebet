@@ -8,6 +8,7 @@
 //!   GET /api/fills        → JSON list of recent fills
 //!   GET /api/pnl          → JSON PnL totals
 
+use crate::anomaly::AnomalyDetector;
 use crate::store::{ExposureSummary, StateStore};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -22,6 +23,7 @@ use tracing::info;
 #[derive(Clone)]
 pub struct DashboardState {
     pub store: Arc<Mutex<StateStore>>,
+    pub anomaly_detector: Option<Arc<Mutex<AnomalyDetector>>>,
 }
 
 /// Build the Axum router.
@@ -33,6 +35,7 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/positions", get(api_positions))
         .route("/api/fills", get(api_fills))
         .route("/api/pnl", get(api_pnl))
+        .route("/api/anomalies", get(api_anomalies))
         .with_state(state)
 }
 
@@ -91,6 +94,16 @@ async fn api_pnl(State(state): State<DashboardState>) -> impl IntoResponse {
         "daily_pnl": daily.to_string(),
     }))
     .into_response()
+}
+
+async fn api_anomalies(State(state): State<DashboardState>) -> impl IntoResponse {
+    if let Some(ref det) = state.anomaly_detector {
+        let detector = det.lock().await;
+        let anomalies: Vec<_> = detector.recent_anomalies().into_iter().rev().cloned().collect();
+        Json(anomalies).into_response()
+    } else {
+        Json(serde_json::json!([])).into_response()
+    }
 }
 
 // --- HTML Dashboard ---
@@ -188,6 +201,47 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
             .collect()
     };
 
+    // Build anomaly table rows
+    let anomaly_rows: String = if let Some(ref det) = state.anomaly_detector {
+        let detector = det.lock().await;
+        let anomalies: Vec<_> = detector.recent_anomalies().into_iter().rev().take(30).collect();
+        if anomalies.is_empty() {
+            "<tr><td colspan=\"7\" style=\"text-align:center;color:#666\">No anomalies detected yet</td></tr>"
+                .to_string()
+        } else {
+            anomalies
+                .iter()
+                .map(|a| {
+                    let sev_color = match a.severity {
+                        crate::anomaly::Severity::High => "#e74c3c",
+                        crate::anomaly::Severity::Medium => "#f39c12",
+                        crate::anomaly::Severity::Low => "#3498db",
+                    };
+                    format!(
+                        "<tr><td style=\"color:{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        sev_color,
+                        a.severity,
+                        a.kind,
+                        &a.market_question[..a.market_question.len().min(45)],
+                        a.price.as_deref().unwrap_or("-"),
+                        a.size.as_deref().unwrap_or("-"),
+                        a.detail,
+                        a.detected_at.chars().take(19).collect::<String>(),
+                    )
+                })
+                .collect()
+        }
+    } else {
+        "<tr><td colspan=\"7\" style=\"text-align:center;color:#666\">Anomaly detector disabled</td></tr>"
+            .to_string()
+    };
+
+    let anomaly_count = if let Some(ref det) = state.anomaly_detector {
+        det.lock().await.anomalies.len()
+    } else {
+        0
+    };
+
     // PnL color
     let pnl_color = |s: &str| -> &str {
         if s.starts_with('-') {
@@ -246,7 +300,17 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
     <div class="label">Total PnL</div>
     <div class="value" style="color:{total_color}">${total_pnl}</div>
   </div>
+  <div class="card">
+    <div class="label">Anomalies</div>
+    <div class="value" style="color:#f39c12">{anomaly_count}</div>
+  </div>
 </div>
+
+<h2>Anomalies (Suspicious Activity)</h2>
+<table>
+  <tr><th>Severity</th><th>Type</th><th>Market</th><th>Price</th><th>Size</th><th>Detail</th><th>Time</th></tr>
+  {anomaly_rows}
+</table>
 
 <h2>Positions</h2>
 <table>
@@ -266,7 +330,7 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
   {fill_rows}
 </table>
 
-<div class="auto">Auto-refresh 5s | API: /api/summary, /api/orders, /api/positions, /api/fills, /api/pnl</div>
+<div class="auto">Auto-refresh 5s | API: /api/summary, /api/orders, /api/positions, /api/fills, /api/pnl, /api/anomalies</div>
 </body>
 </html>"#,
         open_orders = summary.total_open_orders,
@@ -276,6 +340,8 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
         total_pnl = summary.total_pnl,
         daily_color = pnl_color(&summary.daily_pnl),
         total_color = pnl_color(&summary.total_pnl),
+        anomaly_count = anomaly_count,
+        anomaly_rows = anomaly_rows,
         position_rows = position_rows,
         order_rows = order_rows,
         fill_rows = fill_rows,
