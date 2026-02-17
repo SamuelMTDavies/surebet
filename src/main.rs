@@ -28,7 +28,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -404,7 +404,7 @@ async fn main() -> anyhow::Result<()> {
                     ClobEvent::Connected => info!("CLOB connected"),
                     ClobEvent::Disconnected => warn!("CLOB disconnected"),
                     ClobEvent::BookSnapshot { asset_id, bid_levels, ask_levels } => {
-                        info!(
+                        debug!(
                             asset = %asset_id[..12.min(asset_id.len())],
                             bids = bid_levels,
                             asks = ask_levels,
@@ -412,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     ClobEvent::PriceChange { asset_id, best_bid, best_ask } => {
-                        info!(
+                        debug!(
                             asset = %asset_id[..12.min(asset_id.len())],
                             bid = ?best_bid,
                             ask = ?best_ask,
@@ -420,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     ClobEvent::LastTradePrice { asset_id, price } => {
-                        info!(
+                        debug!(
                             asset = %asset_id[..12.min(asset_id.len())],
                             price = %price,
                             "last trade"
@@ -434,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
                     RtdsEvent::Connected => info!("RTDS connected"),
                     RtdsEvent::Disconnected => warn!("RTDS disconnected"),
                     RtdsEvent::Trade(t) => {
-                        info!(
+                        debug!(
                             asset = %t.asset_id,
                             price = %t.price,
                             size = %t.size,
@@ -450,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     RtdsEvent::OrderMatch(m) => {
-                        info!(
+                        debug!(
                             asset = %m.asset_id,
                             price = %m.price,
                             size = %m.size,
@@ -464,7 +464,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     RtdsEvent::CryptoPrice { symbol, price } => {
-                        info!(symbol = %symbol, price = %price, "crypto price");
+                        debug!(symbol = %symbol, price = %price, "crypto price");
                     }
                     RtdsEvent::RawEvent(_) => {}
                 }
