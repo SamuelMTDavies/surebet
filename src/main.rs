@@ -3,13 +3,14 @@ mod auth;
 mod config;
 mod dashboard;
 mod feeds;
+mod maker;
 mod market;
 mod orderbook;
 mod store;
 mod ws;
 
 use crate::arb::executor::{ArbExecutor, RiskLimits};
-use crate::arb::maker::{MakerConfig, MakerEvent, MakerStrategy};
+use crate::maker::{MakerConfig, MakerEvent, MakerStrategy};
 use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
 use crate::auth::{ClobApiClient, L2Credentials};
 use crate::config::Config;

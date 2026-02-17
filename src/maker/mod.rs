@@ -1,6 +1,6 @@
-//! Market-making strategy for cross-outcome arbitrage.
+//! Passive market-making (liquidity-providing) strategy.
 //!
-//! Posts passive bid orders on all outcomes of a market such that
+//! Posts passive bid orders on all outcomes of a binary market such that
 //! bid_sum < $1.00. When all legs fill, you hold a guaranteed-profit
 //! portfolio. Pays zero taker fees and earns maker rebates.
 //!
@@ -176,6 +176,8 @@ pub struct MakerStrategy {
     states: HashMap<String, MarketState>,
     event_tx: mpsc::UnboundedSender<MakerEvent>,
     activity: ActivityTracker,
+    /// Tick counter for periodic diagnostics.
+    tick_count: u64,
 }
 
 impl MakerStrategy {
@@ -192,6 +194,7 @@ impl MakerStrategy {
             states: HashMap::new(),
             event_tx,
             activity: ActivityTracker::default(),
+            tick_count: 0,
         }
     }
 
@@ -229,6 +232,7 @@ impl MakerStrategy {
 
     /// Main tick: for each market, check requotes, fill timeouts, and unwinds.
     pub async fn tick(&mut self) {
+        self.tick_count += 1;
         let condition_ids: Vec<String> = self.states.keys().cloned().collect();
 
         for cid in &condition_ids {
@@ -243,6 +247,77 @@ impl MakerStrategy {
                 error!(condition_id = %cid, error = %e, "maker tick error");
             }
         }
+
+        // Emit diagnostics every 30 ticks
+        if self.tick_count % 30 == 0 {
+            self.emit_diagnostics();
+        }
+    }
+
+    /// Emit periodic diagnostics about maker health.
+    fn emit_diagnostics(&self) {
+        let total_markets = self.states.len();
+        let mut active_quotes = 0usize;
+        let mut pending_fills = 0usize;
+        let mut total_inventory = Decimal::ZERO;
+        let mut tightest_edge: Option<Decimal> = None;
+        let mut tightest_market: Option<String> = None;
+        let mut markets_with_books = 0usize;
+        let mut skipped_no_activity = 0usize;
+        let mut skipped_tight_spread = 0usize;
+
+        for state in self.states.values() {
+            if !state.live_orders.is_empty() {
+                active_quotes += 1;
+            }
+            if state.first_fill_at.is_some() {
+                pending_fills += 1;
+            }
+            let inv: Decimal = state.inventory.values().copied().sum();
+            total_inventory += inv;
+
+            // Check if this market has book data and compute edge
+            let has_books = state.market.outcomes.iter().all(|(_, tid)| {
+                self.store
+                    .get_book(tid)
+                    .and_then(|b| b.asks.best(false))
+                    .is_some()
+            });
+
+            if has_books {
+                markets_with_books += 1;
+
+                // Check what's blocking this market
+                if !self.check_market_activity(&state.market) {
+                    skipped_no_activity += 1;
+                } else if self.compute_bids(&state.market).is_none() {
+                    skipped_tight_spread += 1;
+                }
+
+                // Compute the edge we'd get at target_bid_sum
+                if let Some(prices) = self.compute_bids(&state.market) {
+                    let bid_sum: Decimal = prices.values().copied().sum();
+                    let edge = Decimal::ONE - bid_sum;
+                    if tightest_edge.is_none() || edge < tightest_edge.unwrap() {
+                        tightest_edge = Some(edge);
+                        tightest_market = Some(state.market.question.clone());
+                    }
+                }
+            }
+        }
+
+        info!(
+            total = total_markets,
+            with_books = markets_with_books,
+            quoting = active_quotes,
+            pending_fills = pending_fills,
+            inventory = %total_inventory,
+            tightest_edge = ?tightest_edge,
+            tightest = ?tightest_market.as_deref().map(|s| &s[..s.len().min(50)]),
+            skipped_activity = skipped_no_activity,
+            skipped_spread = skipped_tight_spread,
+            "MAKER diagnostics"
+        );
     }
 
     /// Check if any market has a partial fill that's timed out.

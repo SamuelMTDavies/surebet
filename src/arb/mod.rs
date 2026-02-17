@@ -5,7 +5,6 @@
 //! deviates from $1.00 by more than the fee structure allows.
 
 pub mod executor;
-pub mod maker;
 
 use crate::market::DiscoveredMarket;
 use crate::orderbook::OrderBookStore;
