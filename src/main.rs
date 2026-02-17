@@ -480,11 +480,75 @@ async fn main() -> anyhow::Result<()> {
                             fillable = %opp.max_fillable_size,
                             "ARB OPPORTUNITY"
                         );
+
+                        let mut executed_live = false;
                         if let Some(ref exec) = executor {
                             match exec.try_execute(&opp).await {
-                                Ok(true) => info!(market = %opp.question, "arb executed"),
+                                Ok(true) => {
+                                    info!(market = %opp.question, "arb executed");
+                                    executed_live = true;
+                                }
                                 Ok(false) => {}
                                 Err(e) => error!(error = %e, "arb execution error"),
+                            }
+                        }
+
+                        // Paper trade: simulate the fill and persist to Valkey
+                        // so the dashboard has something to show.
+                        if !executed_live {
+                            if let Some(ref ss) = state_store {
+                                let mut vk = ss.lock().await;
+                                let now = chrono::Utc::now().to_rfc3339();
+                                let paper_id = format!("paper-{}", chrono::Utc::now().timestamp_millis());
+                                let size = opp.max_fillable_size.min(
+                                    Decimal::from(100) / opp.ask_sum
+                                );
+
+                                // Record simulated position
+                                let legs: Vec<PositionLeg> = opp.legs.iter().map(|l| PositionLeg {
+                                    label: l.label.clone(),
+                                    token_id: l.token_id.clone(),
+                                    inventory: size.to_string(),
+                                    avg_price: l.best_ask.to_string(),
+                                }).collect();
+
+                                let pos = PositionRecord {
+                                    condition_id: opp.condition_id.clone(),
+                                    question: opp.question.clone(),
+                                    legs,
+                                    bid_sum: opp.ask_sum.to_string(),
+                                    edge: opp.net_edge.to_string(),
+                                    pending_fill: false,
+                                    updated_at: now.clone(),
+                                };
+                                let _ = vk.set_position(&pos).await;
+
+                                // Record simulated fills for each leg
+                                for leg in &opp.legs {
+                                    let fill = FillRecord {
+                                        order_id: format!("{}-{}", paper_id, &leg.token_id[..8.min(leg.token_id.len())]),
+                                        condition_id: opp.condition_id.clone(),
+                                        token_id: leg.token_id.clone(),
+                                        label: leg.label.clone(),
+                                        side: "BUY".to_string(),
+                                        price: leg.best_ask.to_string(),
+                                        size: size.to_string(),
+                                        timestamp: now.clone(),
+                                        strategy: "arb-paper".to_string(),
+                                    };
+                                    let _ = vk.record_fill(&fill).await;
+                                }
+
+                                // Record simulated PnL (net_edge * size)
+                                let paper_pnl = opp.net_edge * size;
+                                let _ = vk.add_pnl(paper_pnl).await;
+
+                                info!(
+                                    market = %opp.question,
+                                    size = %size,
+                                    pnl = %paper_pnl,
+                                    "PAPER TRADE simulated"
+                                );
                             }
                         }
                     }

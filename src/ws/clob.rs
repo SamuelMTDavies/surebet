@@ -199,8 +199,20 @@ fn process_clob_message(
     store: &OrderBookStore,
     event_tx: &mpsc::UnboundedSender<ClobEvent>,
 ) -> Result<(), WsError> {
-    // Messages come as JSON arrays of events
-    let events: Vec<Value> = serde_json::from_str(text)?;
+    // Messages usually come as JSON arrays, but the server also sends single
+    // objects (ack, heartbeat, error frames). Handle both.
+    let events: Vec<Value> = match serde_json::from_str::<Vec<Value>>(text) {
+        Ok(arr) => arr,
+        Err(_) => {
+            // Try as single object and wrap in a vec
+            let val: Value = serde_json::from_str(text)?;
+            if val.is_object() {
+                vec![val]
+            } else {
+                return Ok(()); // ignore unexpected scalars
+            }
+        }
+    };
 
     for event_val in events {
         let event_type = event_val
