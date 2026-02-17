@@ -561,6 +561,22 @@ async fn main() -> anyhow::Result<()> {
                             info!(scanned = markets_scanned, opps = opportunities, "arb scan");
                         }
                     }
+                    ArbEvent::ScanDiagnostics {
+                        total_markets,
+                        markets_with_books,
+                        tightest_ask_sum,
+                        tightest_market,
+                        near_misses,
+                    } => {
+                        info!(
+                            total = total_markets,
+                            with_books = markets_with_books,
+                            tightest_sum = ?tightest_ask_sum,
+                            tightest = ?tightest_market.as_deref().map(|s| &s[..s.len().min(50)]),
+                            near_misses = near_misses,
+                            "ARB SCAN diagnostics"
+                        );
+                    }
                 }
             }
 

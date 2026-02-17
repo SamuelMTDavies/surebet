@@ -77,6 +77,14 @@ pub enum ArbEvent {
     OpportunityDetected(ArbOpportunity),
     OpportunityGone { condition_id: String },
     ScanComplete { markets_scanned: usize, opportunities: usize },
+    /// Periodic diagnostics showing scanner health + near-misses.
+    ScanDiagnostics {
+        total_markets: usize,
+        markets_with_books: usize,
+        tightest_ask_sum: Option<Decimal>,
+        tightest_market: Option<String>,
+        near_misses: usize,
+    },
 }
 
 /// Dynamic taker fee model (Polymarket's fee curve).
@@ -110,6 +118,8 @@ pub struct ArbScanner {
     min_net_edge: Decimal,
     /// Track which markets currently have live opportunities.
     active_opps: HashMap<String, ArbOpportunity>,
+    /// Scan counter for periodic diagnostics.
+    scan_count: u64,
 }
 
 impl ArbScanner {
@@ -125,6 +135,7 @@ impl ArbScanner {
             event_tx,
             min_net_edge,
             active_opps: HashMap::new(),
+            scan_count: 0,
         }
     }
 
@@ -132,9 +143,47 @@ impl ArbScanner {
     /// Call this on every book update for the affected market,
     /// or periodically.
     pub fn scan_all(&mut self) -> Vec<ArbOpportunity> {
+        self.scan_count += 1;
         let mut opportunities = Vec::new();
 
+        // Diagnostic tracking
+        let mut markets_with_books = 0usize;
+        let mut tightest_ask_sum: Option<Decimal> = None;
+        let mut tightest_market: Option<String> = None;
+        let mut near_misses = 0usize;
+
         for market in &self.markets {
+            // Check if both sides have book data
+            let has_all_books = market
+                .outcomes
+                .iter()
+                .all(|(_, tid)| self.store.get_book(tid).and_then(|b| b.asks.best(false)).is_some());
+
+            if has_all_books {
+                markets_with_books += 1;
+
+                // Compute ask_sum even for non-opportunities (for diagnostics)
+                let ask_sum: Decimal = market
+                    .outcomes
+                    .iter()
+                    .filter_map(|(_, tid)| {
+                        self.store.get_book(tid).and_then(|b| b.asks.best(false).map(|(p, _)| p))
+                    })
+                    .sum();
+
+                // Track tightest ask_sum
+                if tightest_ask_sum.is_none() || ask_sum < tightest_ask_sum.unwrap() {
+                    tightest_ask_sum = Some(ask_sum);
+                    tightest_market = Some(market.question.clone());
+                }
+
+                // Near miss: ask_sum < 1.02 (within 2% of arb)
+                let threshold = Decimal::from_str("1.02").unwrap();
+                if ask_sum < threshold {
+                    near_misses += 1;
+                }
+            }
+
             if let Some(opp) = self.check_market(market) {
                 opportunities.push(opp);
             }
@@ -174,6 +223,17 @@ impl ArbScanner {
             markets_scanned: self.markets.len(),
             opportunities: opportunities.len(),
         });
+
+        // Emit diagnostics every 30 scans (~30s)
+        if self.scan_count % 30 == 0 {
+            let _ = self.event_tx.send(ArbEvent::ScanDiagnostics {
+                total_markets: self.markets.len(),
+                markets_with_books,
+                tightest_ask_sum,
+                tightest_market,
+                near_misses,
+            });
+        }
 
         opportunities
     }
