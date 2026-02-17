@@ -356,6 +356,7 @@ pub struct CrossbookConfig {
     #[serde(default = "default_sports_keys")]
     pub sports_keys: Vec<String>,
     /// How often to fetch fresh odds from The Odds API (seconds).
+    /// Default: 21600 (6 hours). With 4 sports this gives ~480 req/month.
     #[serde(default = "default_crossbook_fetch_interval")]
     pub fetch_interval_secs: u64,
     /// How often to scan for cross-provider arbs (milliseconds).
@@ -367,6 +368,13 @@ pub struct CrossbookConfig {
     /// Maximum results to keep for dashboard.
     #[serde(default = "default_crossbook_max_results")]
     pub max_results: usize,
+    /// Monthly API request budget for The Odds API (free tier = 500).
+    #[serde(default = "default_monthly_budget")]
+    pub monthly_budget: u32,
+    /// Stop fetching when remaining requests fall to this floor.
+    /// Preserves a safety margin for manual/debugging requests.
+    #[serde(default = "default_min_remaining")]
+    pub min_remaining: u32,
 }
 
 fn default_odds_api_url() -> String {
@@ -379,20 +387,17 @@ fn default_odds_markets() -> String {
     "h2h,h2h_lay".to_string()
 }
 fn default_sports_keys() -> Vec<String> {
+    // Trimmed to 4 key leagues to stay within the 500 req/month free tier.
+    // At 6-hour fetch intervals: 4 sports × 4 fetches/day × 30 days = 480 req/month.
     vec![
         "soccer_epl".to_string(),
-        "soccer_efl_champ".to_string(),
-        "soccer_england_league1".to_string(),
         "soccer_spain_la_liga".to_string(),
         "soccer_germany_bundesliga".to_string(),
-        "soccer_italy_serie_a".to_string(),
-        "soccer_france_ligue_one".to_string(),
         "soccer_uefa_champs_league".to_string(),
-        "soccer_uefa_europa_league".to_string(),
     ]
 }
 fn default_crossbook_fetch_interval() -> u64 {
-    120
+    21600 // 6 hours — conservative for 500 req/month budget
 }
 fn default_crossbook_scan_interval() -> u64 {
     5000
@@ -402,6 +407,12 @@ fn default_crossbook_min_edge() -> f64 {
 }
 fn default_crossbook_max_results() -> usize {
     100
+}
+fn default_monthly_budget() -> u32 {
+    500
+}
+fn default_min_remaining() -> u32 {
+    50
 }
 
 impl Default for CrossbookConfig {
@@ -417,6 +428,8 @@ impl Default for CrossbookConfig {
             scan_interval_ms: default_crossbook_scan_interval(),
             min_edge_pct: default_crossbook_min_edge(),
             max_results: default_crossbook_max_results(),
+            monthly_budget: default_monthly_budget(),
+            min_remaining: default_min_remaining(),
         }
     }
 }

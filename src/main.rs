@@ -365,11 +365,18 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+        let est_daily = (86400 / config.crossbook.fetch_interval_secs as u32)
+            * config.crossbook.sports_keys.len() as u32;
+        let est_monthly = est_daily * 30;
         info!(
-            fetch_interval = config.crossbook.fetch_interval_secs,
+            fetch_interval_secs = config.crossbook.fetch_interval_secs,
             scan_interval_ms = config.crossbook.scan_interval_ms,
             sports = config.crossbook.sports_keys.len(),
             min_edge_pct = config.crossbook.min_edge_pct,
+            monthly_budget = config.crossbook.monthly_budget,
+            min_remaining = config.crossbook.min_remaining,
+            est_daily_requests = est_daily,
+            est_monthly_requests = est_monthly,
             "crossbook scanner enabled"
         );
         Some(shared)

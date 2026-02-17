@@ -128,13 +128,51 @@ impl CrossbookScanner {
         }
     }
 
-    /// Fetch fresh odds from The Odds API. Call this periodically (every ~2 min).
+    /// Check whether we should fetch based on remaining API quota.
+    /// Returns false if we know we're at or below the safety floor.
+    pub fn should_fetch(&self) -> bool {
+        if let Some(remaining) = self.fetcher.requests_remaining() {
+            if remaining <= self.config.min_remaining {
+                warn!(
+                    remaining = remaining,
+                    floor = self.config.min_remaining,
+                    "skipping odds fetch — quota floor reached"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns the current API quota info for logging/dashboard.
+    pub fn quota_remaining(&self) -> Option<u32> {
+        self.fetcher.requests_remaining()
+    }
+
+    /// Returns the total requests made this session.
+    pub fn requests_made(&self) -> u32 {
+        self.fetcher.requests_made()
+    }
+
+    /// Fetch fresh odds from The Odds API. Respects the monthly budget
+    /// by checking `x-requests-remaining` and stopping at the floor.
     pub async fn fetch_odds(&mut self) {
-        match self.fetcher.fetch_all(&self.config.sports_keys).await {
-            Ok(matches) => {
+        if !self.should_fetch() {
+            return;
+        }
+
+        match self
+            .fetcher
+            .fetch_all(&self.config.sports_keys, self.config.min_remaining)
+            .await
+        {
+            Ok((matches, quota)) => {
                 info!(
                     matches = matches.len(),
                     sports = self.config.sports_keys.len(),
+                    quota_remaining = ?quota.remaining,
+                    quota_used = ?quota.used,
+                    session_requests = self.fetcher.requests_made(),
                     "fetched bookmaker odds"
                 );
                 self.bookie_matches = matches;
