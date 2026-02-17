@@ -83,6 +83,56 @@ enabled = true
 # Dashboard bind address
 bind = "127.0.0.1:3030"
 
+[anomaly]
+# Enable the anomaly detector (surfaces suspicious trades for review)
+enabled = true
+# Scan interval in milliseconds
+scan_interval_ms = 5000
+# Rolling window for trade history per asset (seconds)
+window_secs = 300
+# A single trade this many × the average size = "whale" trade
+whale_size_multiplier = 10.0
+# Volume in window must exceed this × previous window to flag "volume spike"
+volume_spike_multiplier = 5.0
+# Price must move this % from the rolling mean to flag "price dislocation"
+price_move_pct = 10.0
+# Bid/ask depth ratio threshold for "book imbalance" (5.0 = one side 5× heavier)
+book_imbalance_ratio = 5.0
+# Max anomalies to keep in memory for the dashboard
+max_anomalies = 200
+
+[crossbook]
+# Enable the cross-bookmaker arb scanner (auto-enables if ODDS_API_KEY is set)
+enabled = true
+# The Odds API key is loaded from ODDS_API_KEY env var — never put it here
+# Base URL for The Odds API
+odds_api_url = "https://api.the-odds-api.com/v4/sports"
+# Regions to fetch odds for (comma-separated: us, uk, eu, au)
+regions = "uk,eu"
+# Markets to fetch (comma-separated: h2h, h2h_lay, spreads, totals)
+markets = "h2h,h2h_lay"
+# Sports keys to monitor — keep this short to stay within API budget
+# Full list: https://the-odds-api.com/sports-odds-data/sports-apis.html
+sports_keys = [
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_germany_bundesliga",
+    "soccer_uefa_champs_league",
+]
+# How often to fetch fresh odds (seconds). 21600 = 6 hours.
+# Budget math: 4 sports × 4 fetches/day × 30 days = 480 req/month
+fetch_interval_secs = 21600
+# How often to scan for cross-provider arbs (milliseconds)
+scan_interval_ms = 5000
+# Minimum edge (%) to report a cross-provider arb
+min_edge_pct = 1.0
+# Max results to keep for dashboard
+max_results = 100
+# Monthly API request budget (free tier = 500)
+monthly_budget = 500
+# Stop fetching when remaining requests fall to this floor
+min_remaining = 50
+
 [logging]
 level = "info"
 json = false
