@@ -230,6 +230,74 @@ impl MakerStrategy {
         self.activity.record_trade(asset_id);
     }
 
+    /// Check if an observed RTDS trade would have filled one of our paper bids.
+    ///
+    /// A sell-side trade at price <= our bid means a seller would have hit our
+    /// resting bid order. We simulate the fill by calling `record_fill`, which
+    /// triggers the full state machine (inventory, round-trip check, repricing).
+    ///
+    /// Returns the (condition_id, fill_size) if a paper fill was triggered.
+    pub async fn check_paper_fill(
+        &mut self,
+        asset_id: &str,
+        trade_price: Decimal,
+        trade_size: Decimal,
+        trade_side: &str,
+    ) -> Option<(String, Decimal)> {
+        // Only sell-side trades can fill our buy (bid) orders.
+        // RTDS "side" field: "SELL" means the taker was selling → hits resting bids.
+        // Some feeds use "BUY"/"SELL", others "buy"/"sell".
+        let is_sell = trade_side.eq_ignore_ascii_case("sell");
+        if !is_sell {
+            return None;
+        }
+
+        // Find which market/state has a live paper order on this asset_id
+        let mut match_info: Option<(String, Decimal, Decimal)> = None;
+
+        for (condition_id, state) in &self.states {
+            if let Some(order) = state.live_orders.get(asset_id) {
+                // A sell at or below our bid price would fill us
+                if trade_price <= order.price {
+                    // Fill size is min of trade size and our remaining order size
+                    let already_filled = state
+                        .inventory
+                        .get(asset_id)
+                        .copied()
+                        .unwrap_or(Decimal::ZERO);
+                    let remaining = order.size - already_filled;
+                    if remaining > Decimal::ZERO {
+                        let fill_size = trade_size.min(remaining);
+                        match_info = Some((condition_id.clone(), order.price, fill_size));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((condition_id, bid_price, fill_size)) = match_info {
+            info!(
+                asset = %asset_id,
+                trade_price = %trade_price,
+                our_bid = %bid_price,
+                fill_size = %fill_size,
+                "PAPER FILL — trade matched our bid"
+            );
+
+            if let Err(e) = self.record_fill(&condition_id, asset_id, fill_size).await {
+                error!(
+                    condition_id = %condition_id,
+                    error = %e,
+                    "paper fill record error"
+                );
+            }
+
+            return Some((condition_id, fill_size));
+        }
+
+        None
+    }
+
     /// Main tick: for each market, check requotes, fill timeouts, and unwinds.
     pub async fn tick(&mut self) {
         self.tick_count += 1;

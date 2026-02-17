@@ -444,7 +444,17 @@ async fn main() -> anyhow::Result<()> {
                         );
                         // Feed trade activity to maker + Valkey
                         if let Some(ref m) = maker {
-                            m.lock().await.record_activity(&t.asset_id);
+                            let mut mkr = m.lock().await;
+                            mkr.record_activity(&t.asset_id);
+
+                            // Paper fill simulation: check if this trade would
+                            // have filled one of our resting paper bids.
+                            if let (Ok(price), Ok(size)) = (
+                                Decimal::from_str(&t.price),
+                                Decimal::from_str(&t.size),
+                            ) {
+                                mkr.check_paper_fill(&t.asset_id, price, size, &t.side).await;
+                            }
                         }
                         if let Some(ref ss) = state_store {
                             let _ = ss.lock().await.record_activity(&t.asset_id).await;
