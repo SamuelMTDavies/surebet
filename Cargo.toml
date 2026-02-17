@@ -46,7 +46,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 # Polymarket SDK (official)
-polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob", "ws", "rtds", "tracing"] }
+polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob", "ws", "rtds", "data", "tracing"] }
 futures = "0.3"
 
 # TLS — the SDK's WS client needs a rustls CryptoProvider installed

@@ -47,77 +47,159 @@ struct GammaProfile {
     num_positions: Option<u64>,
 }
 
-/// A single trade from the data API.
-#[derive(Debug, Clone, Deserialize)]
+/// A single trade/activity record, parsed from raw JSON to handle
+/// Polymarket's varying response formats (numeric timestamps, different
+/// field names across endpoints, etc.).
+#[derive(Debug, Clone)]
 struct Trade {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    market: String,
-    #[serde(default, alias = "conditionId", alias = "condition_id")]
     condition_id: String,
-    #[serde(default, alias = "assetId", alias = "asset_id", alias = "tokenID")]
     asset_id: String,
-    #[serde(default)]
     side: String,
-    #[serde(default)]
     size: f64,
-    #[serde(default)]
     price: f64,
-    #[serde(default)]
     outcome: String,
-    #[serde(default, alias = "outcomeIndex")]
-    outcome_index: Option<u32>,
-    #[serde(default, alias = "feeAmount", alias = "fee_amount")]
-    fee_amount: Option<f64>,
-    /// ISO or unix timestamp
-    #[serde(default)]
-    timestamp: String,
-    #[serde(default, alias = "createdAt", alias = "created_at")]
-    created_at: String,
-    #[serde(default)]
+    /// Unix timestamp (seconds)
+    timestamp_secs: Option<i64>,
     title: String,
-    #[serde(default, alias = "marketSlug", alias = "market_slug")]
     market_slug: String,
-    /// "MAKER" or "TAKER"
-    #[serde(default, alias = "type")]
+    /// Activity/trade type: BUY, SELL, REDEEM, MAKER, TAKER, etc.
     trade_type: String,
-    #[serde(default, alias = "transactionHash", alias = "transaction_hash")]
     transaction_hash: String,
 }
 
 impl Trade {
-    fn parsed_time(&self) -> Option<DateTime<Utc>> {
-        // Try ISO format first
-        let ts = if !self.timestamp.is_empty() {
-            &self.timestamp
-        } else if !self.created_at.is_empty() {
-            &self.created_at
-        } else {
-            return None;
-        };
+    /// Extract a Trade from a raw JSON object, trying multiple field name
+    /// variants for each property. This handles the different schemas
+    /// returned by /activity, /trades, and /data/trades endpoints.
+    fn from_json(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        Some(Self {
+            condition_id: json_str(obj, &["conditionId", "condition_id", "market"]),
+            asset_id: json_str(obj, &["asset", "assetId", "asset_id", "tokenID", "token_id"]),
+            side: json_str(obj, &["side"]),
+            size: json_f64(obj, &["size", "amount"]),
+            price: json_f64(obj, &["price"]),
+            outcome: json_str(obj, &["outcome", "outcomeLabel"]),
+            timestamp_secs: json_timestamp(obj),
+            title: json_str(obj, &["title", "question", "marketTitle", "market_title"]),
+            market_slug: json_str(obj, &["marketSlug", "market_slug", "slug"]),
+            trade_type: json_str(obj, &["type", "tradeType", "trade_type"]),
+            transaction_hash: json_str(obj, &["transactionHash", "transaction_hash", "txHash"]),
+        })
+    }
 
-        // ISO 8601
-        if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-            return Some(dt.with_timezone(&Utc));
-        }
-        if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.fZ") {
-            return Some(dt.with_timezone(&Utc));
-        }
-        // Unix seconds
-        if let Ok(secs) = ts.parse::<i64>() {
-            return DateTime::from_timestamp(secs, 0);
-        }
-        // Unix millis
-        if let Ok(ms) = ts.parse::<i64>() {
-            return DateTime::from_timestamp(ms / 1000, ((ms % 1000) * 1_000_000) as u32);
-        }
-        None
+    fn parsed_time(&self) -> Option<DateTime<Utc>> {
+        self.timestamp_secs.and_then(|s| DateTime::from_timestamp(s, 0))
     }
 
     fn notional(&self) -> f64 {
         self.size * self.price
     }
+}
+
+/// Extract a string from a JSON object, trying multiple keys.
+fn json_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(val) = obj.get(*key) {
+            match val {
+                serde_json::Value::String(s) => return s.clone(),
+                serde_json::Value::Number(n) => return n.to_string(),
+                serde_json::Value::Bool(b) => return b.to_string(),
+                _ => {}
+            }
+        }
+    }
+    String::new()
+}
+
+/// Extract a float from a JSON object, trying multiple keys.
+fn json_f64(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> f64 {
+    for key in keys {
+        if let Some(val) = obj.get(*key) {
+            match val {
+                serde_json::Value::Number(n) => {
+                    if let Some(f) = n.as_f64() {
+                        return f;
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    if let Ok(f) = s.parse::<f64>() {
+                        return f;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    0.0
+}
+
+/// Extract a unix timestamp (seconds) from a JSON object.
+/// Handles: numeric seconds, numeric millis, ISO strings.
+fn json_timestamp(obj: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
+    let keys = ["timestamp", "createdAt", "created_at", "time"];
+    for key in keys {
+        if let Some(val) = obj.get(key) {
+            match val {
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        // Distinguish seconds from milliseconds
+                        if i > 1_000_000_000_000 {
+                            return Some(i / 1000); // millis → secs
+                        }
+                        return Some(i);
+                    }
+                    if let Some(f) = n.as_f64() {
+                        return Some(f as i64);
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    // ISO 8601
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                        return Some(dt.timestamp());
+                    }
+                    // Try "2025-01-15T12:00:00.000Z" without timezone offset
+                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
+                        return Some(dt.and_utc().timestamp());
+                    }
+                    // Plain numeric string
+                    if let Ok(i) = s.parse::<i64>() {
+                        if i > 1_000_000_000_000 {
+                            return Some(i / 1000);
+                        }
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Parse an array of JSON values into Trade structs.
+fn parse_trades_from_json(text: &str) -> Vec<Trade> {
+    let val: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    // Could be a plain array or wrapped in {"data": [...]} / {"trades": [...]}
+    let items = match &val {
+        serde_json::Value::Array(arr) => arr.clone(),
+        serde_json::Value::Object(obj) => {
+            for key in &["data", "trades", "results", "items", "activity"] {
+                if let Some(serde_json::Value::Array(arr)) = obj.get(*key) {
+                    return arr.iter().filter_map(|v| {
+                        v.as_object().and_then(Trade::from_json)
+                    }).collect();
+                }
+            }
+            return Vec::new();
+        }
+        _ => return Vec::new(),
+    };
+
+    items.iter().filter_map(|v| v.as_object().and_then(Trade::from_json)).collect()
 }
 
 /// A position from the data API.
@@ -229,7 +311,9 @@ async fn fetch_trades(client: &Client, address: &str, limit: usize) -> anyhow::R
     let mut all_trades = Vec::new();
     let page_size = 100;
 
-    // Try multiple API patterns
+    // Try multiple API patterns — the first one that returns data wins.
+    // Polymarket has several endpoints with different schemas; our JSON
+    // extractor handles all of them.
     let base_urls = [
         format!("{}/activity?user={}", DATA_API, address),
         format!("{}/trades?user={}", DATA_API, address),
@@ -246,31 +330,13 @@ async fn fetch_trades(client: &Client, address: &str, limit: usize) -> anyhow::R
             match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let text = resp.text().await.unwrap_or_default();
-
-                    // Try to parse as array of trades
-                    let page: Vec<Trade> = match serde_json::from_str(&text) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            // Might be wrapped in an object
-                            #[derive(Deserialize)]
-                            struct Wrapper {
-                                #[serde(default, alias = "data", alias = "trades", alias = "results")]
-                                items: Vec<Trade>,
-                            }
-                            match serde_json::from_str::<Wrapper>(&text) {
-                                Ok(w) => w.items,
-                                Err(_) => {
-                                    if offset == 0 {
-                                        eprintln!("    couldn't parse response ({}...)",
-                                            &text[..text.len().min(200)]);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    };
+                    let page = parse_trades_from_json(&text);
 
                     if page.is_empty() {
+                        if offset == 0 && !text.is_empty() && text != "[]" {
+                            eprintln!("    0 trades parsed from response ({}...)",
+                                &text[..text.len().min(200)]);
+                        }
                         break;
                     }
 
@@ -364,8 +430,8 @@ fn analyze(profile: &GammaProfile, trades: &[Trade], positions: &[Position]) {
         println!("  Open Positions: {}", n);
     }
 
-    if trades.is_empty() {
-        println!("\n  No trades fetched — cannot perform behavioral analysis.");
+    if trades.is_empty() && positions.is_empty() {
+        println!("\n  No trades or positions fetched — cannot perform analysis.");
         println!("  Try passing the proxy wallet address directly if username resolution");
         println!("  returned a different wallet.");
         return;
@@ -378,7 +444,30 @@ fn analyze(profile: &GammaProfile, trades: &[Trade], positions: &[Position]) {
         .collect();
     timed_trades.sort_by_key(|(_, dt)| *dt);
 
-    println!("\n## Trade Activity ({} trades fetched)", trades.len());
+    println!("\n## Trade Activity ({} trades fetched, {} with timestamps)",
+        trades.len(), timed_trades.len());
+
+    // Show activity type breakdown (BUY/SELL/REDEEM/etc.)
+    if !trades.is_empty() {
+        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        for t in trades {
+            let key = if !t.trade_type.is_empty() {
+                t.trade_type.to_uppercase()
+            } else if !t.side.is_empty() {
+                t.side.to_uppercase()
+            } else {
+                "UNKNOWN".to_string()
+            };
+            *type_counts.entry(key).or_insert(0) += 1;
+        }
+        let mut type_sorted: Vec<_> = type_counts.iter().collect();
+        type_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        println!("  Activity types:");
+        for (ty, count) in &type_sorted {
+            println!("    {:12} {}", ty, count);
+        }
+    }
+
     if let (Some(first), Some(last)) = (timed_trades.first(), timed_trades.last()) {
         let span = last.1 - first.1;
         println!("  Date range:     {} → {}",
@@ -402,8 +491,12 @@ fn analyze(profile: &GammaProfile, trades: &[Trade], positions: &[Position]) {
     println!("  Avg trade size: {:.2} shares", avg_size);
 
     // ── MAKER vs TAKER ──
-    let maker_count = trades.iter().filter(|t| t.trade_type.eq_ignore_ascii_case("MAKER")).count();
-    let taker_count = trades.iter().filter(|t| t.trade_type.eq_ignore_ascii_case("TAKER")).count();
+    let maker_count = trades.iter().filter(|t| {
+        t.trade_type.eq_ignore_ascii_case("MAKER")
+    }).count();
+    let taker_count = trades.iter().filter(|t| {
+        t.trade_type.eq_ignore_ascii_case("TAKER")
+    }).count();
     if maker_count + taker_count > 0 {
         println!("  Maker trades:   {} ({:.1}%)", maker_count,
             100.0 * maker_count as f64 / (maker_count + taker_count) as f64);
@@ -411,14 +504,25 @@ fn analyze(profile: &GammaProfile, trades: &[Trade], positions: &[Position]) {
             100.0 * taker_count as f64 / (maker_count + taker_count) as f64);
     }
 
-    // ── BUY vs SELL ──
-    let buys = trades.iter().filter(|t| t.side.eq_ignore_ascii_case("BUY") || t.side == "0").count();
-    let sells = trades.iter().filter(|t| t.side.eq_ignore_ascii_case("SELL") || t.side == "1").count();
-    if buys + sells > 0 {
-        println!("  Buys:           {} ({:.1}%)", buys,
-            100.0 * buys as f64 / (buys + sells) as f64);
-        println!("  Sells:          {} ({:.1}%)", sells,
-            100.0 * sells as f64 / (buys + sells) as f64);
+    // ── BUY vs SELL vs REDEEM ──
+    let buys = trades.iter().filter(|t| {
+        t.side.eq_ignore_ascii_case("BUY") || t.side == "0"
+            || t.trade_type.eq_ignore_ascii_case("BUY")
+    }).count();
+    let sells = trades.iter().filter(|t| {
+        t.side.eq_ignore_ascii_case("SELL") || t.side == "1"
+            || t.trade_type.eq_ignore_ascii_case("SELL")
+    }).count();
+    let redeems = trades.iter().filter(|t| {
+        t.trade_type.eq_ignore_ascii_case("REDEEM")
+    }).count();
+    if buys + sells + redeems > 0 {
+        let total_bsr = (buys + sells + redeems) as f64;
+        println!("  Buys:           {} ({:.1}%)", buys, 100.0 * buys as f64 / total_bsr);
+        println!("  Sells:          {} ({:.1}%)", sells, 100.0 * sells as f64 / total_bsr);
+        if redeems > 0 {
+            println!("  Redeems:        {} ({:.1}%)", redeems, 100.0 * redeems as f64 / total_bsr);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
