@@ -545,6 +545,9 @@ impl Config {
             config.polymarket.api_passphrase = pass;
         }
         if let Ok(key) = std::env::var("ODDS_API_KEY") {
+            if !key.is_empty() {
+                config.crossbook.enabled = true;
+            }
             config.crossbook.odds_api_key = key;
         }
 
@@ -578,9 +581,14 @@ impl Config {
             dashboard: DashboardConfig::default(),
             logging: LoggingConfig::default(),
             anomaly: AnomalyConfig::default(),
-            crossbook: CrossbookConfig {
-                odds_api_key: std::env::var("ODDS_API_KEY").unwrap_or_default(),
-                ..CrossbookConfig::default()
+            crossbook: {
+                let key = std::env::var("ODDS_API_KEY").unwrap_or_default();
+                let auto_enable = !key.is_empty();
+                CrossbookConfig {
+                    enabled: auto_enable,
+                    odds_api_key: key,
+                    ..CrossbookConfig::default()
+                }
             },
         }
     }
