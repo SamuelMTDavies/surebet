@@ -718,7 +718,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     MakerEvent::MarketSkipped { condition_id, reason } => {
-                        info!(
+                        debug!(
                             condition = %condition_id[..12.min(condition_id.len())],
                             reason = %reason,
                             "market skipped — insufficient activity"
