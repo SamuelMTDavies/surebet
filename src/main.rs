@@ -1,5 +1,6 @@
 mod anomaly;
 mod arb;
+mod crossbook;
 mod auth;
 mod config;
 mod dashboard;
@@ -12,6 +13,7 @@ mod ws;
 
 use crate::anomaly::{AnomalyDetector, AnomalyEvent};
 use crate::arb::executor::{ArbExecutor, RiskLimits};
+use crate::crossbook::{CrossbookEvent, CrossbookScanner};
 use crate::maker::{MakerConfig, MakerEvent, MakerStrategy};
 use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
 use crate::auth::{ClobApiClient, L2Credentials};
@@ -324,12 +326,69 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // --- Dashboard (launched after anomaly detector so it can reference it) ---
+    // --- Cross-Bookmaker Scanner ---
+    let (crossbook_tx, mut crossbook_rx) = mpsc::unbounded_channel::<CrossbookEvent>();
+    let crossbook_markets: Vec<TrackedMarket> = markets
+        .iter()
+        .filter_map(TrackedMarket::from_discovered)
+        .collect();
+    let crossbook: Option<Arc<Mutex<CrossbookScanner>>> = if config.crossbook.enabled
+        && !config.crossbook.odds_api_key.is_empty()
+    {
+        let scanner = CrossbookScanner::new(
+            config.crossbook.clone(),
+            store.clone(),
+            crossbook_markets,
+            crossbook_tx,
+        );
+        let shared = Arc::new(Mutex::new(scanner));
+
+        // Spawn periodic fetch task (every fetch_interval_secs)
+        let scanner_for_fetch = shared.clone();
+        let fetch_interval = Duration::from_secs(config.crossbook.fetch_interval_secs);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(fetch_interval);
+            loop {
+                interval.tick().await;
+                scanner_for_fetch.lock().await.fetch_odds().await;
+            }
+        });
+
+        // Spawn periodic scan task (every scan_interval_ms)
+        let scanner_for_scan = shared.clone();
+        let scan_interval = Duration::from_millis(config.crossbook.scan_interval_ms);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(scan_interval);
+            loop {
+                interval.tick().await;
+                scanner_for_scan.lock().await.scan();
+            }
+        });
+
+        info!(
+            fetch_interval = config.crossbook.fetch_interval_secs,
+            scan_interval_ms = config.crossbook.scan_interval_ms,
+            sports = config.crossbook.sports_keys.len(),
+            min_edge_pct = config.crossbook.min_edge_pct,
+            "crossbook scanner enabled"
+        );
+        Some(shared)
+    } else {
+        if config.crossbook.enabled && config.crossbook.odds_api_key.is_empty() {
+            warn!("crossbook.enabled=true but ODDS_API_KEY not set — disabled");
+        } else {
+            info!("crossbook scanner disabled (set crossbook.enabled=true + ODDS_API_KEY)");
+        }
+        None
+    };
+
+    // --- Dashboard (launched after all modules so it can reference them) ---
     if config.dashboard.enabled {
         if let Some(ref store_ref) = state_store {
             let dash_state = DashboardState {
                 store: store_ref.clone(),
                 anomaly_detector: anomaly.clone(),
+                crossbook_scanner: crossbook.clone(),
             };
             let bind = config.dashboard.bind.clone();
             tokio::spawn(async move {
@@ -827,7 +886,6 @@ async fn main() -> anyhow::Result<()> {
             Some(anomaly_event) = anomaly_rx.recv() => {
                 match anomaly_event {
                     AnomalyEvent::Detected(a) => {
-                        // Already logged in the detector, but we can persist to Valkey here
                         info!(
                             kind = %a.kind,
                             severity = %a.severity,
@@ -846,6 +904,38 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                     }
+                }
+            }
+
+            Some(crossbook_event) = crossbook_rx.recv() => {
+                match crossbook_event {
+                    CrossbookEvent::OpportunityDetected(opp) => {
+                        info!(
+                            event = %opp.event,
+                            arb_pct = format!("{:.2}%", opp.arb_return_pct),
+                            legs = opp.legs.len(),
+                            poly = ?opp.poly_question.as_deref().map(|s| &s[..s.len().min(40)]),
+                            "CROSSBOOK ARB"
+                        );
+                    }
+                    CrossbookEvent::FetchComplete { matches_fetched, poly_links } => {
+                        info!(
+                            matches = matches_fetched,
+                            poly_links = poly_links,
+                            "crossbook odds fetched"
+                        );
+                    }
+                    CrossbookEvent::ScanComplete { events_scanned, opportunities, best_edge_pct } => {
+                        if opportunities > 0 || best_edge_pct.map_or(false, |e| e > -5.0) {
+                            info!(
+                                scanned = events_scanned,
+                                opps = opportunities,
+                                best_edge = ?best_edge_pct.map(|e| format!("{:.2}%", e)),
+                                "crossbook scan"
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
 

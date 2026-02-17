@@ -9,6 +9,7 @@
 //!   GET /api/pnl          → JSON PnL totals
 
 use crate::anomaly::AnomalyDetector;
+use crate::crossbook::CrossbookScanner;
 use crate::store::{ExposureSummary, StateStore};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -24,6 +25,7 @@ use tracing::info;
 pub struct DashboardState {
     pub store: Arc<Mutex<StateStore>>,
     pub anomaly_detector: Option<Arc<Mutex<AnomalyDetector>>>,
+    pub crossbook_scanner: Option<Arc<Mutex<CrossbookScanner>>>,
 }
 
 /// Build the Axum router.
@@ -36,6 +38,7 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/fills", get(api_fills))
         .route("/api/pnl", get(api_pnl))
         .route("/api/anomalies", get(api_anomalies))
+        .route("/api/crossbook", get(api_crossbook))
         .with_state(state)
 }
 
@@ -103,6 +106,19 @@ async fn api_anomalies(State(state): State<DashboardState>) -> impl IntoResponse
         Json(anomalies).into_response()
     } else {
         Json(serde_json::json!([])).into_response()
+    }
+}
+
+async fn api_crossbook(State(state): State<DashboardState>) -> impl IntoResponse {
+    if let Some(ref scanner) = state.crossbook_scanner {
+        let s = scanner.lock().await;
+        Json(serde_json::json!({
+            "opportunities": s.opportunities.iter().collect::<Vec<_>>(),
+            "best_odds": &s.best_odds,
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({"opportunities": [], "best_odds": []})).into_response()
     }
 }
 
@@ -242,6 +258,68 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
         0
     };
 
+    // Build crossbook best odds table rows
+    let (crossbook_rows, crossbook_count) = if let Some(ref scanner) = state.crossbook_scanner {
+        let s = scanner.lock().await;
+        let items: Vec<_> = s.best_odds.iter().take(30).collect();
+        let count = s.opportunities.len();
+        if items.is_empty() {
+            (
+                "<tr><td colspan=\"6\" style=\"text-align:center;color:#666\">No bookmaker odds fetched yet</td></tr>"
+                    .to_string(),
+                count,
+            )
+        } else {
+            let rows: String = items
+                .iter()
+                .map(|opp| {
+                    let legs_html: String = opp
+                        .legs
+                        .iter()
+                        .map(|l| {
+                            format!(
+                                "{}: <b>{:.2}</b> @ {}",
+                                l.outcome,
+                                l.raw_price,
+                                l.provider
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("<br>");
+                    let arb_color = if opp.arb_return_pct > 0.0 {
+                        "#2ecc71"
+                    } else if opp.arb_return_pct > -2.0 {
+                        "#f39c12"
+                    } else {
+                        "#8b949e"
+                    };
+                    let poly_link = opp
+                        .poly_question
+                        .as_deref()
+                        .map(|q| format!("{}", &q[..q.len().min(35)]))
+                        .unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td style=\"color:{}\">{:.2}%</td><td>{:.4}</td><td>{}</td></tr>",
+                        &opp.event[..opp.event.len().min(35)],
+                        legs_html,
+                        poly_link,
+                        arb_color,
+                        opp.arb_return_pct,
+                        opp.implied_prob_sum,
+                        opp.detected_at.chars().take(19).collect::<String>(),
+                    )
+                })
+                .collect();
+            (rows, count)
+        }
+    } else {
+        (
+            "<tr><td colspan=\"6\" style=\"text-align:center;color:#666\">Crossbook scanner disabled</td></tr>"
+                .to_string(),
+            0,
+        )
+    };
+
     // PnL color
     let pnl_color = |s: &str| -> &str {
         if s.starts_with('-') {
@@ -306,6 +384,12 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
   </div>
 </div>
 
+<h2>Cross-Bookmaker Odds ({crossbook_count} arbs)</h2>
+<table>
+  <tr><th>Event</th><th>Best Legs</th><th>Polymarket</th><th>Arb %</th><th>Implied Sum</th><th>Time</th></tr>
+  {crossbook_rows}
+</table>
+
 <h2>Anomalies (Suspicious Activity)</h2>
 <table>
   <tr><th>Severity</th><th>Type</th><th>Market</th><th>Price</th><th>Size</th><th>Detail</th><th>Time</th></tr>
@@ -330,7 +414,7 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
   {fill_rows}
 </table>
 
-<div class="auto">Auto-refresh 5s | API: /api/summary, /api/orders, /api/positions, /api/fills, /api/pnl, /api/anomalies</div>
+<div class="auto">Auto-refresh 5s | API: /api/summary, /api/orders, /api/positions, /api/fills, /api/pnl, /api/anomalies, /api/crossbook</div>
 </body>
 </html>"#,
         open_orders = summary.total_open_orders,
@@ -342,6 +426,8 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
         total_color = pnl_color(&summary.total_pnl),
         anomaly_count = anomaly_count,
         anomaly_rows = anomaly_rows,
+        crossbook_count = crossbook_count,
+        crossbook_rows = crossbook_rows,
         position_rows = position_rows,
         order_rows = order_rows,
         fill_rows = fill_rows,

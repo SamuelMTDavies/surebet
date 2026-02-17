@@ -31,6 +31,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub anomaly: AnomalyConfig,
+    #[serde(default)]
+    pub crossbook: CrossbookConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,6 +335,92 @@ impl Default for AnomalyConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CrossbookConfig {
+    /// Enable the cross-bookmaker arb scanner.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The Odds API key (loaded from env ODDS_API_KEY).
+    #[serde(default)]
+    pub odds_api_key: String,
+    /// The Odds API base URL.
+    #[serde(default = "default_odds_api_url")]
+    pub odds_api_url: String,
+    /// Regions to fetch odds for (comma-separated: us, uk, eu, au).
+    #[serde(default = "default_odds_regions")]
+    pub regions: String,
+    /// Markets to fetch (comma-separated: h2h, h2h_lay, spreads, totals).
+    #[serde(default = "default_odds_markets")]
+    pub markets: String,
+    /// Sports keys to monitor from The Odds API.
+    #[serde(default = "default_sports_keys")]
+    pub sports_keys: Vec<String>,
+    /// How often to fetch fresh odds from The Odds API (seconds).
+    #[serde(default = "default_crossbook_fetch_interval")]
+    pub fetch_interval_secs: u64,
+    /// How often to scan for cross-provider arbs (milliseconds).
+    #[serde(default = "default_crossbook_scan_interval")]
+    pub scan_interval_ms: u64,
+    /// Minimum edge (%) to report a cross-provider arb.
+    #[serde(default = "default_crossbook_min_edge")]
+    pub min_edge_pct: f64,
+    /// Maximum results to keep for dashboard.
+    #[serde(default = "default_crossbook_max_results")]
+    pub max_results: usize,
+}
+
+fn default_odds_api_url() -> String {
+    "https://api.the-odds-api.com/v4/sports".to_string()
+}
+fn default_odds_regions() -> String {
+    "uk,eu".to_string()
+}
+fn default_odds_markets() -> String {
+    "h2h,h2h_lay".to_string()
+}
+fn default_sports_keys() -> Vec<String> {
+    vec![
+        "soccer_epl".to_string(),
+        "soccer_efl_champ".to_string(),
+        "soccer_england_league1".to_string(),
+        "soccer_spain_la_liga".to_string(),
+        "soccer_germany_bundesliga".to_string(),
+        "soccer_italy_serie_a".to_string(),
+        "soccer_france_ligue_one".to_string(),
+        "soccer_uefa_champs_league".to_string(),
+        "soccer_uefa_europa_league".to_string(),
+    ]
+}
+fn default_crossbook_fetch_interval() -> u64 {
+    120
+}
+fn default_crossbook_scan_interval() -> u64 {
+    5000
+}
+fn default_crossbook_min_edge() -> f64 {
+    1.0
+}
+fn default_crossbook_max_results() -> usize {
+    100
+}
+
+impl Default for CrossbookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            odds_api_key: String::new(),
+            odds_api_url: default_odds_api_url(),
+            regions: default_odds_regions(),
+            markets: default_odds_markets(),
+            sports_keys: default_sports_keys(),
+            fetch_interval_secs: default_crossbook_fetch_interval(),
+            scan_interval_ms: default_crossbook_scan_interval(),
+            min_edge_pct: default_crossbook_min_edge(),
+            max_results: default_crossbook_max_results(),
+        }
+    }
+}
+
 fn default_clob_url() -> String {
     "https://clob.polymarket.com".to_string()
 }
@@ -443,6 +531,9 @@ impl Config {
         if let Ok(pass) = std::env::var("POLY_API_PASSPHRASE") {
             config.polymarket.api_passphrase = pass;
         }
+        if let Ok(key) = std::env::var("ODDS_API_KEY") {
+            config.crossbook.odds_api_key = key;
+        }
 
         Ok(config)
     }
@@ -474,6 +565,10 @@ impl Config {
             dashboard: DashboardConfig::default(),
             logging: LoggingConfig::default(),
             anomaly: AnomalyConfig::default(),
+            crossbook: CrossbookConfig {
+                odds_api_key: std::env::var("ODDS_API_KEY").unwrap_or_default(),
+                ..CrossbookConfig::default()
+            },
         }
     }
 
