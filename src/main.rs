@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Valkey State Store ---
     let activity_ttl = Duration::from_secs(config.maker.min_activity_age_secs);
-    let state_store = match StateStore::connect(&config.valkey.url, activity_ttl).await {
+    let state_store = match StateStore::connect(&config.valkey.url, activity_ttl, &config.valkey.prefix).await {
         Ok(mut s) => {
             if let Err(e) = s.ping().await {
                 error!(error = %e, "Valkey ping failed — continuing without state store");

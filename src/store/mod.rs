@@ -105,19 +105,33 @@ pub struct ExposureSummary {
 }
 
 /// Valkey-backed state store.
+///
+/// All keys are namespaced under a configurable prefix to allow multiple
+/// instances (e.g. paper vs live) to share a single Valkey without collisions.
+/// Default prefix: "surebet" → keys like "surebet:order:{id}", "surebet:fills", etc.
 #[derive(Clone)]
 pub struct StateStore {
     conn: MultiplexedConnection,
     activity_ttl: Duration,
+    prefix: String,
 }
 
 impl StateStore {
     /// Connect to Valkey/Redis.
-    pub async fn connect(url: &str, activity_ttl: Duration) -> anyhow::Result<Self> {
+    pub async fn connect(url: &str, activity_ttl: Duration, prefix: &str) -> anyhow::Result<Self> {
         let client = Client::open(url)?;
         let conn = client.get_multiplexed_async_connection().await?;
-        info!(url = url, "connected to Valkey");
-        Ok(Self { conn, activity_ttl })
+        info!(url = url, prefix = prefix, "connected to Valkey");
+        Ok(Self {
+            conn,
+            activity_ttl,
+            prefix: prefix.to_string(),
+        })
+    }
+
+    /// Build a namespaced key: "{prefix}:{suffix}"
+    fn key(&self, suffix: &str) -> String {
+        format!("{}:{}", self.prefix, suffix)
     }
 
     /// Test connectivity.
@@ -133,14 +147,14 @@ impl StateStore {
 
     /// Store an order. Sets TTL of 24h.
     pub async fn set_order(&mut self, order: &OrderRecord) -> anyhow::Result<()> {
-        let key = format!("order:{}", order.order_id);
+        let key = self.key(&format!("order:{}", order.order_id));
         let json = serde_json::to_string(order)?;
         self.conn
             .set_ex::<_, _, ()>(&key, &json, ORDER_TTL_SECS)
             .await?;
 
         // Add to market index
-        let market_key = format!("market_orders:{}", order.condition_id);
+        let market_key = self.key(&format!("market_orders:{}", order.condition_id));
         self.conn
             .sadd::<_, _, ()>(&market_key, &order.order_id)
             .await?;
@@ -151,7 +165,7 @@ impl StateStore {
 
     /// Get a single order.
     pub async fn get_order(&mut self, order_id: &str) -> anyhow::Result<Option<OrderRecord>> {
-        let key = format!("order:{}", order_id);
+        let key = self.key(&format!("order:{}", order_id));
         let json: Option<String> = self.conn.get(&key).await?;
         match json {
             Some(j) => Ok(Some(serde_json::from_str(&j)?)),
@@ -178,16 +192,17 @@ impl StateStore {
         &mut self,
         condition_id: &str,
     ) -> anyhow::Result<Vec<String>> {
-        let key = format!("market_orders:{}", condition_id);
+        let key = self.key(&format!("market_orders:{}", condition_id));
         let ids: Vec<String> = self.conn.smembers(&key).await?;
         Ok(ids)
     }
 
     /// Get all open orders across all markets.
     pub async fn get_all_open_orders(&mut self) -> anyhow::Result<Vec<OrderRecord>> {
-        // Scan for order:* keys
+        // Scan for namespaced order:* keys
+        let pattern = self.key("order:*");
         let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("order:*")
+            .arg(&pattern)
             .query_async(&mut self.conn)
             .await?;
 
@@ -213,7 +228,7 @@ impl StateStore {
         condition_id: &str,
         order_id: &str,
     ) -> anyhow::Result<()> {
-        let key = format!("market_orders:{}", condition_id);
+        let key = self.key(&format!("market_orders:{}", condition_id));
         self.conn.srem::<_, _, ()>(&key, order_id).await?;
         Ok(())
     }
@@ -222,7 +237,7 @@ impl StateStore {
 
     /// Update position for a market.
     pub async fn set_position(&mut self, position: &PositionRecord) -> anyhow::Result<()> {
-        let key = format!("position:{}", position.condition_id);
+        let key = self.key(&format!("position:{}", position.condition_id));
         let json = serde_json::to_string(position)?;
         self.conn.set::<_, _, ()>(&key, &json).await?;
         Ok(())
@@ -233,7 +248,7 @@ impl StateStore {
         &mut self,
         condition_id: &str,
     ) -> anyhow::Result<Option<PositionRecord>> {
-        let key = format!("position:{}", condition_id);
+        let key = self.key(&format!("position:{}", condition_id));
         let json: Option<String> = self.conn.get(&key).await?;
         match json {
             Some(j) => Ok(Some(serde_json::from_str(&j)?)),
@@ -243,8 +258,9 @@ impl StateStore {
 
     /// Get all positions.
     pub async fn get_all_positions(&mut self) -> anyhow::Result<Vec<PositionRecord>> {
+        let pattern = self.key("position:*");
         let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("position:*")
+            .arg(&pattern)
             .query_async(&mut self.conn)
             .await?;
 
@@ -265,12 +281,13 @@ impl StateStore {
     /// Record a fill. Appends to the fill log and updates PnL.
     pub async fn record_fill(&mut self, fill: &FillRecord) -> anyhow::Result<()> {
         let json = serde_json::to_string(fill)?;
+        let fills_key = self.key("fills");
 
         // Append to fill log (left-push so newest is first)
-        self.conn.lpush::<_, _, ()>("fills", &json).await?;
+        self.conn.lpush::<_, _, ()>(&fills_key, &json).await?;
         // Cap the list
         self.conn
-            .ltrim::<_, ()>("fills", 0, MAX_FILL_LOG - 1)
+            .ltrim::<_, ()>(&fills_key, 0, MAX_FILL_LOG - 1)
             .await?;
 
         debug!(
@@ -284,7 +301,8 @@ impl StateStore {
 
     /// Get recent fills (newest first).
     pub async fn get_recent_fills(&mut self, count: isize) -> anyhow::Result<Vec<FillRecord>> {
-        let jsons: Vec<String> = self.conn.lrange("fills", 0, count - 1).await?;
+        let fills_key = self.key("fills");
+        let jsons: Vec<String> = self.conn.lrange(&fills_key, 0, count - 1).await?;
         let mut fills = Vec::new();
         for j in jsons {
             if let Ok(f) = serde_json::from_str::<FillRecord>(&j) {
@@ -299,16 +317,17 @@ impl StateStore {
     /// Add to running PnL total.
     pub async fn add_pnl(&mut self, amount: Decimal) -> anyhow::Result<()> {
         // Get current total
-        let current: String = self.conn.get("pnl:total").await.unwrap_or("0".to_string());
+        let pnl_key = self.key("pnl:total");
+        let current: String = self.conn.get(&pnl_key).await.unwrap_or("0".to_string());
         let current_dec = Decimal::from_str(&current).unwrap_or(Decimal::ZERO);
         let new_total = current_dec + amount;
         self.conn
-            .set::<_, _, ()>("pnl:total", new_total.to_string())
+            .set::<_, _, ()>(&pnl_key, new_total.to_string())
             .await?;
 
         // Daily PnL
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let daily_key = format!("pnl:daily:{}", today);
+        let daily_key = self.key(&format!("pnl:daily:{}", today));
         let daily: String = self.conn.get(&daily_key).await.unwrap_or("0".to_string());
         let daily_dec = Decimal::from_str(&daily).unwrap_or(Decimal::ZERO);
         let new_daily = daily_dec + amount;
@@ -327,14 +346,15 @@ impl StateStore {
 
     /// Get total PnL.
     pub async fn get_total_pnl(&mut self) -> anyhow::Result<Decimal> {
-        let val: String = self.conn.get("pnl:total").await.unwrap_or("0".to_string());
+        let key = self.key("pnl:total");
+        let val: String = self.conn.get(&key).await.unwrap_or("0".to_string());
         Ok(Decimal::from_str(&val).unwrap_or(Decimal::ZERO))
     }
 
     /// Get daily PnL.
     pub async fn get_daily_pnl(&mut self) -> anyhow::Result<Decimal> {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let key = format!("pnl:daily:{}", today);
+        let key = self.key(&format!("pnl:daily:{}", today));
         let val: String = self.conn.get(&key).await.unwrap_or("0".to_string());
         Ok(Decimal::from_str(&val).unwrap_or(Decimal::ZERO))
     }
@@ -343,7 +363,7 @@ impl StateStore {
 
     /// Record trade activity on a token. Sets a key with TTL.
     pub async fn record_activity(&mut self, token_id: &str) -> anyhow::Result<()> {
-        let key = format!("activity:{}", token_id);
+        let key = self.key(&format!("activity:{}", token_id));
         self.conn
             .set_ex::<_, _, ()>(&key, "1", self.activity_ttl.as_secs())
             .await?;
@@ -352,7 +372,7 @@ impl StateStore {
 
     /// Check if a token has recent activity (key exists = active).
     pub async fn has_recent_activity(&mut self, token_id: &str) -> anyhow::Result<bool> {
-        let key = format!("activity:{}", token_id);
+        let key = self.key(&format!("activity:{}", token_id));
         let exists: bool = self.conn.exists(&key).await?;
         Ok(exists)
     }
@@ -387,12 +407,22 @@ impl StateStore {
         })
     }
 
-    /// Flush all surebet keys (for testing/reset).
+    /// Flush all keys under this instance's namespace (not the whole DB).
     pub async fn flush_all(&mut self) -> anyhow::Result<()> {
-        warn!("flushing all Valkey state");
-        redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut self.conn)
+        let pattern = self.key("*");
+        warn!(prefix = %self.prefix, "flushing all keys under namespace");
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut self.conn)
             .await?;
+        if !keys.is_empty() {
+            let mut cmd = redis::cmd("DEL");
+            for k in &keys {
+                cmd.arg(k);
+            }
+            cmd.query_async::<()>(&mut self.conn).await?;
+            info!(count = keys.len(), "flushed namespaced keys");
+        }
         Ok(())
     }
 }

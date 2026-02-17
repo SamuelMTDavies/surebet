@@ -73,6 +73,9 @@ max_observation_age_secs = 5
 [valkey]
 # Valkey/Redis connection URL (also supports VALKEY_URL env var)
 url = "redis://127.0.0.1:6379"
+# Key namespace prefix. Multiple instances can share one Valkey by using
+# different prefixes, e.g. "surebet:paper" vs "surebet:live"
+prefix = "surebet"
 
 [dashboard]
 # Enable the HTTP monitoring dashboard

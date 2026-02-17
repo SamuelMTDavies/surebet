@@ -201,16 +201,25 @@ pub struct ValkeyConfig {
     /// Valkey/Redis connection URL.
     #[serde(default = "default_valkey_url")]
     pub url: String,
+    /// Key namespace prefix. Allows multiple instances (e.g. "surebet:paper"
+    /// vs "surebet:live") to share one Valkey without key collisions.
+    #[serde(default = "default_valkey_prefix")]
+    pub prefix: String,
 }
 
 fn default_valkey_url() -> String {
     "redis://127.0.0.1:6379".to_string()
 }
 
+fn default_valkey_prefix() -> String {
+    "surebet".to_string()
+}
+
 impl Default for ValkeyConfig {
     fn default() -> Self {
         Self {
             url: default_valkey_url(),
+            prefix: default_valkey_prefix(),
         }
     }
 }
@@ -386,6 +395,7 @@ impl Config {
             feeds: FeedsConfig::default(),
             valkey: ValkeyConfig {
                 url: std::env::var("VALKEY_URL").unwrap_or_else(|_| default_valkey_url()),
+                prefix: std::env::var("VALKEY_PREFIX").unwrap_or_else(|_| default_valkey_prefix()),
             },
             dashboard: DashboardConfig::default(),
             logging: LoggingConfig::default(),
