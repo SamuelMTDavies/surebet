@@ -647,9 +647,48 @@ async fn main() -> anyhow::Result<()> {
                                 strategy: "maker".to_string(),
                             };
                             let _ = vk.record_fill(&fill).await;
+
+                            // Update position with leg inventory so dashboard shows fills
+                            if let Ok(Some(mut pos)) = vk.get_position(condition_id).await {
+                                // Upsert the leg
+                                if let Some(leg) = pos.legs.iter_mut().find(|l| l.token_id == *token_id) {
+                                    let prev: Decimal = Decimal::from_str(&leg.inventory).unwrap_or(Decimal::ZERO);
+                                    leg.inventory = (prev + size).to_string();
+                                    leg.avg_price = price.to_string();
+                                } else {
+                                    pos.legs.push(PositionLeg {
+                                        label: label.clone(),
+                                        token_id: token_id.clone(),
+                                        inventory: size.to_string(),
+                                        avg_price: price.to_string(),
+                                    });
+                                }
+                                pos.pending_fill = true;
+                                pos.updated_at = chrono::Utc::now().to_rfc3339();
+                                let _ = vk.set_position(&pos).await;
+                            }
                         }
-                        MakerEvent::RoundTripComplete { profit, .. } => {
+                        MakerEvent::RoundTripComplete { condition_id, profit } => {
                             let _ = vk.add_pnl(*profit).await;
+
+                            // Clear pending_fill and zero out legs on completed round-trip
+                            if let Ok(Some(mut pos)) = vk.get_position(condition_id).await {
+                                pos.pending_fill = false;
+                                for leg in &mut pos.legs {
+                                    leg.inventory = "0".to_string();
+                                }
+                                pos.updated_at = chrono::Utc::now().to_rfc3339();
+                                let _ = vk.set_position(&pos).await;
+                            }
+                        }
+                        MakerEvent::FillTimeout { condition_id, .. } => {
+                            // Mark position as unwinding
+                            if let Ok(Some(mut pos)) = vk.get_position(condition_id).await {
+                                pos.pending_fill = false;
+                                pos.edge = "UNWOUND".to_string();
+                                pos.updated_at = chrono::Utc::now().to_rfc3339();
+                                let _ = vk.set_position(&pos).await;
+                            }
                         }
                         _ => {}
                     }
