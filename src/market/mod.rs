@@ -7,12 +7,36 @@
 use crate::config::FilterConfig;
 use reqwest::Client;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 const GAMMA_MARKETS_ENDPOINT: &str = "/markets";
 const GAMMA_EVENTS_ENDPOINT: &str = "/events";
+
+/// Deserialize a field that may be either a JSON array or a stringified JSON array.
+/// The Gamma API inconsistently returns e.g. `"[\"Yes\", \"No\"]"` instead of `["Yes", "No"]`.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Vec(Vec<String>),
+        String(String),
+    }
+
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Vec(v) => Ok(v),
+        StringOrVec::String(s) => {
+            // Try parsing as JSON array
+            serde_json::from_str::<Vec<String>>(&s).map_err(|_| {
+                serde::de::Error::custom(format!("could not parse '{}' as string array", s))
+            })
+        }
+    }
+}
 
 /// A market from the Gamma API.
 #[derive(Debug, Clone, Deserialize)]
@@ -25,11 +49,11 @@ pub struct GammaMarket {
     pub question: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub outcomes: Vec<String>,
-    #[serde(default, rename = "outcomePrices")]
+    #[serde(default, rename = "outcomePrices", deserialize_with = "deserialize_string_or_vec")]
     pub outcome_prices: Vec<String>,
-    #[serde(default, rename = "clobTokenIds")]
+    #[serde(default, rename = "clobTokenIds", deserialize_with = "deserialize_string_or_vec")]
     pub clob_token_ids: Vec<String>,
     #[serde(default)]
     pub volume: String,
