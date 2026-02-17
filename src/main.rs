@@ -32,6 +32,12 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install rustls crypto provider before any TLS usage.
+    // The SDK's WS client needs this to establish TLS connections.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     // Load .env if present
     let _ = dotenvy::dotenv();
 

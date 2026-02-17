@@ -49,6 +49,9 @@ uuid = { version = "1", features = ["v4"] }
 polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob", "ws", "rtds", "tracing"] }
 futures = "0.3"
 
+# TLS — the SDK's WS client needs a rustls CryptoProvider installed
+rustls = { version = "0.23", features = ["ring"] }
+
 # State store (Valkey/Redis)
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 
