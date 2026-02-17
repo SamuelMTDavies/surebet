@@ -328,11 +328,15 @@ impl MakerStrategy {
         let mut active_quotes = 0usize;
         let mut pending_fills = 0usize;
         let mut total_inventory = Decimal::ZERO;
-        let mut tightest_edge: Option<Decimal> = None;
-        let mut tightest_market: Option<String> = None;
         let mut markets_with_books = 0usize;
         let mut skipped_no_activity = 0usize;
         let mut skipped_tight_spread = 0usize;
+        // Track the best opportunity (widest spread that passes non-activity filters)
+        let mut best_spread: Option<Decimal> = None;
+        let mut best_spread_market: Option<String> = None;
+        let mut best_spread_edge: Option<Decimal> = None;
+        // Count markets that would qualify if activity filter were relaxed
+        let mut would_qualify = 0usize;
 
         for state in self.states.values() {
             if !state.live_orders.is_empty() {
@@ -355,20 +359,39 @@ impl MakerStrategy {
             if has_books {
                 markets_with_books += 1;
 
-                // Check what's blocking this market
-                if !self.check_market_activity(&state.market) {
+                let has_activity = self.check_market_activity(&state.market);
+                let has_bids = self.compute_bids(&state.market).is_some();
+
+                if !has_activity {
                     skipped_no_activity += 1;
-                } else if self.compute_bids(&state.market).is_none() {
+                } else if !has_bids {
                     skipped_tight_spread += 1;
                 }
 
-                // Compute the edge we'd get at target_bid_sum
+                // Compute spread and edge for best-opportunity tracking
+                // (ignoring activity filter — we want to see what we're missing)
                 if let Some(prices) = self.compute_bids(&state.market) {
                     let bid_sum: Decimal = prices.values().copied().sum();
                     let edge = Decimal::ONE - bid_sum;
-                    if tightest_edge.is_none() || edge < tightest_edge.unwrap() {
-                        tightest_edge = Some(edge);
-                        tightest_market = Some(state.market.question.clone());
+
+                    if edge > Decimal::ZERO {
+                        would_qualify += 1;
+                    }
+
+                    // Compute the widest per-outcome spread in this market
+                    let widest_spread = state.market.outcomes.iter().filter_map(|(_, tid)| {
+                        let book = self.store.get_book(tid)?;
+                        let bid = book.bids.best(true)?.0;
+                        let ask = book.asks.best(false)?.0;
+                        Some(ask - bid)
+                    }).max();
+
+                    if let Some(spread) = widest_spread {
+                        if best_spread.is_none() || spread > best_spread.unwrap() {
+                            best_spread = Some(spread);
+                            best_spread_edge = Some(edge);
+                            best_spread_market = Some(state.market.question.clone());
+                        }
                     }
                 }
             }
@@ -380,8 +403,10 @@ impl MakerStrategy {
             quoting = active_quotes,
             pending_fills = pending_fills,
             inventory = %total_inventory,
-            tightest_edge = ?tightest_edge,
-            tightest = ?tightest_market.as_deref().map(|s| &s[..s.len().min(50)]),
+            best_spread = ?best_spread,
+            best_edge = ?best_spread_edge,
+            best = ?best_spread_market.as_deref().map(|s| &s[..s.len().min(50)]),
+            would_qualify = would_qualify,
             skipped_activity = skipped_no_activity,
             skipped_spread = skipped_tight_spread,
             "MAKER diagnostics"
