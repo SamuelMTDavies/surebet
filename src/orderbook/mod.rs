@@ -173,6 +173,42 @@ impl OrderBookStore {
         }
     }
 
+    /// Apply a book update from the official SDK's WebSocket stream.
+    /// The SDK already parses prices/sizes into Decimal, so no string
+    /// parsing needed here.
+    pub fn apply_sdk_book_update(
+        &self,
+        update: &polymarket_client_sdk::clob::ws::types::response::BookUpdate,
+    ) {
+        let asset_id = update.asset_id.to_string();
+
+        let bids: Vec<PriceLevel> = update
+            .bids
+            .iter()
+            .map(|l| PriceLevel {
+                price: l.price,
+                size: l.size,
+            })
+            .collect();
+        let asks: Vec<PriceLevel> = update
+            .asks
+            .iter()
+            .map(|l| PriceLevel {
+                price: l.price,
+                size: l.size,
+            })
+            .collect();
+
+        let mut book = self
+            .books
+            .entry(asset_id.clone())
+            .or_insert_with(|| OrderBook::new(asset_id));
+
+        book.bids.apply_snapshot(&bids);
+        book.asks.apply_snapshot(&asks);
+        book.last_update_ts = update.timestamp as u64;
+    }
+
     pub fn get_book(&self, asset_id: &str) -> Option<OrderBook> {
         self.books.get(asset_id).map(|b| b.clone())
     }

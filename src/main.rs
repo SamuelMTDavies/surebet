@@ -17,10 +17,10 @@ use crate::dashboard::DashboardState;
 use crate::feeds::aggregator::{AggregatorEvent, PriceAggregator};
 use crate::feeds::binance::{BinanceEvent, BinanceFeed};
 use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
-use crate::market::{classify_edge_profile, MarketDiscovery};
+use crate::market::{classify_edge_profile, DiscoveredMarket, MarketDiscovery};
 use crate::orderbook::OrderBookStore;
 use crate::store::{FillRecord, OrderRecord, OrderStatus, PositionLeg, PositionRecord, StateStore};
-use crate::ws::clob::{ClobEvent, ClobWsClient};
+use crate::ws::clob::{ClobEvent, start_clob_ws};
 use crate::ws::rtds::{RtdsEvent, RtdsSubscription, RtdsWsClient};
 use rust_decimal::Decimal;
 use std::path::Path;
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     // Build tracked markets for arb scanner
     let tracked_markets: Vec<TrackedMarket> = markets
         .iter()
-        .filter_map(TrackedMarket::from_gamma)
+        .filter_map(TrackedMarket::from_discovered)
         .collect();
 
     info!("--- Market Edge Profiles ({} markets) ---", markets.len());
@@ -161,13 +161,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- CLOB WebSocket ---
     let (clob_tx, mut clob_rx) = mpsc::unbounded_channel::<ClobEvent>();
-    let clob_client = ClobWsClient::new(
-        config.polymarket.clob_ws_url.clone(),
-        store.clone(),
-        clob_tx,
-    );
-    info!(assets = asset_ids.len(), "subscribing to CLOB market channel");
-    clob_client.subscribe(asset_ids).await?;
+    info!(assets = asset_ids.len(), "subscribing to CLOB market channel (SDK)");
+    start_clob_ws(store.clone(), clob_tx, asset_ids)?;
 
     // --- RTDS WebSocket ---
     let (rtds_tx, mut rtds_rx) = mpsc::unbounded_channel::<RtdsEvent>();
@@ -228,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
     // The maker needs its own tracked_markets clone since it moves into a task
     let maker_markets: Vec<TrackedMarket> = markets
         .iter()
-        .filter_map(TrackedMarket::from_gamma)
+        .filter_map(TrackedMarket::from_discovered)
         .collect();
 
     // Shared maker: Arc<Mutex> so both the tick task and RTDS fill handler can access it

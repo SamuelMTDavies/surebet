@@ -7,14 +7,13 @@
 pub mod executor;
 pub mod maker;
 
-use crate::market::GammaMarket;
+use crate::market::DiscoveredMarket;
 use crate::orderbook::OrderBookStore;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// A tracked market with its outcome token IDs.
 #[derive(Debug, Clone)]
@@ -27,7 +26,7 @@ pub struct TrackedMarket {
 }
 
 impl TrackedMarket {
-    pub fn from_gamma(m: &GammaMarket) -> Option<Self> {
+    pub fn from_discovered(m: &DiscoveredMarket) -> Option<Self> {
         if m.clob_token_ids.len() < 2 || m.outcomes.len() != m.clob_token_ids.len() {
             return None;
         }

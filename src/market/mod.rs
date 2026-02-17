@@ -1,170 +1,110 @@
 //! Market discovery and filtering.
 //!
-//! Uses the Polymarket Gamma API to discover active markets,
-//! then filters based on volume, depth, and category to find
-//! markets worth subscribing to.
+//! Uses the official Polymarket SDK (polymarket-client-sdk) Gamma client
+//! for market discovery. The SDK handles all Gamma API deserialization
+//! quirks (stringified JSON arrays, mixed string/float fields, etc.)
 
 use crate::config::FilterConfig;
-use reqwest::Client;
-use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer};
-use std::str::FromStr;
+use polymarket_client_sdk::gamma;
+use polymarket_client_sdk::gamma::types::request::MarketsRequest;
+use polymarket_client_sdk::gamma::types::response::Market as SdkMarket;
 use tracing::{debug, info, warn};
 
-const GAMMA_MARKETS_ENDPOINT: &str = "/markets";
-const GAMMA_EVENTS_ENDPOINT: &str = "/events";
-
-/// Deserialize a field that may be either a JSON array or a stringified JSON array.
-/// The Gamma API inconsistently returns e.g. `"[\"Yes\", \"No\"]"` instead of `["Yes", "No"]`.
-fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrVec {
-        Vec(Vec<String>),
-        String(String),
-    }
-
-    match StringOrVec::deserialize(deserializer)? {
-        StringOrVec::Vec(v) => Ok(v),
-        StringOrVec::String(s) => {
-            // Try parsing as JSON array
-            serde_json::from_str::<Vec<String>>(&s).map_err(|_| {
-                serde::de::Error::custom(format!("could not parse '{}' as string array", s))
-            })
-        }
-    }
-}
-
-/// Deserialize a field that may be a string or a number, coercing to String.
-/// The Gamma API inconsistently returns numeric fields as strings or floats.
-fn deserialize_number_or_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum NumOrStr {
-        Str(String),
-        Float(f64),
-        Int(i64),
-    }
-
-    match NumOrStr::deserialize(deserializer)? {
-        NumOrStr::Str(s) => Ok(s),
-        NumOrStr::Float(f) => Ok(f.to_string()),
-        NumOrStr::Int(i) => Ok(i.to_string()),
-    }
-}
-
-/// A market from the Gamma API.
-///
-/// Many fields use flexible deserializers because the API is inconsistent:
-/// - Array fields (outcomes, clobTokenIds) may be JSON arrays or stringified JSON
-/// - Numeric fields (volume, liquidity, spread) may be strings or raw numbers
-#[derive(Debug, Clone, Deserialize)]
-pub struct GammaMarket {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
+/// A market discovered from the Gamma API, with fields converted to string
+/// form for downstream consumption by the arb scanner, order book store, etc.
+#[derive(Debug, Clone)]
+pub struct DiscoveredMarket {
     pub condition_id: String,
-    #[serde(default)]
     pub question: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub outcomes: Vec<String>,
-    #[serde(default, rename = "outcomePrices", deserialize_with = "deserialize_string_or_vec")]
-    pub outcome_prices: Vec<String>,
-    #[serde(default, rename = "clobTokenIds", deserialize_with = "deserialize_string_or_vec")]
     pub clob_token_ids: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_number_or_string")]
-    pub volume: String,
-    #[serde(default, rename = "volume24hr", deserialize_with = "deserialize_number_or_string")]
-    pub volume_24hr: String,
-    #[serde(default, deserialize_with = "deserialize_number_or_string")]
-    pub liquidity: String,
-    #[serde(default)]
-    pub active: bool,
-    #[serde(default)]
-    pub closed: bool,
-    #[serde(default, rename = "acceptingOrders")]
-    pub accepting_orders: bool,
-    #[serde(default, rename = "enableOrderBook")]
-    pub enable_order_book: bool,
-    #[serde(default)]
+    pub volume_24hr: f64,
+    pub liquidity: f64,
     pub category: String,
-    #[serde(default, rename = "endDateIso")]
-    pub end_date: String,
-    #[serde(default, deserialize_with = "deserialize_number_or_string")]
-    pub spread: String,
-    #[serde(default, rename = "bestBid", deserialize_with = "deserialize_number_or_string")]
-    pub best_bid: String,
-    #[serde(default, rename = "bestAsk", deserialize_with = "deserialize_number_or_string")]
-    pub best_ask: String,
+    pub active: bool,
+    pub accepting_orders: bool,
 }
 
-impl GammaMarket {
-    pub fn volume_24hr_usd(&self) -> f64 {
-        self.volume_24hr.parse().unwrap_or(0.0)
-    }
+impl DiscoveredMarket {
+    /// Convert an SDK Market into our lightweight bridge type.
+    /// Returns None if the market is missing required fields.
+    pub fn from_sdk(m: &SdkMarket) -> Option<Self> {
+        let condition_id = m.condition_id.as_ref()?.to_string();
+        let clob_token_ids: Vec<String> = m
+            .clob_token_ids
+            .as_ref()?
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
 
-    pub fn liquidity_usd(&self) -> f64 {
-        self.liquidity.parse().unwrap_or(0.0)
-    }
+        if clob_token_ids.is_empty() {
+            return None;
+        }
 
-    pub fn spread_value(&self) -> Option<Decimal> {
-        Decimal::from_str(&self.spread).ok()
-    }
-
-    /// Get all CLOB token IDs (asset IDs) for this market.
-    /// Binary markets have 2 tokens (YES/NO).
-    pub fn asset_ids(&self) -> &[String] {
-        &self.clob_token_ids
+        Some(Self {
+            condition_id,
+            question: m.question.clone().unwrap_or_default(),
+            outcomes: m.outcomes.clone().unwrap_or_default(),
+            clob_token_ids,
+            volume_24hr: m
+                .volume_24hr
+                .map(|d| d.to_string().parse().unwrap_or(0.0))
+                .unwrap_or(0.0),
+            liquidity: m
+                .liquidity
+                .map(|d| d.to_string().parse().unwrap_or(0.0))
+                .unwrap_or(0.0),
+            category: m.category.clone().unwrap_or_default(),
+            active: m.active.unwrap_or(false),
+            accepting_orders: m.accepting_orders.unwrap_or(false),
+        })
     }
 }
 
-/// Fetches and filters markets from the Gamma API.
+/// Fetches and filters markets from the Gamma API using the official SDK.
 pub struct MarketDiscovery {
-    client: Client,
-    gamma_url: String,
+    client: gamma::Client,
     filters: FilterConfig,
 }
 
 impl MarketDiscovery {
     pub fn new(gamma_url: String, filters: FilterConfig) -> Self {
-        Self {
-            client: Client::new(),
-            gamma_url,
-            filters,
-        }
+        let client = gamma::Client::new(&gamma_url)
+            .unwrap_or_else(|_| gamma::Client::default());
+        Self { client, filters }
     }
 
     /// Fetch active, open markets from Gamma API with pagination.
-    pub async fn fetch_active_markets(&self) -> anyhow::Result<Vec<GammaMarket>> {
+    pub async fn fetch_active_markets(&self) -> anyhow::Result<Vec<DiscoveredMarket>> {
         let mut all_markets = Vec::new();
-        let mut offset = 0;
-        let limit = 100;
+        let mut offset = 0i32;
+        let limit = 100i32;
 
         loop {
-            let url = format!(
-                "{}{}?active=true&closed=false&limit={}&offset={}",
-                self.gamma_url, GAMMA_MARKETS_ENDPOINT, limit, offset
-            );
+            let request = MarketsRequest::builder()
+                .closed(false)
+                .limit(limit)
+                .offset(offset)
+                .build();
 
-            debug!(url = %url, "fetching markets page");
+            debug!(offset = offset, limit = limit, "fetching markets page");
 
-            let resp = self.client.get(&url).send().await?;
-            let markets: Vec<GammaMarket> = resp.json().await?;
+            let sdk_markets = self.client.markets(&request).await?;
 
-            if markets.is_empty() {
+            if sdk_markets.is_empty() {
                 break;
             }
 
-            let count = markets.len();
-            all_markets.extend(markets);
+            let count = sdk_markets.len() as i32;
+
+            // Convert SDK Markets to our bridge type, filtering out any
+            // that are missing required fields
+            let discovered: Vec<DiscoveredMarket> = sdk_markets
+                .iter()
+                .filter_map(DiscoveredMarket::from_sdk)
+                .collect();
+
+            all_markets.extend(discovered);
             offset += count;
 
             // Safety limit
@@ -174,17 +114,17 @@ impl MarketDiscovery {
             }
         }
 
-        info!(total = all_markets.len(), "fetched markets from Gamma API");
+        info!(total = all_markets.len(), "fetched markets from Gamma API (SDK)");
         Ok(all_markets)
     }
 
     /// Filter markets based on configured criteria.
-    pub fn filter_markets(&self, markets: &[GammaMarket]) -> Vec<GammaMarket> {
-        let filtered: Vec<GammaMarket> = markets
+    pub fn filter_markets(&self, markets: &[DiscoveredMarket]) -> Vec<DiscoveredMarket> {
+        let filtered: Vec<DiscoveredMarket> = markets
             .iter()
             .filter(|m| {
                 // Must be active and accepting orders
-                if !m.active || m.closed || !m.accepting_orders {
+                if !m.active || !m.accepting_orders {
                     return false;
                 }
 
@@ -194,28 +134,33 @@ impl MarketDiscovery {
                 }
 
                 // Volume filter
-                if m.volume_24hr_usd() < self.filters.min_volume_usd {
+                if m.volume_24hr < self.filters.min_volume_usd {
                     return false;
                 }
 
                 // Liquidity as proxy for depth
-                if m.liquidity_usd() < self.filters.min_depth_usd {
+                if m.liquidity < self.filters.min_depth_usd {
                     return false;
                 }
 
                 // Category filter
                 if !self.filters.categories.is_empty()
-                    && !self.filters.categories.iter().any(|c| {
-                        c.eq_ignore_ascii_case(&m.category)
-                    })
+                    && !self
+                        .filters
+                        .categories
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&m.category))
                 {
                     return false;
                 }
 
                 // Exclude categories
-                if self.filters.exclude_categories.iter().any(|c| {
-                    c.eq_ignore_ascii_case(&m.category)
-                }) {
+                if self
+                    .filters
+                    .exclude_categories
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&m.category))
+                {
                     return false;
                 }
 
@@ -236,7 +181,9 @@ impl MarketDiscovery {
     }
 
     /// Discover markets, filter, and return all asset IDs worth subscribing to.
-    pub async fn discover_asset_ids(&self) -> anyhow::Result<(Vec<String>, Vec<GammaMarket>)> {
+    pub async fn discover_asset_ids(
+        &self,
+    ) -> anyhow::Result<(Vec<String>, Vec<DiscoveredMarket>)> {
         let all = self.fetch_active_markets().await?;
         let filtered = self.filter_markets(&all);
 
@@ -279,9 +226,9 @@ impl std::fmt::Display for EdgeProfile {
     }
 }
 
-pub fn classify_edge_profile(market: &GammaMarket) -> EdgeProfile {
-    let vol = market.volume_24hr_usd();
-    let liq = market.liquidity_usd();
+pub fn classify_edge_profile(market: &DiscoveredMarket) -> EdgeProfile {
+    let vol = market.volume_24hr;
+    let liq = market.liquidity;
 
     // High-volume, high-liquidity markets are dominated by MMs
     if vol > 500_000.0 && liq > 100_000.0 {
