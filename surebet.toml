@@ -132,6 +132,10 @@ max_results = 100
 monthly_budget = 500
 # Stop fetching when remaining requests fall to this floor
 min_remaining = 50
+# Polymarket volume/depth filters for crossbook matching (lower than main
+# [filters] so that thinner sports markets aren't dropped before matching).
+poly_min_volume_usd = 100.0
+poly_min_depth_usd = 0.0
 
 [logging]
 level = "info"

@@ -368,6 +368,13 @@ pub struct CrossbookConfig {
     /// Maximum results to keep for dashboard.
     #[serde(default = "default_crossbook_max_results")]
     pub max_results: usize,
+    /// Minimum Polymarket 24h volume (USDC) for crossbook matching.
+    /// Lower than the main `[filters]` since sports markets may have thinner books.
+    #[serde(default = "default_crossbook_poly_min_volume")]
+    pub poly_min_volume_usd: f64,
+    /// Minimum Polymarket depth (USDC) for crossbook matching.
+    #[serde(default = "default_crossbook_poly_min_depth")]
+    pub poly_min_depth_usd: f64,
     /// Monthly API request budget for The Odds API (free tier = 500).
     #[serde(default = "default_monthly_budget")]
     pub monthly_budget: u32,
@@ -414,6 +421,12 @@ fn default_monthly_budget() -> u32 {
 fn default_min_remaining() -> u32 {
     50
 }
+fn default_crossbook_poly_min_volume() -> f64 {
+    100.0
+}
+fn default_crossbook_poly_min_depth() -> f64 {
+    0.0
+}
 
 impl Default for CrossbookConfig {
     fn default() -> Self {
@@ -430,6 +443,8 @@ impl Default for CrossbookConfig {
             max_results: default_crossbook_max_results(),
             monthly_budget: default_monthly_budget(),
             min_remaining: default_min_remaining(),
+            poly_min_volume_usd: default_crossbook_poly_min_volume(),
+            poly_min_depth_usd: default_crossbook_poly_min_depth(),
         }
     }
 }

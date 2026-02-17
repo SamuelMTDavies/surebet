@@ -123,12 +123,53 @@ async fn main() -> anyhow::Result<()> {
         config.filters.clone(),
     );
 
-    let (asset_ids, markets) = discovery.discover_asset_ids().await?;
+    // Fetch all markets once, then filter twice: strict for arb/maker,
+    // relaxed for crossbook (sports markets often have lower Polymarket volume).
+    let all_gamma_markets = discovery.fetch_active_markets().await?;
+    let markets = discovery.filter_markets(&all_gamma_markets);
+
+    let mut asset_ids: Vec<String> = markets
+        .iter()
+        .flat_map(|m| m.clob_token_ids.clone())
+        .collect();
 
     if asset_ids.is_empty() {
         error!("no markets found matching filters, exiting");
         return Ok(());
     }
+
+    // Crossbook gets a second filter pass with relaxed thresholds so that
+    // thin sports markets aren't dropped before the matcher sees them.
+    let crossbook_discovered = if config.crossbook.enabled
+        && !config.crossbook.odds_api_key.is_empty()
+    {
+        let crossbook_filters = crate::config::FilterConfig {
+            min_volume_usd: config.crossbook.poly_min_volume_usd,
+            min_depth_usd: config.crossbook.poly_min_depth_usd,
+            ..config.filters.clone()
+        };
+        let crossbook_discovery = MarketDiscovery::new(
+            config.polymarket.gamma_url.clone(),
+            crossbook_filters,
+        );
+        let cb_markets = crossbook_discovery.filter_markets(&all_gamma_markets);
+
+        // Merge extra asset IDs into the CLOB WS subscription
+        let extra_ids: Vec<String> = cb_markets
+            .iter()
+            .flat_map(|m| m.clob_token_ids.clone())
+            .filter(|id| !asset_ids.contains(id))
+            .collect();
+        info!(
+            crossbook_markets = cb_markets.len(),
+            extra_assets = extra_ids.len(),
+            "crossbook discovery (relaxed filters)"
+        );
+        asset_ids.extend(extra_ids);
+        cb_markets
+    } else {
+        Vec::new()
+    };
 
     // Build tracked markets for arb scanner
     let tracked_markets: Vec<TrackedMarket> = markets
@@ -328,10 +369,17 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Cross-Bookmaker Scanner ---
     let (crossbook_tx, mut crossbook_rx) = mpsc::unbounded_channel::<CrossbookEvent>();
-    let crossbook_markets: Vec<TrackedMarket> = markets
-        .iter()
-        .filter_map(TrackedMarket::from_discovered)
-        .collect();
+    let crossbook_markets: Vec<TrackedMarket> = if crossbook_discovered.is_empty() {
+        markets
+            .iter()
+            .filter_map(TrackedMarket::from_discovered)
+            .collect()
+    } else {
+        crossbook_discovered
+            .iter()
+            .filter_map(TrackedMarket::from_discovered)
+            .collect()
+    };
     let crossbook: Option<Arc<Mutex<CrossbookScanner>>> = if config.crossbook.enabled
         && !config.crossbook.odds_api_key.is_empty()
     {

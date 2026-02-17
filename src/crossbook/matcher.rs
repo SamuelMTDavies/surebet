@@ -29,6 +29,11 @@ pub struct MatchLink {
     /// e.g., "Yes" → "Arsenal" (for a "Will Arsenal win?" market)
     /// or "Arsenal" → "Arsenal" (for a multi-outcome market)
     pub outcome_map: Vec<(String, String)>,
+    /// True when the Polymarket market is binary (Yes/No) and maps to a
+    /// multi-outcome bookie event. The scanner uses special 2-leg logic:
+    /// "Yes" maps to the team winning; "No" maps to the complement
+    /// (draw + away combined) on the bookie side.
+    pub binary: bool,
 }
 
 /// Normalize a team name for comparison: lowercase, strip common suffixes,
@@ -81,11 +86,11 @@ fn contains_team(text: &str, team: &str) -> bool {
 }
 
 /// Score how well a Polymarket question matches a bookmaker event.
-/// Returns (score, outcome_mapping) or None if no match.
+/// Returns (score, outcome_mapping, is_binary) or None if no match.
 fn score_match(
     bookie: &BookmakerMatch,
     poly: &TrackedMarket,
-) -> Option<(f64, Vec<(String, String)>)> {
+) -> Option<(f64, Vec<(String, String)>, bool)> {
     let question = &poly.question;
     let poly_outcomes: Vec<&str> = poly.outcomes.iter().map(|(label, _)| label.as_str()).collect();
 
@@ -115,10 +120,14 @@ fn score_match(
                 _ => return None,
             };
 
-            // This is tricky: a binary "Will X beat Y" doesn't directly map to
-            // a 3-way h2h (Home/Draw/Away). Skip for now — these are better
-            // handled as multi-outcome.
-            return None;
+            // Binary market: "Yes" = team wins, "No" = team doesn't win.
+            // The scanner handles the complement (draw + away) on the bookie
+            // side when it sees `binary: true`.
+            return Some((
+                0.85,
+                vec![("Yes".to_string(), yes_team.to_string())],
+                true,
+            ));
         }
 
         // Multi-outcome: outcomes might be team names
@@ -134,7 +143,7 @@ fn score_match(
         }
 
         if outcome_map.len() >= 2 {
-            return Some((0.9, outcome_map));
+            return Some((0.9, outcome_map, false));
         }
     }
 
@@ -152,7 +161,7 @@ fn score_match(
         }
 
         if outcome_map.len() >= 2 {
-            return Some((0.7, outcome_map));
+            return Some((0.7, outcome_map, false));
         }
     }
 
@@ -173,7 +182,7 @@ fn score_match(
     // Need at least 2 mapped outcomes for a meaningful comparison
     if outcome_map.len() >= 2 {
         let confidence = 0.5 + 0.1 * outcome_map.len() as f64;
-        return Some((confidence.min(0.9), outcome_map));
+        return Some((confidence.min(0.9), outcome_map, false));
     }
 
     None
@@ -192,7 +201,7 @@ pub fn match_markets(
         let mut best_link: Option<MatchLink> = None;
 
         for (pi, pm) in poly_markets.iter().enumerate() {
-            if let Some((score, outcome_map)) = score_match(bm, pm) {
+            if let Some((score, outcome_map, binary)) = score_match(bm, pm) {
                 if score > best_score {
                     best_score = score;
                     best_link = Some(MatchLink {
@@ -200,6 +209,7 @@ pub fn match_markets(
                         poly_idx: pi,
                         confidence: score,
                         outcome_map,
+                        binary,
                     });
                 }
             }
@@ -211,6 +221,7 @@ pub fn match_markets(
                 poly = %poly_markets[link.poly_idx].question[..poly_markets[link.poly_idx].question.len().min(40)],
                 confidence = link.confidence,
                 outcomes = link.outcome_map.len(),
+                binary = link.binary,
                 "matched"
             );
             links.push(link);

@@ -206,69 +206,16 @@ impl CrossbookScanner {
             let bookie_match = &self.bookie_matches[link.bookie_idx];
             let poly_market = &self.poly_markets[link.poly_idx];
 
-            // For each outcome, find the best price across all bookmakers AND Polymarket
-            let mut best_per_outcome: HashMap<String, CrossbookLeg> = HashMap::new();
+            let legs: Vec<CrossbookLeg> = if link.binary {
+                self.scan_binary_link(link, bookie_match, poly_market)
+            } else {
+                self.scan_multi_link(link, bookie_match, poly_market)
+            };
 
-            // Bookmaker odds: pick best across all bookies per outcome
-            for bookie in &bookie_match.bookmakers {
-                for market in &bookie.markets {
-                    if market.key != "h2h" {
-                        continue;
-                    }
-                    for outcome in &market.outcomes {
-                        let implied = 1.0 / outcome.price as f64;
-                        let entry = best_per_outcome
-                            .entry(outcome.name.clone())
-                            .or_insert_with(|| CrossbookLeg {
-                                outcome: outcome.name.clone(),
-                                provider: bookie.title.clone(),
-                                implied_prob: implied,
-                                raw_price: outcome.price as f64,
-                            });
-                        // Lower implied prob = better odds for the bettor
-                        if implied < entry.implied_prob {
-                            entry.provider = bookie.title.clone();
-                            entry.implied_prob = implied;
-                            entry.raw_price = outcome.price as f64;
-                        }
-                    }
-                }
-            }
-
-            // Polymarket prices: check if any outcome is cheaper on Polymarket
-            for (poly_outcome, mapped_bookie_outcome) in &link.outcome_map {
-                if let Some((_, token_id)) = poly_market
-                    .outcomes
-                    .iter()
-                    .find(|(label, _)| label == poly_outcome)
-                {
-                    if let Some(book) = self.store.get_book(token_id) {
-                        if let Some((ask_price, _)) = book.asks.best(false) {
-                            let poly_implied =
-                                ask_price.to_string().parse::<f64>().unwrap_or(1.0);
-                            let entry = best_per_outcome
-                                .entry(mapped_bookie_outcome.clone())
-                                .or_insert_with(|| CrossbookLeg {
-                                    outcome: mapped_bookie_outcome.clone(),
-                                    provider: "Polymarket".to_string(),
-                                    implied_prob: poly_implied,
-                                    raw_price: poly_implied,
-                                });
-                            if poly_implied < entry.implied_prob {
-                                entry.provider = "Polymarket".to_string();
-                                entry.implied_prob = poly_implied;
-                                entry.raw_price = poly_implied;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if best_per_outcome.is_empty() {
+            if legs.is_empty() {
                 continue;
             }
 
-            let legs: Vec<CrossbookLeg> = best_per_outcome.into_values().collect();
             let implied_sum: f64 = legs.iter().map(|l| l.implied_prob).sum();
             let arb_return = (1.0 - implied_sum) * 100.0;
 
@@ -291,6 +238,7 @@ impl CrossbookScanner {
                     arb_pct = format!("{:.2}%", arb_return),
                     implied_sum = format!("{:.4}", implied_sum),
                     legs = opp.legs.len(),
+                    binary = link.binary,
                     "CROSS-PROVIDER ARB"
                 );
                 pending_arbs.push(opp);
@@ -388,6 +336,222 @@ impl CrossbookScanner {
             opportunities: opportunities_found,
             best_edge_pct: best_edge,
         });
+    }
+
+    /// Scan a multi-outcome Polymarket market against a bookie event.
+    /// Each Polymarket outcome maps 1:1 to a bookie outcome.
+    fn scan_multi_link(
+        &self,
+        link: &MatchLink,
+        bookie_match: &fetcher::BookmakerMatch,
+        poly_market: &TrackedMarket,
+    ) -> Vec<CrossbookLeg> {
+        let mut best_per_outcome: HashMap<String, CrossbookLeg> = HashMap::new();
+
+        // Bookmaker odds: pick best across all bookies per outcome
+        for bookie in &bookie_match.bookmakers {
+            for market in &bookie.markets {
+                if market.key != "h2h" {
+                    continue;
+                }
+                for outcome in &market.outcomes {
+                    let implied = 1.0 / outcome.price as f64;
+                    let entry = best_per_outcome
+                        .entry(outcome.name.clone())
+                        .or_insert_with(|| CrossbookLeg {
+                            outcome: outcome.name.clone(),
+                            provider: bookie.title.clone(),
+                            implied_prob: implied,
+                            raw_price: outcome.price as f64,
+                        });
+                    if implied < entry.implied_prob {
+                        entry.provider = bookie.title.clone();
+                        entry.implied_prob = implied;
+                        entry.raw_price = outcome.price as f64;
+                    }
+                }
+            }
+        }
+
+        // Polymarket prices: check if any outcome is cheaper on Polymarket
+        for (poly_outcome, mapped_bookie_outcome) in &link.outcome_map {
+            if let Some((_, token_id)) = poly_market
+                .outcomes
+                .iter()
+                .find(|(label, _)| label == poly_outcome)
+            {
+                if let Some(book) = self.store.get_book(token_id) {
+                    if let Some((ask_price, _)) = book.asks.best(false) {
+                        let poly_implied =
+                            ask_price.to_string().parse::<f64>().unwrap_or(1.0);
+                        let entry = best_per_outcome
+                            .entry(mapped_bookie_outcome.clone())
+                            .or_insert_with(|| CrossbookLeg {
+                                outcome: mapped_bookie_outcome.clone(),
+                                provider: "Polymarket".to_string(),
+                                implied_prob: poly_implied,
+                                raw_price: poly_implied,
+                            });
+                        if poly_implied < entry.implied_prob {
+                            entry.provider = "Polymarket".to_string();
+                            entry.implied_prob = poly_implied;
+                            entry.raw_price = poly_implied;
+                        }
+                    }
+                }
+            }
+        }
+
+        best_per_outcome.into_values().collect()
+    }
+
+    /// Scan a binary (Yes/No) Polymarket market against a multi-outcome bookie event.
+    ///
+    /// The arb structure is 2-leg:
+    ///   Leg 1 ("Team wins"):     best of { Poly Yes ask, bookie home implied }
+    ///   Leg 2 ("Team loses/draws"): best of { Poly No ask, bookie complement }
+    ///
+    /// Bookie complement = sum of best implied probs for all non-team outcomes
+    /// (e.g. Draw + Away), picking the best price per sub-outcome across bookies.
+    fn scan_binary_link(
+        &self,
+        link: &MatchLink,
+        bookie_match: &fetcher::BookmakerMatch,
+        poly_market: &TrackedMarket,
+    ) -> Vec<CrossbookLeg> {
+        // outcome_map has exactly 1 entry: ("Yes", team_name)
+        let (poly_yes_label, bookie_team) = match link.outcome_map.first() {
+            Some(entry) => entry,
+            None => return Vec::new(),
+        };
+
+        // --- Leg 1: Team wins ---
+
+        // Best bookie price for team winning
+        let mut best_team_implied = f64::MAX;
+        let mut best_team_provider = String::new();
+        let mut best_team_raw = 0.0f64;
+        for bookie in &bookie_match.bookmakers {
+            for market in &bookie.markets {
+                if market.key != "h2h" {
+                    continue;
+                }
+                for outcome in &market.outcomes {
+                    if outcome.name == *bookie_team {
+                        let implied = 1.0 / outcome.price as f64;
+                        if implied < best_team_implied {
+                            best_team_implied = implied;
+                            best_team_provider = bookie.title.clone();
+                            best_team_raw = outcome.price as f64;
+                        }
+                    }
+                }
+            }
+        }
+
+        if best_team_implied == f64::MAX {
+            return Vec::new();
+        }
+
+        let mut team_leg = CrossbookLeg {
+            outcome: bookie_team.clone(),
+            provider: best_team_provider,
+            implied_prob: best_team_implied,
+            raw_price: best_team_raw,
+        };
+
+        // Check if Poly "Yes" ask is cheaper
+        if let Some((_, token_id)) = poly_market
+            .outcomes
+            .iter()
+            .find(|(label, _)| label == poly_yes_label)
+        {
+            if let Some(book) = self.store.get_book(token_id) {
+                if let Some((ask_price, _)) = book.asks.best(false) {
+                    let poly_implied = ask_price.to_string().parse::<f64>().unwrap_or(1.0);
+                    if poly_implied < team_leg.implied_prob {
+                        team_leg.provider = "Polymarket".to_string();
+                        team_leg.implied_prob = poly_implied;
+                        team_leg.raw_price = poly_implied;
+                    }
+                }
+            }
+        }
+
+        // --- Leg 2: Team doesn't win (complement = draw + away) ---
+
+        // Best bookie complement: pick best price per non-team sub-outcome,
+        // then sum (this is the dutch cost across bookies).
+        let mut best_complement_per_sub: HashMap<String, (f64, String)> = HashMap::new();
+        for bookie in &bookie_match.bookmakers {
+            for market in &bookie.markets {
+                if market.key != "h2h" {
+                    continue;
+                }
+                for outcome in &market.outcomes {
+                    if outcome.name != *bookie_team {
+                        let implied = 1.0 / outcome.price as f64;
+                        let entry = best_complement_per_sub
+                            .entry(outcome.name.clone())
+                            .or_insert((implied, bookie.title.clone()));
+                        if implied < entry.0 {
+                            *entry = (implied, bookie.title.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if best_complement_per_sub.is_empty() {
+            return Vec::new();
+        }
+
+        let complement_implied: f64 = best_complement_per_sub.values().map(|(p, _)| p).sum();
+        let complement_provider = if best_complement_per_sub.len() == 1 {
+            best_complement_per_sub
+                .values()
+                .next()
+                .map(|(_, p)| p.clone())
+                .unwrap_or_default()
+        } else {
+            // Multiple sub-outcomes dutched across best bookies
+            let providers: Vec<&str> = best_complement_per_sub
+                .values()
+                .map(|(_, p)| p.as_str())
+                .collect();
+            if providers.iter().all(|p| *p == providers[0]) {
+                providers[0].to_string()
+            } else {
+                "Dutched".to_string()
+            }
+        };
+
+        let mut complement_leg = CrossbookLeg {
+            outcome: format!("Not {}", bookie_team),
+            provider: complement_provider,
+            implied_prob: complement_implied,
+            raw_price: complement_implied,
+        };
+
+        // Check if Poly "No" ask is cheaper
+        let poly_no_label = poly_market
+            .outcomes
+            .iter()
+            .find(|(label, _)| label != poly_yes_label);
+        if let Some((_, token_id)) = poly_no_label {
+            if let Some(book) = self.store.get_book(token_id) {
+                if let Some((ask_price, _)) = book.asks.best(false) {
+                    let poly_implied = ask_price.to_string().parse::<f64>().unwrap_or(1.0);
+                    if poly_implied < complement_leg.implied_prob {
+                        complement_leg.provider = "Polymarket".to_string();
+                        complement_leg.implied_prob = poly_implied;
+                        complement_leg.raw_price = poly_implied;
+                    }
+                }
+            }
+        }
+
+        vec![team_leg, complement_leg]
     }
 
     fn push_opportunity(&mut self, opp: CrossbookOpportunity) {
