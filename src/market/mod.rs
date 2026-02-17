@@ -38,7 +38,32 @@ where
     }
 }
 
+/// Deserialize a field that may be a string or a number, coercing to String.
+/// The Gamma API inconsistently returns numeric fields as strings or floats.
+fn deserialize_number_or_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Str(String),
+        Float(f64),
+        Int(i64),
+    }
+
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Str(s) => Ok(s),
+        NumOrStr::Float(f) => Ok(f.to_string()),
+        NumOrStr::Int(i) => Ok(i.to_string()),
+    }
+}
+
 /// A market from the Gamma API.
+///
+/// Many fields use flexible deserializers because the API is inconsistent:
+/// - Array fields (outcomes, clobTokenIds) may be JSON arrays or stringified JSON
+/// - Numeric fields (volume, liquidity, spread) may be strings or raw numbers
 #[derive(Debug, Clone, Deserialize)]
 pub struct GammaMarket {
     #[serde(default)]
@@ -55,11 +80,11 @@ pub struct GammaMarket {
     pub outcome_prices: Vec<String>,
     #[serde(default, rename = "clobTokenIds", deserialize_with = "deserialize_string_or_vec")]
     pub clob_token_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_number_or_string")]
     pub volume: String,
-    #[serde(default, rename = "volume24hr")]
+    #[serde(default, rename = "volume24hr", deserialize_with = "deserialize_number_or_string")]
     pub volume_24hr: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_number_or_string")]
     pub liquidity: String,
     #[serde(default)]
     pub active: bool,
@@ -73,11 +98,11 @@ pub struct GammaMarket {
     pub category: String,
     #[serde(default, rename = "endDateIso")]
     pub end_date: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_number_or_string")]
     pub spread: String,
-    #[serde(default, rename = "bestBid")]
+    #[serde(default, rename = "bestBid", deserialize_with = "deserialize_number_or_string")]
     pub best_bid: String,
-    #[serde(default, rename = "bestAsk")]
+    #[serde(default, rename = "bestAsk", deserialize_with = "deserialize_number_or_string")]
     pub best_ask: String,
 }
 
