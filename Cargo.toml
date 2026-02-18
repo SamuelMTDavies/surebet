@@ -58,3 +58,7 @@ redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 # Dashboard HTTP server
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
+
+# On-chain event monitoring (Polygon/EVM)
+alloy = { version = "1", features = ["provider-ws", "rpc-types-eth"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }

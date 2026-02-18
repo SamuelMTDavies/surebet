@@ -9,6 +9,7 @@ mod lifecycle;
 mod maker;
 mod market;
 mod metrics;
+mod onchain;
 mod orderbook;
 mod sniper;
 mod split;
@@ -29,6 +30,7 @@ use crate::feeds::aggregator::{AggregatorEvent, PriceAggregator};
 use crate::feeds::binance::{BinanceEvent, BinanceFeed};
 use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
 use crate::market::{classify_edge_profile, DiscoveredMarket, MarketDiscovery};
+use crate::onchain::{MarketCache, OnChainMonitor, OnChainSignal};
 use crate::orderbook::OrderBookStore;
 use crate::sniper::{SniperEngine, SniperEvent, auto_map_markets};
 use crate::sniper::executor::SniperExecutor;
@@ -676,6 +678,39 @@ async fn main() -> anyhow::Result<()> {
         coinbase_feed.subscribe(config.feeds.coinbase_products.clone());
     } else {
         info!("exchange feeds disabled (set feeds.enabled=true in config)");
+    }
+
+    // --- On-Chain Event Monitor (Polygon WebSocket) ---
+    let (onchain_tx, mut onchain_rx) = mpsc::unbounded_channel::<OnChainSignal>();
+
+    if config.onchain.enabled && !config.onchain.polygon_ws_url.is_empty() {
+        // Build the market cache from Gamma API
+        let market_cache = MarketCache::new(config.polymarket.gamma_url.clone());
+        match market_cache.load_active_markets().await {
+            Ok(count) => info!(markets = count, "on-chain market cache loaded"),
+            Err(e) => warn!(error = %e, "failed to load market cache (will populate on demand)"),
+        }
+
+        let monitor = OnChainMonitor::new(
+            config.onchain.clone(),
+            onchain_tx.clone(),
+            market_cache,
+        );
+        monitor.start();
+        info!(
+            ctf = %config.onchain.ctf_address,
+            ctf_exchange = %config.onchain.ctf_exchange,
+            neg_risk_exchange = %config.onchain.neg_risk_ctf_exchange,
+            neg_risk_adapter = %config.onchain.neg_risk_adapter,
+            max_latency_ms = config.onchain.max_latency_ms,
+            "on-chain event monitor enabled"
+        );
+    } else {
+        if config.onchain.enabled && config.onchain.polygon_ws_url.is_empty() {
+            warn!("onchain.enabled=true but POLYGON_WS_URL not set — disabled");
+        } else {
+            info!("on-chain monitor disabled (set onchain.enabled=true + POLYGON_WS_URL)");
+        }
     }
 
     // --- Periodic Tasks ---
@@ -1492,6 +1527,166 @@ async fn main() -> anyhow::Result<()> {
                         snap.lifecycle.total_cost_basis = total_cost_basis.to_string();
                         snap.lifecycle.total_mark_value = total_mark_value.to_string();
                         snap.lifecycle.unrealized_pnl = unrealized_pnl.to_string();
+                    }
+                }
+            }
+
+            Some(onchain_event) = onchain_rx.recv() => {
+                match onchain_event {
+                    OnChainSignal::Connected => {
+                        info!("on-chain monitor connected to Polygon");
+                    }
+                    OnChainSignal::Disconnected { reason } => {
+                        warn!(reason = %reason, "on-chain monitor disconnected (reconnecting)");
+                    }
+                    OnChainSignal::GapRecovered { from_block, to_block, events_found } => {
+                        info!(
+                            from = from_block,
+                            to = to_block,
+                            events = events_found,
+                            "on-chain gap recovery complete"
+                        );
+                    }
+                    OnChainSignal::NewMarket {
+                        condition_id,
+                        outcome_count,
+                        is_multi_outcome,
+                        question_id,
+                        block_number,
+                        ..
+                    } => {
+                        info!(
+                            condition_id = %condition_id,
+                            question_id = %question_id,
+                            outcomes = outcome_count,
+                            multi = is_multi_outcome,
+                            block = block_number,
+                            "ON-CHAIN: new market detected"
+                        );
+                        if is_multi_outcome {
+                            info!(
+                                condition_id = %condition_id,
+                                outcomes = outcome_count,
+                                "SPLIT ARB TARGET: multi-outcome market created on-chain"
+                            );
+                        }
+                    }
+                    OnChainSignal::ResolutionProposed {
+                        question_id,
+                        proposed_price,
+                        proposer,
+                        block_number,
+                        ..
+                    } => {
+                        let outcome = if proposed_price > 0 { "YES" } else { "NO" };
+                        warn!(
+                            question_id = %question_id,
+                            proposed = outcome,
+                            proposer = %proposer,
+                            block = block_number,
+                            "ON-CHAIN: RESOLUTION PROPOSED — sniping window open"
+                        );
+                        // Feed to sniper as on-chain resolution signal
+                        if let Some(ref engine) = sniper_engine {
+                            let qid_str = format!("{:x}", question_id);
+                            let action = engine.lock().await.on_chain_resolution(
+                                &qid_str,
+                                outcome,
+                            );
+                            if let Some(action) = action {
+                                let profit = sniper_executor.execute(&action).await;
+                                metrics.lock().await.record_trade(metrics::TradeRecord {
+                                    condition_id: action.condition_id.clone(),
+                                    strategy: "snipe-onchain".to_string(),
+                                    direction: "buy_winner".to_string(),
+                                    gross_edge: profit,
+                                    fees: Decimal::ZERO,
+                                    net_edge: profit,
+                                    size_usd: profit,
+                                    profit_usd: profit,
+                                    fill_rate: 1.0,
+                                    recorded_at: std::time::Instant::now(),
+                                });
+                            }
+                        }
+                    }
+                    OnChainSignal::ResolutionDisputed {
+                        question_id,
+                        block_number,
+                        ..
+                    } => {
+                        error!(
+                            question_id = %question_id,
+                            block = block_number,
+                            "ON-CHAIN: RESOLUTION DISPUTED — cancel any snipe orders!"
+                        );
+                    }
+                    OnChainSignal::ResolutionFinalised {
+                        condition_id,
+                        question_id,
+                        payout_numerators,
+                        block_number,
+                        ..
+                    } => {
+                        // Determine winning outcome from payouts
+                        let winner_idx = payout_numerators
+                            .iter()
+                            .position(|p| *p > alloy::primitives::U256::ZERO)
+                            .unwrap_or(0);
+                        info!(
+                            condition_id = %condition_id,
+                            question_id = %question_id,
+                            winner_index = winner_idx,
+                            payouts = ?payout_numerators,
+                            block = block_number,
+                            "ON-CHAIN: resolution finalised — trigger redemption"
+                        );
+                        // Notify lifecycle manager
+                        if let Some(ref lc) = lifecycle {
+                            let cid_str = format!("{:x}", condition_id);
+                            let winner_label = if winner_idx == 0 { "Yes" } else { "No" };
+                            lc.lock().await.on_resolution(&cid_str, winner_label);
+                            lc.lock().await.on_chain_resolution_confirmed(&cid_str);
+                        }
+                    }
+                    OnChainSignal::TokenRegistered {
+                        token_id,
+                        exchange,
+                        block_number,
+                        ..
+                    } => {
+                        debug!(
+                            token_id = %token_id,
+                            exchange = %exchange,
+                            block = block_number,
+                            "ON-CHAIN: token registered on exchange"
+                        );
+                    }
+                    OnChainSignal::PositionSplit {
+                        condition_id,
+                        collateral_amount,
+                        block_number,
+                        ..
+                    } => {
+                        debug!(
+                            condition_id = %condition_id,
+                            amount = %collateral_amount,
+                            block = block_number,
+                            "ON-CHAIN: position split (neg risk)"
+                        );
+                    }
+                    OnChainSignal::PositionsMerged {
+                        condition_id,
+                        merge_amount,
+                        block_number,
+                        ..
+                    } => {
+                        debug!(
+                            condition_id = %condition_id,
+                            amount = %merge_amount,
+                            block = block_number,
+                            "ON-CHAIN: positions merged (neg risk)"
+                        );
                     }
                 }
             }

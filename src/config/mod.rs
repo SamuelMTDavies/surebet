@@ -39,6 +39,8 @@ pub struct Config {
     pub sniper: SniperConfig,
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    #[serde(default)]
+    pub onchain: OnChainConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -686,6 +688,83 @@ impl Default for LifecycleConfig {
     }
 }
 
+// --- On-chain event monitoring config ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OnChainConfig {
+    /// Enable on-chain event monitoring (Polygon WebSocket).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Polygon WebSocket RPC endpoint (Alchemy, QuickNode, Infura, etc.).
+    /// Set via POLYGON_WS_URL env var or in config.
+    #[serde(default)]
+    pub polygon_ws_url: String,
+    /// CTF (Conditional Token Framework) contract address on Polygon.
+    #[serde(default = "default_ctf_address")]
+    pub ctf_address: String,
+    /// Neg Risk CTF Exchange contract address.
+    #[serde(default = "default_neg_risk_ctf_exchange")]
+    pub neg_risk_ctf_exchange: String,
+    /// Standard CTF Exchange contract address.
+    #[serde(default = "default_ctf_exchange")]
+    pub ctf_exchange: String,
+    /// Neg Risk Adapter contract address.
+    #[serde(default = "default_neg_risk_adapter")]
+    pub neg_risk_adapter: String,
+    /// UMA Oracle Adapter contract address (for PriceProposed/PriceDisputed).
+    #[serde(default)]
+    pub uma_oracle_adapter: String,
+    /// Maximum latency (ms) before alerting. If event processing exceeds
+    /// this threshold from block timestamp to signal emission, log a warning.
+    #[serde(default = "default_max_latency_ms")]
+    pub max_latency_ms: u64,
+    /// File path to persist last processed block number for gap recovery.
+    #[serde(default = "default_checkpoint_path")]
+    pub checkpoint_path: String,
+    /// How many blocks back to scan on startup for missed events.
+    #[serde(default = "default_startup_lookback")]
+    pub startup_lookback_blocks: u64,
+}
+
+fn default_ctf_address() -> String {
+    "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
+}
+fn default_neg_risk_ctf_exchange() -> String {
+    "0xC5d563A36AE78145C45a50134d48A1215220f80a".to_string()
+}
+fn default_ctf_exchange() -> String {
+    "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".to_string()
+}
+fn default_neg_risk_adapter() -> String {
+    "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".to_string()
+}
+fn default_max_latency_ms() -> u64 {
+    2000
+}
+fn default_checkpoint_path() -> String {
+    "onchain_checkpoint.txt".to_string()
+}
+fn default_startup_lookback() -> u64 {
+    100
+}
+
+impl Default for OnChainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            polygon_ws_url: String::new(),
+            ctf_address: default_ctf_address(),
+            neg_risk_ctf_exchange: default_neg_risk_ctf_exchange(),
+            ctf_exchange: default_ctf_exchange(),
+            neg_risk_adapter: default_neg_risk_adapter(),
+            uma_oracle_adapter: String::new(),
+            max_latency_ms: default_max_latency_ms(),
+            checkpoint_path: default_checkpoint_path(),
+            startup_lookback_blocks: default_startup_lookback(),
+        }
+    }
+}
+
 impl Config {
     /// Load config from a TOML file, then overlay environment variables for secrets.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -707,6 +786,11 @@ impl Config {
                 config.crossbook.enabled = true;
             }
             config.crossbook.odds_api_key = key;
+        }
+        if let Ok(ws_url) = std::env::var("POLYGON_WS_URL") {
+            if !ws_url.is_empty() {
+                config.onchain.polygon_ws_url = ws_url;
+            }
         }
 
         Ok(config)
@@ -751,6 +835,15 @@ impl Config {
             split: SplitConfig::default(),
             sniper: SniperConfig::default(),
             lifecycle: LifecycleConfig::default(),
+            onchain: {
+                let ws_url = std::env::var("POLYGON_WS_URL").unwrap_or_default();
+                let auto_enable = !ws_url.is_empty();
+                OnChainConfig {
+                    enabled: auto_enable,
+                    polygon_ws_url: ws_url,
+                    ..OnChainConfig::default()
+                }
+            },
         }
     }
 

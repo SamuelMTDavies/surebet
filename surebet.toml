@@ -183,6 +183,34 @@ drip_sell_interval_secs = 35
 # Tick interval for lifecycle checks (seconds)
 tick_interval_secs = 10
 
+[onchain]
+# Enable on-chain event monitoring via Polygon WebSocket.
+# Subscribes to CTF and UMA Oracle events for earliest possible signals
+# on new market creation and resolution proposals.
+enabled = false
+# Polygon WebSocket RPC URL (also supports POLYGON_WS_URL env var).
+# Options: Alchemy, QuickNode, Infura — e.g.:
+#   wss://polygon-mainnet.g.alchemy.com/v2/{API_KEY}
+#   wss://polygon-mainnet.quiknode.pro/{API_KEY}
+polygon_ws_url = ""
+# Gnosis CTF contract on Polygon (ConditionPreparation, ConditionResolution)
+ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# Neg Risk CTF Exchange (TokenRegistered events)
+neg_risk_ctf_exchange = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+# Standard CTF Exchange (TokenRegistered events)
+ctf_exchange = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+# Neg Risk Adapter (PositionSplit/PositionsMerge events)
+neg_risk_adapter = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+# UMA Oracle Adapter (PriceProposed/PriceDisputed)
+# Set this to the correct Polymarket UMA adapter address
+uma_oracle_adapter = ""
+# Alert if event processing latency exceeds this (ms)
+max_latency_ms = 2000
+# File to persist last processed block for gap recovery on restart
+checkpoint_path = "onchain_checkpoint.txt"
+# How many blocks back to scan on startup
+startup_lookback_blocks = 100
+
 [logging]
 level = "info"
 json = false
