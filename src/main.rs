@@ -119,23 +119,35 @@ async fn main() -> anyhow::Result<()> {
         config.filters.clone(),
     );
 
-    // Fetch all markets once, then filter twice: strict for arb/maker,
-    // relaxed for crossbook (sports markets often have lower Polymarket volume).
+    // Fetch ALL active markets from Gamma — we subscribe to everything on the
+    // CLOB WS so that niche/thin markets have book data when a ResolutionProposed
+    // event fires.  Filtering is only used for crossbook matching.
     let all_gamma_markets = discovery.fetch_active_markets().await?;
     let markets = discovery.filter_markets(&all_gamma_markets);
 
-    let mut asset_ids: Vec<String> = markets
+    // Subscribe to ALL active markets (unfiltered) so sniper has book data
+    // for every token that could resolve, regardless of volume/depth.
+    let asset_ids: Vec<String> = all_gamma_markets
         .iter()
+        .filter(|m| m.active && m.accepting_orders && !m.clob_token_ids.is_empty())
         .flat_map(|m| m.clob_token_ids.clone())
         .collect();
 
     if asset_ids.is_empty() {
-        error!("no markets found matching filters, exiting");
+        error!("no active markets found on Gamma, exiting");
         return Ok(());
     }
 
+    info!(
+        all_markets = all_gamma_markets.len(),
+        filtered = markets.len(),
+        all_tokens = asset_ids.len(),
+        "subscribing to ALL active market tokens (unfiltered for sniper coverage)"
+    );
+
     // Crossbook gets a second filter pass with relaxed thresholds so that
     // thin sports markets aren't dropped before the matcher sees them.
+    // (asset_ids already contains ALL tokens, so no merge needed.)
     let crossbook_discovered = if config.crossbook.enabled
         && !config.crossbook.odds_api_key.is_empty()
     {
@@ -149,19 +161,10 @@ async fn main() -> anyhow::Result<()> {
             crossbook_filters,
         );
         let cb_markets = crossbook_discovery.filter_markets(&all_gamma_markets);
-
-        // Merge extra asset IDs into the CLOB WS subscription
-        let extra_ids: Vec<String> = cb_markets
-            .iter()
-            .flat_map(|m| m.clob_token_ids.clone())
-            .filter(|id| !asset_ids.contains(id))
-            .collect();
         info!(
             crossbook_markets = cb_markets.len(),
-            extra_assets = extra_ids.len(),
             "crossbook discovery (relaxed filters)"
         );
-        asset_ids.extend(extra_ids);
         cb_markets
     } else {
         Vec::new()
@@ -797,7 +800,11 @@ async fn main() -> anyhow::Result<()> {
 
                             if let Some(market) = cached {
                                 let one = Decimal::from(1);
-                                let mut grand_total_profit = Decimal::ZERO;
+                                // Polymarket taker fee: fee_rate = price * (1 - price) * 0.0222
+                                // (complementary pricing — peaks at ~0.55% near p=0.50)
+                                let fee_coeff = Decimal::from_str("0.0222").unwrap();
+                                let mut grand_total_gross = Decimal::ZERO;
+                                let mut grand_total_fees = Decimal::ZERO;
                                 let token_count = market.clob_token_ids.len();
 
                                 warn!(
@@ -814,34 +821,61 @@ async fn main() -> anyhow::Result<()> {
                                         .map(|s| s.as_str())
                                         .unwrap_or("?");
 
-                                    if let Some(book) = store.get_book(token_id) {
-                                        // Asks ≤ $0.95 = winning outcome shares to buy cheap
+                                    // Try in-memory book first, fall back to REST API fetch
+                                    let book = match store.get_book(token_id) {
+                                        Some(b) => Some(b),
+                                        None => {
+                                            warn!(
+                                                outcome = outcome_label,
+                                                token = %&token_id[..16.min(token_id.len())],
+                                                "no WS book data, fetching via REST"
+                                            );
+                                            store.fetch_rest_book(
+                                                &config.polymarket.clob_url,
+                                                token_id,
+                                            ).await
+                                        }
+                                    };
+
+                                    if let Some(book) = book {
+                                        // Asks ≤ max_buy_price = winning outcome shares to buy cheap
                                         let mut ask_shares = Decimal::ZERO;
-                                        let mut ask_profit = Decimal::ZERO;
+                                        let mut ask_gross = Decimal::ZERO;
+                                        let mut ask_fees = Decimal::ZERO;
                                         let mut ask_details = Vec::new();
-                                        let threshold = Decimal::from_str("0.95").unwrap();
+                                        let threshold = Decimal::from_str(&config.sniper.max_buy_price.to_string()).unwrap();
                                         for (&price, &size) in book.asks.levels.iter() {
                                             if price <= threshold {
+                                                let gross = (one - price) * size;
+                                                // Fee on the buy: rate = p * (1-p) * 0.0222
+                                                let fee = price * (one - price) * fee_coeff * size;
                                                 ask_shares += size;
-                                                ask_profit += (one - price) * size;
+                                                ask_gross += gross;
+                                                ask_fees += fee;
                                                 ask_details.push(format!("{}@${}", size, price));
                                             }
                                         }
                                         // Bids ≥ $0.05 = losing outcome shares to sell into
                                         let mut bid_shares = Decimal::ZERO;
-                                        let mut bid_profit = Decimal::ZERO;
+                                        let mut bid_gross = Decimal::ZERO;
+                                        let mut bid_fees = Decimal::ZERO;
                                         let mut bid_details = Vec::new();
                                         let floor = Decimal::from_str("0.05").unwrap();
                                         for (&price, &size) in book.bids.levels.iter().rev() {
                                             if price >= floor {
+                                                let gross = price * size;
+                                                let fee = price * (one - price) * fee_coeff * size;
                                                 bid_shares += size;
-                                                bid_profit += price * size;
+                                                bid_gross += gross;
+                                                bid_fees += fee;
                                                 bid_details.push(format!("{}@${}", size, price));
                                             }
                                         }
 
-                                        let total = ask_profit + bid_profit;
-                                        grand_total_profit += total;
+                                        let total_gross = ask_gross + bid_gross;
+                                        let total_fees = ask_fees + bid_fees;
+                                        grand_total_gross += total_gross;
+                                        grand_total_fees += total_fees;
 
                                         warn!(
                                             outcome = outcome_label,
@@ -849,10 +883,14 @@ async fn main() -> anyhow::Result<()> {
                                             best_bid = %book.bids.best(true).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
                                             best_ask = %book.asks.best(false).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
                                             ask_snipe_shares = %ask_shares,
-                                            ask_snipe_profit = %format!("${:.2}", ask_profit),
+                                            ask_gross = %format!("${:.4}", ask_gross),
+                                            ask_fees = %format!("${:.4}", ask_fees),
+                                            ask_net = %format!("${:.4}", ask_gross - ask_fees),
                                             ask_levels = %ask_details.join(" | "),
                                             bid_snipe_shares = %bid_shares,
-                                            bid_snipe_profit = %format!("${:.2}", bid_profit),
+                                            bid_gross = %format!("${:.4}", bid_gross),
+                                            bid_fees = %format!("${:.4}", bid_fees),
+                                            bid_net = %format!("${:.4}", bid_gross - bid_fees),
                                             bid_levels = %bid_details.join(" | "),
                                             "SNIPE BOOK: {} outcome", outcome_label
                                         );
@@ -860,16 +898,19 @@ async fn main() -> anyhow::Result<()> {
                                         warn!(
                                             outcome = outcome_label,
                                             token = %&token_id[..16.min(token_id.len())],
-                                            "SNIPE BOOK: no order book data for this token"
+                                            "SNIPE BOOK: no book data (WS + REST both empty)"
                                         );
                                     }
                                 }
 
+                                let grand_net = grand_total_gross - grand_total_fees;
                                 warn!(
                                     question = %market.question,
                                     proposed = outcome,
                                     tokens_scanned = token_count,
-                                    total_potential_profit = %format!("${:.2}", grand_total_profit),
+                                    gross_profit = %format!("${:.4}", grand_total_gross),
+                                    fees = %format!("${:.4}", grand_total_fees),
+                                    net_profit = %format!("${:.4}", grand_net),
                                     "SNIPE SCAN COMPLETE"
                                 );
                             } else {

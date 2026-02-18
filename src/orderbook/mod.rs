@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// A single price level in the order book.
 #[derive(Debug, Clone)]
@@ -211,6 +211,78 @@ impl OrderBookStore {
 
     pub fn get_book(&self, asset_id: &str) -> Option<OrderBook> {
         self.books.get(asset_id).map(|b| b.clone())
+    }
+
+    /// Fetch a book snapshot from the CLOB REST API and store it.
+    /// This is the fallback for tokens not subscribed on the WebSocket.
+    /// The endpoint is public (no auth required):
+    ///   GET {clob_url}/book?token_id={token_id}
+    /// Returns the book if successfully fetched, None on error.
+    pub async fn fetch_rest_book(&self, clob_url: &str, token_id: &str) -> Option<OrderBook> {
+        let url = format!("{}/book?token_id={}", clob_url, token_id);
+        let client = reqwest::Client::new();
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(token = %&token_id[..16.min(token_id.len())], error = %e, "REST book fetch failed");
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            warn!(
+                token = %&token_id[..16.min(token_id.len())],
+                status = resp.status().as_u16(),
+                "REST book fetch returned error"
+            );
+            return None;
+        }
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(token = %&token_id[..16.min(token_id.len())], error = %e, "REST book parse failed");
+                return None;
+            }
+        };
+
+        // Parse CLOB REST book format: { "bids": [{"price":"0.50","size":"100"},...], "asks": [...] }
+        let parse_levels = |key: &str| -> Vec<PriceLevel> {
+            body.get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| {
+                            let price = l.get("price")?.as_str()?.parse::<Decimal>().ok()?;
+                            let size = l.get("size")?.as_str()?.parse::<Decimal>().ok()?;
+                            Some(PriceLevel { price, size })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let bids = parse_levels("bids");
+        let asks = parse_levels("asks");
+
+        info!(
+            token = %&token_id[..16.min(token_id.len())],
+            bids = bids.len(),
+            asks = asks.len(),
+            "REST book fetch OK"
+        );
+
+        // Store it so subsequent lookups hit the in-memory cache
+        let mut book = self
+            .books
+            .entry(token_id.to_string())
+            .or_insert_with(|| OrderBook::new(token_id.to_string()));
+
+        book.bids.apply_snapshot(&bids);
+        book.asks.apply_snapshot(&asks);
+
+        Some(book.clone())
     }
 
     pub fn all_asset_ids(&self) -> Vec<String> {
