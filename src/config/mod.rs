@@ -739,7 +739,7 @@ fn default_neg_risk_adapter() -> String {
     "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".to_string()
 }
 fn default_uma_oracle_adapter() -> String {
-    "0xCB1822859cEF82Cd2Eb4E6276C7916e692995130".to_string()
+    "0x2F5e3684cb1F318ec51b00Edba38d79Ac2c0aA9d".to_string()
 }
 fn default_max_latency_ms() -> u64 {
     2000
