@@ -190,10 +190,10 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(TrackedMarket::from_discovered)
         .collect();
 
-    info!("--- Market Edge Profiles ({} markets) ---", markets.len());
+    info!(markets = markets.len(), "market edge profiles loaded");
     for m in &markets {
         let profile = classify_edge_profile(m);
-        info!(
+        debug!(
             question = %m.question,
             category = %m.category,
             volume_24h = %m.volume_24hr,
@@ -723,9 +723,9 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             let summaries = store_for_summary.summary();
             if !summaries.is_empty() {
-                info!("--- Order Book Summary ({} assets) ---", summaries.len());
+                debug!("--- Order Book Summary ({} assets) ---", summaries.len());
                 for s in &summaries {
-                    info!("{}", s);
+                    debug!("{}", s);
                 }
             }
         }
@@ -758,7 +758,7 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             let snap = agg_for_snapshot.snapshot();
             for agg in &snap {
-                info!(
+                debug!(
                     symbol = %agg.symbol,
                     price = %agg.price,
                     sources = agg.source_count,
@@ -779,10 +779,23 @@ async fn main() -> anyhow::Result<()> {
                 interval.tick().await;
                 exec_cleanup.cleanup_stale(Duration::from_secs(300)).await;
                 let summary = exec_cleanup.exposure_summary().await;
-                info!("executor: {}", summary);
+                debug!("executor: {}", summary);
             }
         });
     }
+
+    // --- WebSocket Connection Tracker ---
+    let mut ws_expected: Vec<&str> = vec!["CLOB", "RTDS"];
+    if config.feeds.enabled {
+        ws_expected.push("Binance");
+        ws_expected.push("Coinbase");
+    }
+    if config.onchain.enabled && !config.onchain.polygon_ws_url.is_empty() {
+        ws_expected.push("Polygon");
+    }
+    let mut ws_connected: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let ws_total = ws_expected.len();
+    info!(expected = ?ws_expected, "waiting for WebSocket connections...");
 
     // --- Main Event Loop ---
     info!("entering main event loop - press Ctrl+C to stop");
@@ -791,8 +804,17 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             Some(clob_event) = clob_rx.recv() => {
                 match clob_event {
-                    ClobEvent::Connected => info!("CLOB connected"),
-                    ClobEvent::Disconnected => warn!("CLOB disconnected"),
+                    ClobEvent::Connected => {
+                        ws_connected.insert("CLOB");
+                        info!(
+                            "{}/{} WebSockets up [CLOB connected] {:?}",
+                            ws_connected.len(), ws_total, ws_connected
+                        );
+                    }
+                    ClobEvent::Disconnected => {
+                        ws_connected.remove("CLOB");
+                        warn!("CLOB disconnected ({}/{} WebSockets up)", ws_connected.len(), ws_total);
+                    }
                     ClobEvent::BookSnapshot { asset_id, bid_levels, ask_levels } => {
                         debug!(
                             asset = %asset_id[..12.min(asset_id.len())],
@@ -821,8 +843,17 @@ async fn main() -> anyhow::Result<()> {
 
             Some(rtds_event) = rtds_rx.recv() => {
                 match rtds_event {
-                    RtdsEvent::Connected => info!("RTDS connected"),
-                    RtdsEvent::Disconnected => warn!("RTDS disconnected"),
+                    RtdsEvent::Connected => {
+                        ws_connected.insert("RTDS");
+                        info!(
+                            "{}/{} WebSockets up [RTDS connected] {:?}",
+                            ws_connected.len(), ws_total, ws_connected
+                        );
+                    }
+                    RtdsEvent::Disconnected => {
+                        ws_connected.remove("RTDS");
+                        warn!("RTDS disconnected ({}/{} WebSockets up)", ws_connected.len(), ws_total);
+                    }
                     RtdsEvent::Trade(t) => {
                         debug!(
                             asset = %t.asset_id,
@@ -967,7 +998,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     ArbEvent::OpportunityGone { condition_id } => {
-                        info!(condition_id = %condition_id, "arb opportunity gone");
+                        debug!(condition_id = %condition_id, "arb opportunity gone");
                     }
                     ArbEvent::ScanComplete { markets_scanned, opportunities } => {
                         if opportunities > 0 {
@@ -996,20 +1027,28 @@ async fn main() -> anyhow::Result<()> {
             Some(binance_event) = binance_rx.recv() => {
                 aggregator.handle_binance(&binance_event);
                 if let BinanceEvent::Connected = binance_event {
-                    info!("Binance feed connected");
+                    ws_connected.insert("Binance");
+                    info!(
+                        "{}/{} WebSockets up [Binance connected] {:?}",
+                        ws_connected.len(), ws_total, ws_connected
+                    );
                 }
             }
 
             Some(coinbase_event) = coinbase_rx.recv() => {
                 aggregator.handle_coinbase(&coinbase_event);
                 if let CoinbaseEvent::Connected = coinbase_event {
-                    info!("Coinbase feed connected");
+                    ws_connected.insert("Coinbase");
+                    info!(
+                        "{}/{} WebSockets up [Coinbase connected] {:?}",
+                        ws_connected.len(), ws_total, ws_connected
+                    );
                 }
             }
 
             Some(agg_event) = agg_rx.recv() => {
                 if let AggregatorEvent::PriceUpdate(ref agg) = agg_event {
-                    info!(
+                    debug!(
                         symbol = %agg.symbol,
                         price = %agg.price,
                         sources = agg.source_count,
@@ -1115,7 +1154,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     MakerEvent::QuotesUpdated { condition_id, bid_sum } => {
-                        info!(
+                        debug!(
                             condition = %condition_id[..12.min(condition_id.len())],
                             bid_sum = %bid_sum,
                             "maker quotes updated"
@@ -1222,7 +1261,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     CrossbookEvent::FetchComplete { matches_fetched, poly_links } => {
-                        info!(
+                        debug!(
                             matches = matches_fetched,
                             poly_links = poly_links,
                             "crossbook odds fetched"
@@ -1279,7 +1318,7 @@ async fn main() -> anyhow::Result<()> {
                         snap.split.active_opps.push(entry);
                     }
                     SplitEvent::OpportunityGone { ref condition_id, direction } => {
-                        info!(
+                        debug!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             dir = %direction,
                             "split opp gone"
@@ -1534,10 +1573,15 @@ async fn main() -> anyhow::Result<()> {
             Some(onchain_event) = onchain_rx.recv() => {
                 match onchain_event {
                     OnChainSignal::Connected => {
-                        info!("on-chain monitor connected to Polygon");
+                        ws_connected.insert("Polygon");
+                        info!(
+                            "{}/{} WebSockets up [Polygon connected] {:?}",
+                            ws_connected.len(), ws_total, ws_connected
+                        );
                     }
                     OnChainSignal::Disconnected { reason } => {
-                        warn!(reason = %reason, "on-chain monitor disconnected (reconnecting)");
+                        ws_connected.remove("Polygon");
+                        warn!(reason = %reason, "Polygon disconnected ({}/{} WebSockets up)", ws_connected.len(), ws_total);
                     }
                     OnChainSignal::GapRecovered { from_block, to_block, events_found } => {
                         info!(
