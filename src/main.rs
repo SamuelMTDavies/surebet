@@ -32,7 +32,7 @@ use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
 use crate::market::{classify_edge_profile, DiscoveredMarket, MarketDiscovery};
 use crate::onchain::{MarketCache, OnChainMonitor, OnChainSignal};
 use crate::orderbook::OrderBookStore;
-use crate::sniper::{SniperEngine, SniperEvent, auto_map_markets};
+use crate::sniper::{SnipeSide, SniperEngine, SniperEvent, auto_map_markets};
 use crate::sniper::executor::SniperExecutor;
 use crate::sniper::sources::CryptoThresholdWatcher;
 use crate::split::{SplitEvent, SplitScanner};
@@ -1645,6 +1645,86 @@ async fn main() -> anyhow::Result<()> {
                                 detected_at,
                             );
                             if let Some(ref action) = action {
+                                // Log order book snapshot: snipeable shares and potential winnings
+                                let one = Decimal::from(1);
+                                let mut total_snipeable_shares = Decimal::ZERO;
+                                let mut total_potential_profit = Decimal::ZERO;
+                                for order in &action.orders {
+                                    if let Some(book) = store.get_book(&order.token_id) {
+                                        match order.side {
+                                            SnipeSide::BuyWinner => {
+                                                // Sweep asks below $1: buy at ask, redeem at $1
+                                                let mut level_shares = Decimal::ZERO;
+                                                let mut level_profit = Decimal::ZERO;
+                                                let mut level_details = Vec::new();
+                                                for (&price, &size) in book.asks.levels.iter() {
+                                                    if price <= order.limit_price {
+                                                        level_shares += size;
+                                                        let edge = (one - price) * size;
+                                                        level_profit += edge;
+                                                        level_details.push(format!(
+                                                            "{}@${}", size, price
+                                                        ));
+                                                    }
+                                                }
+                                                if level_shares > Decimal::ZERO {
+                                                    warn!(
+                                                        token = %&order.token_id[..12.min(order.token_id.len())],
+                                                        label = %order.label,
+                                                        side = "BUY_WINNER",
+                                                        snipeable_shares = %level_shares,
+                                                        potential_profit = %level_profit,
+                                                        levels = level_details.len(),
+                                                        book = %level_details.join(" | "),
+                                                        "SNIPE BOOK: asks available to sweep"
+                                                    );
+                                                }
+                                                total_snipeable_shares += level_shares;
+                                                total_potential_profit += level_profit;
+                                            }
+                                            SnipeSide::SellLoser => {
+                                                // Hit bids above floor: sell at bid, token goes to $0
+                                                let mut level_shares = Decimal::ZERO;
+                                                let mut level_profit = Decimal::ZERO;
+                                                let mut level_details = Vec::new();
+                                                for (&price, &size) in book.bids.levels.iter().rev() {
+                                                    if price >= order.limit_price {
+                                                        level_shares += size;
+                                                        let edge = price * size;
+                                                        level_profit += edge;
+                                                        level_details.push(format!(
+                                                            "{}@${}", size, price
+                                                        ));
+                                                    }
+                                                }
+                                                if level_shares > Decimal::ZERO {
+                                                    warn!(
+                                                        token = %&order.token_id[..12.min(order.token_id.len())],
+                                                        label = %order.label,
+                                                        side = "SELL_LOSER",
+                                                        snipeable_shares = %level_shares,
+                                                        potential_profit = %level_profit,
+                                                        levels = level_details.len(),
+                                                        book = %level_details.join(" | "),
+                                                        "SNIPE BOOK: bids available to hit"
+                                                    );
+                                                }
+                                                total_snipeable_shares += level_shares;
+                                                total_potential_profit += level_profit;
+                                            }
+                                        }
+                                    }
+                                }
+                                warn!(
+                                    market = %action.question,
+                                    condition_id = %action.condition_id,
+                                    proposed = outcome,
+                                    total_snipeable_shares = %total_snipeable_shares,
+                                    total_potential_profit = %total_potential_profit,
+                                    orders = action.orders.len(),
+                                    "SNIPE OPPORTUNITY: total snipeable on book"
+                                );
+
                                 let profit = sniper_executor.execute(action, detected_at).await;
                                 let order_ready_ms = detected_at.elapsed().as_millis() as u64;
                                 info!(
