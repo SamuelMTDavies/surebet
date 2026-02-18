@@ -151,7 +151,7 @@ impl OnChainMonitor {
         }
     }
 
-    /// A single WebSocket session: connect, recover gap, subscribe, process.
+    /// A single WebSocket session: connect, subscribe, process live events.
     async fn run_session_with_url(&self, url: &str) -> anyhow::Result<()> {
         let ws = WsConnect::new(url);
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
@@ -159,38 +159,10 @@ impl OnChainMonitor {
         let _ = self.signal_tx.send(OnChainSignal::Connected);
         info!("Polygon WebSocket connected");
 
-        // Get current block
+        // Log current block for reference (no gap recovery — forward-only)
         let current_block = provider.get_block_number().await?;
-        info!(block = current_block, "current Polygon block");
-
-        // Recover any missed events since last checkpoint
-        let last_processed = self.last_block.load(Ordering::SeqCst);
-        if last_processed > 0 && current_block > last_processed {
-            let gap_start = last_processed + 1;
-            let gap_end = current_block;
-            info!(
-                from = gap_start,
-                to = gap_end,
-                blocks = gap_end - gap_start + 1,
-                "recovering missed events from gap"
-            );
-            let recovered = self.recover_gap(&provider, gap_start, gap_end).await?;
-            let _ = self.signal_tx.send(OnChainSignal::GapRecovered {
-                from_block: gap_start,
-                to_block: gap_end,
-                events_found: recovered,
-            });
-        } else if last_processed == 0 && self.config.startup_lookback_blocks > 0 {
-            // First startup: look back N blocks
-            let lookback_start = current_block.saturating_sub(self.config.startup_lookback_blocks);
-            info!(
-                from = lookback_start,
-                to = current_block,
-                "startup lookback scan"
-            );
-            let recovered = self.recover_gap(&provider, lookback_start, current_block).await?;
-            info!(events = recovered, "startup lookback complete");
-        }
+        self.update_checkpoint(current_block);
+        info!(block = current_block, "current Polygon block, streaming forward");
 
         // Build the subscription filter
         let filter = self.build_filter();
@@ -264,83 +236,6 @@ impl OnChainMonitor {
         ];
 
         Filter::new().address(addresses).event_signature(topics)
-    }
-
-    /// Recover missed events for a block range using eth_getLogs.
-    /// Uses small chunks with delays between requests to stay under RPC rate limits.
-    async fn recover_gap<P: Provider>(
-        &self,
-        provider: &P,
-        from_block: u64,
-        to_block: u64,
-    ) -> anyhow::Result<usize> {
-        let chunk_size = 500u64;
-        let mut total_events = 0;
-        let mut retry_delay = Duration::from_millis(500);
-        let max_retry_delay = Duration::from_secs(30);
-
-        let mut start = from_block;
-        while start <= to_block {
-            let end = (start + chunk_size - 1).min(to_block);
-
-            let filter = self
-                .build_filter()
-                .from_block(start)
-                .to_block(end);
-
-            match provider.get_logs(&filter).await {
-                Ok(logs) => {
-                    for log in &logs {
-                        let now_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-
-                        if let Err(e) = self.process_log(log, now_ms).await {
-                            debug!(error = %e, "failed to process historical log");
-                        }
-                    }
-                    total_events += logs.len();
-
-                    if let Some(last_log) = logs.last() {
-                        if let Some(bn) = last_log.block_number {
-                            self.update_checkpoint(bn);
-                        }
-                    }
-
-                    // Reset retry delay on success, pause briefly between chunks
-                    retry_delay = Duration::from_millis(500);
-                    start = end + 1;
-                    if start <= to_block {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("429") || err_str.contains("Too Many Requests") {
-                        warn!(
-                            delay_ms = retry_delay.as_millis() as u64,
-                            from = start,
-                            to = end,
-                            "rate limited during gap recovery, backing off"
-                        );
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay = (retry_delay * 2).min(max_retry_delay);
-                        // Don't advance start — retry the same chunk
-                    } else {
-                        warn!(
-                            error = %e,
-                            from = start,
-                            to = end,
-                            "failed to get historical logs for block range"
-                        );
-                        start = end + 1;
-                    }
-                }
-            }
-        }
-
-        Ok(total_events)
     }
 
     /// Process a single log entry, decode the event, and emit a signal.
