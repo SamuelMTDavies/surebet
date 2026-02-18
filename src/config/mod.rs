@@ -712,7 +712,7 @@ pub struct OnChainConfig {
     #[serde(default = "default_neg_risk_adapter")]
     pub neg_risk_adapter: String,
     /// UMA Oracle Adapter contract address (for PriceProposed/PriceDisputed).
-    #[serde(default)]
+    #[serde(default = "default_uma_oracle_adapter")]
     pub uma_oracle_adapter: String,
     /// Maximum latency (ms) before alerting. If event processing exceeds
     /// this threshold from block timestamp to signal emission, log a warning.
@@ -738,6 +738,9 @@ fn default_ctf_exchange() -> String {
 fn default_neg_risk_adapter() -> String {
     "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".to_string()
 }
+fn default_uma_oracle_adapter() -> String {
+    "0xCB1822859cEF82Cd2Eb4E6276C7916e692995130".to_string()
+}
 fn default_max_latency_ms() -> u64 {
     2000
 }
@@ -757,7 +760,7 @@ impl Default for OnChainConfig {
             neg_risk_ctf_exchange: default_neg_risk_ctf_exchange(),
             ctf_exchange: default_ctf_exchange(),
             neg_risk_adapter: default_neg_risk_adapter(),
-            uma_oracle_adapter: String::new(),
+            uma_oracle_adapter: default_uma_oracle_adapter(),
             max_latency_ms: default_max_latency_ms(),
             checkpoint_path: default_checkpoint_path(),
             startup_lookback_blocks: default_startup_lookback(),
