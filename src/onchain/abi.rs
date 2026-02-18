@@ -18,15 +18,19 @@ pub const CONDITION_PREPARATION_TOPIC: B256 =
 pub const CONDITION_RESOLUTION_TOPIC: B256 =
     b256!("b3a26bab9bbcd2aabece9cb56a3bcc47b9cfee7ecef7e3d4ab4455f3afe4d53f");
 
-/// keccak256("PriceProposed(bytes32,uint256,bytes,int256,address)")
-/// Note: UMA v2 OptimisticOracleV2 signature — may differ for adapter.
-/// The actual topic hash will be verified at startup.
-pub const PRICE_PROPOSED_TOPIC: B256 =
-    b256!("5e30a3dfe06dd85fdc4e4ef1a81ef7fd21ee9a0ea8b6071db4ab4e97e00779dc");
+/// keccak256("ProposePrice(address,address,bytes32,uint256,bytes,int256,uint256,address)")
+/// UMA OptimisticOracleV2 event — emitted by the Oracle (NOT the adapter).
+/// Indexed: requester (address), proposer (address).
+/// Data: identifier, timestamp, ancillaryData, proposedPrice, expirationTimestamp, currency.
+pub const PROPOSE_PRICE_TOPIC: B256 =
+    b256!("6e51dd00371aabffa82cd401592f76ed51e98a9ea4b58751c70463a2c78b5ca1");
 
-/// keccak256("PriceDisputed(bytes32,uint256,bytes,int256)")
-pub const PRICE_DISPUTED_TOPIC: B256 =
-    b256!("e3dd224766e67d30e3fb0bac0e5e5f76ecd67f6eb209e436a2c0fa31c4d0b1f5");
+/// keccak256("DisputePrice(address,address,address,bytes32,uint256,bytes,int256)")
+/// UMA OptimisticOracleV2 event — emitted by the Oracle (NOT the adapter).
+/// Indexed: requester, proposer, disputer.
+/// Data: identifier, timestamp, ancillaryData, proposedPrice.
+pub const DISPUTE_PRICE_TOPIC: B256 =
+    b256!("5165909c3d1c01c5d1e121ac6f6d01dda1ba24bc9e1f975b5a375339c15be7f3");
 
 /// keccak256("Transfer(address,address,uint256)")
 /// Used to detect TokenRegistered-like events on CTF Exchange.
@@ -69,6 +73,14 @@ pub fn verify_topic_hashes() -> Vec<(String, bool)> {
         (
             "ConditionResolution(bytes32,address,bytes32,uint256,uint256[])",
             CONDITION_RESOLUTION_TOPIC,
+        ),
+        (
+            "ProposePrice(address,address,bytes32,uint256,bytes,int256,uint256,address)",
+            PROPOSE_PRICE_TOPIC,
+        ),
+        (
+            "DisputePrice(address,address,address,bytes32,uint256,bytes,int256)",
+            DISPUTE_PRICE_TOPIC,
         ),
     ];
 

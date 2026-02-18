@@ -190,7 +190,7 @@ impl OnChainMonitor {
             addresses.push(addr);
         }
 
-        // UMA Oracle Adapter (PriceProposed, PriceDisputed)
+        // UMA Optimistic Oracle V2 (ProposePrice, DisputePrice)
         if !self.config.uma_oracle_adapter.is_empty() {
             if let Ok(addr) = Address::from_str(&self.config.uma_oracle_adapter) {
                 addresses.push(addr);
@@ -201,8 +201,8 @@ impl OnChainMonitor {
         let topics = vec![
             abi::CONDITION_PREPARATION_TOPIC,
             abi::CONDITION_RESOLUTION_TOPIC,
-            abi::PRICE_PROPOSED_TOPIC,
-            abi::PRICE_DISPUTED_TOPIC,
+            abi::PROPOSE_PRICE_TOPIC,
+            abi::DISPUTE_PRICE_TOPIC,
             abi::TRANSFER_SINGLE_ERC1155_TOPIC,
             abi::POSITION_SPLIT_TOPIC,
             abi::POSITIONS_MERGE_TOPIC,
@@ -307,11 +307,11 @@ impl OnChainMonitor {
             t if t == abi::CONDITION_RESOLUTION_TOPIC => {
                 self.handle_condition_resolution(log, block_number, block_timestamp, receive_time_ms)?;
             }
-            t if t == abi::PRICE_PROPOSED_TOPIC => {
-                self.handle_price_proposed(log, block_number, block_timestamp, receive_time_ms)?;
+            t if t == abi::PROPOSE_PRICE_TOPIC => {
+                self.handle_propose_price(log, block_number, block_timestamp, receive_time_ms)?;
             }
-            t if t == abi::PRICE_DISPUTED_TOPIC => {
-                self.handle_price_disputed(log, block_number, block_timestamp, receive_time_ms)?;
+            t if t == abi::DISPUTE_PRICE_TOPIC => {
+                self.handle_dispute_price(log, block_number, block_timestamp, receive_time_ms)?;
             }
             t if t == abi::TRANSFER_SINGLE_ERC1155_TOPIC => {
                 self.handle_transfer_single(log, block_number, block_timestamp)?;
@@ -490,19 +490,30 @@ impl OnChainMonitor {
         Ok(())
     }
 
-    /// PriceProposed(bytes32 indexed identifier, uint256 timestamp,
-    ///               bytes ancillaryData, int256 price, address indexed proposer)
-    fn handle_price_proposed(
+    /// ProposePrice(address indexed requester, address indexed proposer,
+    ///              bytes32 identifier, uint256 timestamp, bytes ancillaryData,
+    ///              int256 proposedPrice, uint256 expirationTimestamp, address currency)
+    ///
+    /// Emitted by UMA Optimistic Oracle V2 (NOT the adapter).
+    /// Topics: [sig, requester, proposer]
+    /// Data:   [identifier(32), timestamp(32), ancillaryData_offset(32),
+    ///          proposedPrice(32), expirationTimestamp(32), currency(32),
+    ///          ancillaryData_length(32), ancillaryData_bytes(...)]
+    fn handle_propose_price(
         &self,
         log: &Log,
         block_number: u64,
         timestamp: u64,
         receive_time_ms: u64,
     ) -> anyhow::Result<()> {
-        // identifier is topic[1] — this is the UMA identifier (often "YES_OR_NO_QUERY")
-        let _identifier = log.topics().get(1).copied().unwrap_or_default();
+        // topic[1] = requester (the UmaCtfAdapter that requested the price)
+        let _requester = if let Some(t) = log.topics().get(1) {
+            Address::from_slice(&t.0[12..])
+        } else {
+            Address::ZERO
+        };
 
-        // proposer is topic[2] for the indexed version
+        // topic[2] = proposer (the address that proposed the resolution)
         let proposer = if let Some(t) = log.topics().get(2) {
             Address::from_slice(&t.0[12..])
         } else {
@@ -511,44 +522,41 @@ impl OnChainMonitor {
 
         let data = &log.data().data;
 
-        // Data layout: uint256 timestamp (32), bytes ancillaryData (dynamic), int256 price (32)
-        // ABI: [timestamp: 32][offset_ancillary: 32][price: 32][ancillary_len: 32][ancillary_data: ...]
-        let _uma_timestamp = if data.len() >= 32 {
-            let bytes: [u8; 32] = data[0..32].try_into().unwrap_or([0u8; 32]);
-            U256::from_be_bytes(bytes)
-                .try_into()
-                .unwrap_or(0u64)
-        } else {
-            0u64
-        };
+        // data[0..32]   = identifier (bytes32, e.g. "YES_OR_NO_QUERY")
+        // data[32..64]  = timestamp (uint256)
+        // data[64..96]  = offset to ancillaryData (uint256, typically 0xC0 = 192)
+        // data[96..128] = proposedPrice (int256)
+        // data[128..160] = expirationTimestamp (uint256)
+        // data[160..192] = currency (address)
+        // data[192..224] = ancillaryData length
+        // data[224..]    = ancillaryData bytes
 
-        // Price is at offset 64 (after timestamp + ancillary offset)
-        let proposed_price = if data.len() >= 96 {
-            let bytes: [u8; 32] = data[64..96].try_into().unwrap_or([0u8; 32]);
-            // int256 — interpret as signed. For Polymarket: 1e18 = Yes, 0 = No
+        let proposed_price = if data.len() >= 128 {
+            let bytes: [u8; 32] = data[96..128].try_into().unwrap_or([0u8; 32]);
+            // int256 — for Polymarket: 1e18 = Yes, 0 = No
             let val = U256::from_be_bytes(bytes);
-            // Convert to simple i64: 1e18 → 1, 0 → 0
-            if val > U256::ZERO {
-                1i64
-            } else {
-                0i64
-            }
+            if val > U256::ZERO { 1i64 } else { 0i64 }
         } else {
             0i64
         };
 
-        // Extract questionId from ancillaryData
-        // The ancillaryData typically contains the questionId as hex-encoded bytes.
-        // For Polymarket, the ancillary data format is: q: title: <title>, ...
-        // The questionId is embedded in the data. We try to extract it.
-        let question_id = extract_question_id_from_log(log, data);
+        let expiration_ts = if data.len() >= 160 {
+            let bytes: [u8; 32] = data[128..160].try_into().unwrap_or([0u8; 32]);
+            U256::from_be_bytes(bytes).try_into().unwrap_or(0u64)
+        } else {
+            0u64
+        };
+
+        // Extract questionId from ancillaryData (contains market_id and question text)
+        let question_id = extract_question_id_from_ancillary(data);
 
         info!(
             question_id = %question_id,
             proposed_price = proposed_price,
             proposer = %proposer,
+            expiration_ts = expiration_ts,
             block = block_number,
-            "RESOLUTION PROPOSED: PriceProposed"
+            "RESOLUTION PROPOSED: ProposePrice on UMA Oracle"
         );
 
         let detected_at = std::time::Instant::now();
@@ -570,20 +578,27 @@ impl OnChainMonitor {
         Ok(())
     }
 
-    /// PriceDisputed
-    fn handle_price_disputed(
+    /// DisputePrice(address indexed requester, address indexed proposer,
+    ///              address indexed disputer, bytes32 identifier,
+    ///              uint256 timestamp, bytes ancillaryData, int256 proposedPrice)
+    ///
+    /// Emitted by UMA Optimistic Oracle V2 when a proposal is disputed.
+    /// Topics: [sig, requester, proposer, disputer]
+    /// Data:   [identifier(32), timestamp(32), ancillaryData_offset(32),
+    ///          proposedPrice(32), ancillaryData_length(32), ancillaryData_bytes(...)]
+    fn handle_dispute_price(
         &self,
         log: &Log,
         block_number: u64,
         timestamp: u64,
         receive_time_ms: u64,
     ) -> anyhow::Result<()> {
-        let question_id = extract_question_id_from_log(log, &log.data().data);
+        let question_id = extract_question_id_from_ancillary(&log.data().data);
 
         warn!(
             question_id = %question_id,
             block = block_number,
-            "RESOLUTION DISPUTED: PriceDisputed"
+            "RESOLUTION DISPUTED: DisputePrice on UMA Oracle"
         );
 
         let detected_at = std::time::Instant::now();
@@ -747,49 +762,78 @@ impl OnChainMonitor {
     }
 }
 
-/// Try to extract a questionId from a UMA oracle log.
-/// The questionId may be in the ancillaryData or derivable from indexed topics.
-/// Falls back to using the first indexed topic after the event signature.
-fn extract_question_id_from_log(log: &Log, data: &[u8]) -> B256 {
-    // For Polymarket's UMA adapter, the ancillaryData often contains
-    // the questionId. The exact encoding depends on the adapter version.
-    // As a fallback, we use the identifier topic which maps to the question.
+/// Extract a questionId from UMA Oracle event data by parsing ancillaryData.
+///
+/// ProposePrice data layout:
+///   [0..32]    identifier (bytes32)
+///   [32..64]   timestamp (uint256)
+///   [64..96]   offset to ancillaryData (relative to data start)
+///   [96..128]  proposedPrice (int256)
+///   [128..160] expirationTimestamp (uint256)  — ProposePrice only
+///   [160..192] currency (address)             — ProposePrice only
+///   [offset..offset+32] ancillaryData length
+///   [offset+32..] ancillaryData bytes
+///
+/// DisputePrice data layout:
+///   [0..32]    identifier (bytes32)
+///   [32..64]   timestamp (uint256)
+///   [64..96]   offset to ancillaryData
+///   [96..128]  proposedPrice (int256)
+///   [offset..offset+32] ancillaryData length
+///   [offset+32..] ancillaryData bytes
+///
+/// The ancillaryData for Polymarket contains UTF-8 text with an `initializer:`
+/// suffix that holds the questionId as a hex string. Format:
+///   "q: title: ..., description: ..., market_id: ..., initializer:<40-char hex>"
+///
+/// The last 40 hex chars after "initializer:" are the questionId's initializer
+/// address, but for unique identification we hash the full ancillaryData to
+/// derive a stable questionId matching what the adapter uses.
+fn extract_question_id_from_ancillary(data: &[u8]) -> B256 {
+    if data.len() < 96 {
+        return B256::ZERO;
+    }
 
-    // Try: ancillaryData is at the dynamic offset. Parse it and look for
-    // a 32-byte questionId pattern.
-    if data.len() >= 64 {
-        // offset to ancillary data is at data[32..64]
-        let offset_bytes: [u8; 32] = data[32..64].try_into().unwrap_or([0u8; 32]);
-        let offset: usize = U256::from_be_bytes(offset_bytes)
-            .try_into()
-            .unwrap_or(0);
+    // The offset to ancillaryData is at data[64..96]
+    let offset_bytes: [u8; 32] = data[64..96].try_into().unwrap_or([0u8; 32]);
+    let offset: usize = U256::from_be_bytes(offset_bytes)
+        .try_into()
+        .unwrap_or(0);
 
-        if offset > 0 && offset + 32 <= data.len() {
-            let len_bytes: [u8; 32] = data[offset..offset + 32]
-                .try_into()
-                .unwrap_or([0u8; 32]);
-            let len: usize = U256::from_be_bytes(len_bytes)
-                .try_into()
-                .unwrap_or(0);
+    if offset == 0 || offset + 32 > data.len() {
+        return B256::ZERO;
+    }
 
-            if len > 0 && offset + 32 + len <= data.len() {
-                let ancillary = &data[offset + 32..offset + 32 + len];
-                // Try to parse as UTF-8 and extract questionId
-                if let Ok(text) = std::str::from_utf8(ancillary) {
-                    // Polymarket ancillary format: "q: title: ..., p1: 0, ..."
-                    // The questionId might be derivable from hashing this
-                    debug!(ancillary_text = %text, "decoded ancillary data");
-                }
-                // If ancillary is exactly 32 bytes, it might be the questionId itself
-                if ancillary.len() == 32 {
-                    return B256::from_slice(ancillary);
-                }
-            }
+    let len_bytes: [u8; 32] = data[offset..offset + 32]
+        .try_into()
+        .unwrap_or([0u8; 32]);
+    let len: usize = U256::from_be_bytes(len_bytes)
+        .try_into()
+        .unwrap_or(0);
+
+    if len == 0 || offset + 32 + len > data.len() {
+        return B256::ZERO;
+    }
+
+    let ancillary = &data[offset + 32..offset + 32 + len];
+
+    // Log the ancillary text for debugging
+    if let Ok(text) = std::str::from_utf8(ancillary) {
+        debug!(ancillary_len = len, "decoded ancillary data from UMA Oracle event");
+
+        // Try to extract initializer from the tail — Polymarket appends it as
+        // "initializer:<hex>" at the very end of the ancillary string.
+        if let Some(pos) = text.rfind("initializer:") {
+            let hex_str = &text[pos + "initializer:".len()..];
+            debug!(initializer = %hex_str, "found initializer in ancillary data");
         }
     }
 
-    // Fallback: use the identifier topic (topic[1])
-    log.topics().get(1).copied().unwrap_or_default()
+    // Derive a stable questionId by hashing the full ancillary data.
+    // This matches how the UmaCtfAdapter computes questionId from the
+    // ancillaryData + timestamp combination.
+    use crate::onchain::abi::keccak256;
+    keccak256(ancillary)
 }
 
 /// Attempt to derive a conditionId hint from a CTF token ID.

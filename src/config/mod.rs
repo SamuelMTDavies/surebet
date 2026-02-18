@@ -711,7 +711,8 @@ pub struct OnChainConfig {
     /// Neg Risk Adapter contract address.
     #[serde(default = "default_neg_risk_adapter")]
     pub neg_risk_adapter: String,
-    /// UMA Oracle Adapter contract address (for PriceProposed/PriceDisputed).
+    /// UMA Optimistic Oracle V2 address (for ProposePrice/DisputePrice events).
+    /// Note: events fire on the Oracle contract, NOT the UmaCtfAdapter.
     #[serde(default = "default_uma_oracle_adapter")]
     pub uma_oracle_adapter: String,
     /// Maximum latency (ms) before alerting. If event processing exceeds
@@ -739,7 +740,7 @@ fn default_neg_risk_adapter() -> String {
     "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".to_string()
 }
 fn default_uma_oracle_adapter() -> String {
-    "0x2F5e3684cb1F318ec51b00Edba38d79Ac2c0aA9d".to_string()
+    "0xeE3Afe347D5C74317041E2618C49534dAf887c24".to_string()
 }
 fn default_max_latency_ms() -> u64 {
     2000

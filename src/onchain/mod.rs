@@ -2,8 +2,8 @@
 //!
 //! Subscribes to blockchain events via WebSocket RPC to detect:
 //! 1. New market creation (ConditionPreparation) — earliest signal for split arb
-//! 2. Resolution proposals (PriceProposed on UMA Oracle) — sniping window
-//! 3. Resolution disputes (PriceDisputed) — cancel snipe orders
+//! 2. Resolution proposals (ProposePrice on UMA Optimistic Oracle V2) — sniping window
+//! 3. Resolution disputes (DisputePrice) — cancel snipe orders
 //! 4. Final settlement (ConditionResolution) — trigger redemptions
 //! 5. Neg Risk splits/merges — conversion opportunity detection
 //!
