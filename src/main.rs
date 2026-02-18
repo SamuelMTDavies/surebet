@@ -32,7 +32,7 @@ use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
 use crate::market::{classify_edge_profile, DiscoveredMarket, MarketDiscovery};
 use crate::onchain::{MarketCache, OnChainMonitor, OnChainSignal};
 use crate::orderbook::OrderBookStore;
-use crate::sniper::{SnipeSide, SniperEngine, SniperEvent, auto_map_markets};
+use crate::sniper::{SniperEngine, SniperEvent, auto_map_markets};
 use crate::sniper::executor::SniperExecutor;
 use crate::sniper::sources::CryptoThresholdWatcher;
 use crate::split::{SplitEvent, SplitScanner};
@@ -1636,7 +1636,73 @@ async fn main() -> anyhow::Result<()> {
                             channel_ms = receive_elapsed_ms,
                             "ON-CHAIN: RESOLUTION PROPOSED — sniping window open"
                         );
-                        // Feed to sniper as on-chain resolution signal
+
+                        // Scan ALL tracked order books for stale orders we could snipe.
+                        // This runs regardless of whether the sniper engine can map the
+                        // question_id to a specific market — we want to see what's sitting
+                        // on every book at the moment a resolution fires.
+                        {
+                            let one = Decimal::from(1);
+                            let summaries = store.summary();
+                            let mut books_with_opportunity = 0usize;
+                            let mut grand_total_profit = Decimal::ZERO;
+                            for s in &summaries {
+                                if let Some(book) = store.get_book(&s.asset_id) {
+                                    // Asks below $0.95 = potential winning outcome to buy
+                                    let mut ask_shares = Decimal::ZERO;
+                                    let mut ask_profit = Decimal::ZERO;
+                                    let mut ask_details = Vec::new();
+                                    let threshold = Decimal::from_str("0.95").unwrap();
+                                    for (&price, &size) in book.asks.levels.iter() {
+                                        if price <= threshold {
+                                            ask_shares += size;
+                                            ask_profit += (one - price) * size;
+                                            ask_details.push(format!("{}@${}", size, price));
+                                        }
+                                    }
+                                    // Bids above $0.05 = potential losing outcome to sell into
+                                    let mut bid_shares = Decimal::ZERO;
+                                    let mut bid_profit = Decimal::ZERO;
+                                    let mut bid_details = Vec::new();
+                                    let floor = Decimal::from_str("0.05").unwrap();
+                                    for (&price, &size) in book.bids.levels.iter().rev() {
+                                        if price >= floor {
+                                            bid_shares += size;
+                                            bid_profit += price * size;
+                                            bid_details.push(format!("{}@${}", size, price));
+                                        }
+                                    }
+
+                                    let total = ask_profit + bid_profit;
+                                    if total > Decimal::ZERO {
+                                        books_with_opportunity += 1;
+                                        grand_total_profit += total;
+                                        warn!(
+                                            asset = %&s.asset_id[..12.min(s.asset_id.len())],
+                                            best_bid = %s.best_bid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                                            best_ask = %s.best_ask.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                                            ask_snipe_shares = %ask_shares,
+                                            ask_snipe_profit = %ask_profit,
+                                            ask_levels = %ask_details.join(" | "),
+                                            bid_snipe_shares = %bid_shares,
+                                            bid_snipe_profit = %bid_profit,
+                                            bid_levels = %bid_details.join(" | "),
+                                            "BOOK SNAPSHOT: stale orders on book"
+                                        );
+                                    }
+                                }
+                            }
+                            warn!(
+                                question_id = %question_id,
+                                proposed = outcome,
+                                books_scanned = summaries.len(),
+                                books_with_opportunity = books_with_opportunity,
+                                total_potential_profit = %grand_total_profit,
+                                "SNIPE SCAN COMPLETE"
+                            );
+                        }
+
+                        // Feed to sniper engine for execution (if market mapping exists)
                         if let Some(ref engine) = sniper_engine {
                             let qid_str = format!("{:x}", question_id);
                             let action = engine.lock().await.on_chain_resolution(
@@ -1645,86 +1711,6 @@ async fn main() -> anyhow::Result<()> {
                                 detected_at,
                             );
                             if let Some(ref action) = action {
-                                // Log order book snapshot: snipeable shares and potential winnings
-                                let one = Decimal::from(1);
-                                let mut total_snipeable_shares = Decimal::ZERO;
-                                let mut total_potential_profit = Decimal::ZERO;
-                                for order in &action.orders {
-                                    if let Some(book) = store.get_book(&order.token_id) {
-                                        match order.side {
-                                            SnipeSide::BuyWinner => {
-                                                // Sweep asks below $1: buy at ask, redeem at $1
-                                                let mut level_shares = Decimal::ZERO;
-                                                let mut level_profit = Decimal::ZERO;
-                                                let mut level_details = Vec::new();
-                                                for (&price, &size) in book.asks.levels.iter() {
-                                                    if price <= order.limit_price {
-                                                        level_shares += size;
-                                                        let edge = (one - price) * size;
-                                                        level_profit += edge;
-                                                        level_details.push(format!(
-                                                            "{}@${}", size, price
-                                                        ));
-                                                    }
-                                                }
-                                                if level_shares > Decimal::ZERO {
-                                                    warn!(
-                                                        token = %&order.token_id[..12.min(order.token_id.len())],
-                                                        label = %order.label,
-                                                        side = "BUY_WINNER",
-                                                        snipeable_shares = %level_shares,
-                                                        potential_profit = %level_profit,
-                                                        levels = level_details.len(),
-                                                        book = %level_details.join(" | "),
-                                                        "SNIPE BOOK: asks available to sweep"
-                                                    );
-                                                }
-                                                total_snipeable_shares += level_shares;
-                                                total_potential_profit += level_profit;
-                                            }
-                                            SnipeSide::SellLoser => {
-                                                // Hit bids above floor: sell at bid, token goes to $0
-                                                let mut level_shares = Decimal::ZERO;
-                                                let mut level_profit = Decimal::ZERO;
-                                                let mut level_details = Vec::new();
-                                                for (&price, &size) in book.bids.levels.iter().rev() {
-                                                    if price >= order.limit_price {
-                                                        level_shares += size;
-                                                        let edge = price * size;
-                                                        level_profit += edge;
-                                                        level_details.push(format!(
-                                                            "{}@${}", size, price
-                                                        ));
-                                                    }
-                                                }
-                                                if level_shares > Decimal::ZERO {
-                                                    warn!(
-                                                        token = %&order.token_id[..12.min(order.token_id.len())],
-                                                        label = %order.label,
-                                                        side = "SELL_LOSER",
-                                                        snipeable_shares = %level_shares,
-                                                        potential_profit = %level_profit,
-                                                        levels = level_details.len(),
-                                                        book = %level_details.join(" | "),
-                                                        "SNIPE BOOK: bids available to hit"
-                                                    );
-                                                }
-                                                total_snipeable_shares += level_shares;
-                                                total_potential_profit += level_profit;
-                                            }
-                                        }
-                                    }
-                                }
-                                warn!(
-                                    market = %action.question,
-                                    condition_id = %action.condition_id,
-                                    proposed = outcome,
-                                    total_snipeable_shares = %total_snipeable_shares,
-                                    total_potential_profit = %total_potential_profit,
-                                    orders = action.orders.len(),
-                                    "SNIPE OPPORTUNITY: total snipeable on book"
-                                );
-
                                 let profit = sniper_executor.execute(action, detected_at).await;
                                 let order_ready_ms = detected_at.elapsed().as_millis() as u64;
                                 info!(

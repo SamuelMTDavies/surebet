@@ -256,7 +256,7 @@ impl OnChainMonitor {
         if block_timestamp > 0 {
             let latency_ms = receive_time_ms.saturating_sub(block_timestamp * 1000);
             if latency_ms > self.config.max_latency_ms {
-                warn!(
+                debug!(
                     latency_ms = latency_ms,
                     block = block_number,
                     threshold_ms = self.config.max_latency_ms,
