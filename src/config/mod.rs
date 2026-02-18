@@ -33,6 +33,12 @@ pub struct Config {
     pub anomaly: AnomalyConfig,
     #[serde(default)]
     pub crossbook: CrossbookConfig,
+    #[serde(default)]
+    pub split: SplitConfig,
+    #[serde(default)]
+    pub sniper: SniperConfig,
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -543,6 +549,143 @@ impl Default for LoggingConfig {
     }
 }
 
+// --- Split arb config ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SplitConfig {
+    /// Enable the split arb scanner.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Enable live execution (false = paper mode).
+    #[serde(default)]
+    pub execute: bool,
+    /// Minimum net edge after fees to report/execute.
+    #[serde(default = "default_min_edge")]
+    pub min_net_edge: f64,
+    /// Scan interval in milliseconds.
+    #[serde(default = "default_scan_interval_ms")]
+    pub scan_interval_ms: u64,
+    /// Max USDC per split position.
+    #[serde(default = "default_split_max_position")]
+    pub max_position_usd: f64,
+    /// Max total USDC across all open split positions.
+    #[serde(default = "default_split_max_exposure")]
+    pub max_total_exposure: f64,
+}
+
+fn default_split_max_position() -> f64 {
+    500.0
+}
+fn default_split_max_exposure() -> f64 {
+    2000.0
+}
+
+impl Default for SplitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            execute: false,
+            min_net_edge: default_min_edge(),
+            scan_interval_ms: default_scan_interval_ms(),
+            max_position_usd: default_split_max_position(),
+            max_total_exposure: default_split_max_exposure(),
+        }
+    }
+}
+
+// --- Sniper config ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SniperConfig {
+    /// Enable the resolution sniper.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Enable live execution (false = paper mode, logs opportunities).
+    #[serde(default)]
+    pub execute: bool,
+    /// Minimum confidence (0.0-1.0) to act on a resolution signal.
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f64,
+    /// Maximum price to pay for winning outcome tokens ($0.99 = sweep nearly everything).
+    #[serde(default = "default_max_buy_price")]
+    pub max_buy_price: f64,
+    /// Enable crypto price threshold watching (uses existing exchange feeds).
+    #[serde(default = "default_true")]
+    pub crypto_enabled: bool,
+    /// Poll interval for HTTP-based sources in seconds.
+    #[serde(default = "default_http_poll_secs")]
+    pub http_poll_interval_secs: u64,
+}
+
+fn default_min_confidence() -> f64 {
+    0.95
+}
+fn default_max_buy_price() -> f64 {
+    0.99
+}
+fn default_http_poll_secs() -> u64 {
+    30
+}
+
+impl Default for SniperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            execute: false,
+            min_confidence: default_min_confidence(),
+            max_buy_price: default_max_buy_price(),
+            crypto_enabled: true,
+            http_poll_interval_secs: default_http_poll_secs(),
+        }
+    }
+}
+
+// --- Lifecycle config ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LifecycleConfig {
+    /// Enable the position lifecycle manager.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hours before a position is considered stale (triggers discount sell).
+    #[serde(default = "default_stale_hours")]
+    pub stale_threshold_hours: u64,
+    /// Shares to sell per drip batch (for losing/stale positions).
+    #[serde(default = "default_drip_batch")]
+    pub drip_sell_batch: f64,
+    /// Seconds between drip sell batches.
+    #[serde(default = "default_drip_interval")]
+    pub drip_sell_interval_secs: u64,
+    /// Tick interval in seconds for lifecycle checks.
+    #[serde(default = "default_lifecycle_tick")]
+    pub tick_interval_secs: u64,
+}
+
+fn default_stale_hours() -> u64 {
+    24
+}
+fn default_drip_batch() -> f64 {
+    1000.0
+}
+fn default_drip_interval() -> u64 {
+    35
+}
+fn default_lifecycle_tick() -> u64 {
+    10
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stale_threshold_hours: default_stale_hours(),
+            drip_sell_batch: default_drip_batch(),
+            drip_sell_interval_secs: default_drip_interval(),
+            tick_interval_secs: default_lifecycle_tick(),
+        }
+    }
+}
+
 impl Config {
     /// Load config from a TOML file, then overlay environment variables for secrets.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -605,6 +748,9 @@ impl Config {
                     ..CrossbookConfig::default()
                 }
             },
+            split: SplitConfig::default(),
+            sniper: SniperConfig::default(),
+            lifecycle: LifecycleConfig::default(),
         }
     }
 

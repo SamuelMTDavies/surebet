@@ -5,16 +5,22 @@ mod auth;
 mod config;
 mod dashboard;
 mod feeds;
+mod lifecycle;
 mod maker;
 mod market;
+mod metrics;
 mod orderbook;
+mod sniper;
+mod split;
 mod store;
 mod ws;
 
 use crate::anomaly::{AnomalyDetector, AnomalyEvent};
 use crate::arb::executor::{ArbExecutor, RiskLimits};
 use crate::crossbook::{CrossbookEvent, CrossbookScanner};
+use crate::lifecycle::{LifecycleEvent, LifecycleManager};
 use crate::maker::{MakerConfig, MakerEvent, MakerStrategy};
+use crate::metrics::MetricsTracker;
 use crate::arb::{ArbEvent, ArbScanner, TrackedMarket};
 use crate::auth::{ClobApiClient, L2Credentials};
 use crate::config::Config;
@@ -24,6 +30,11 @@ use crate::feeds::binance::{BinanceEvent, BinanceFeed};
 use crate::feeds::coinbase::{CoinbaseEvent, CoinbaseFeed};
 use crate::market::{classify_edge_profile, DiscoveredMarket, MarketDiscovery};
 use crate::orderbook::OrderBookStore;
+use crate::sniper::{SniperEngine, SniperEvent, auto_map_markets};
+use crate::sniper::executor::SniperExecutor;
+use crate::sniper::sources::CryptoThresholdWatcher;
+use crate::split::{SplitEvent, SplitScanner};
+use crate::split::executor::{SplitExecutor, SplitRiskLimits};
 use crate::store::{FillRecord, OrderRecord, OrderStatus, PositionLeg, PositionRecord, StateStore};
 use crate::ws::clob::{ClobEvent, start_clob_ws};
 use crate::ws::rtds::{RtdsEvent, RtdsSubscription, RtdsWsClient};
@@ -437,6 +448,142 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Split Arb Scanner (Strategy 1A) ---
+    let (split_tx, mut split_rx) = mpsc::unbounded_channel::<SplitEvent>();
+    let split_markets: Vec<TrackedMarket> = markets
+        .iter()
+        .filter_map(TrackedMarket::from_discovered)
+        .collect();
+
+    if config.split.enabled {
+        let split_min_edge =
+            Decimal::from_str(&config.split.min_net_edge.to_string()).unwrap_or(Decimal::ZERO);
+        let mut split_scanner = SplitScanner::new(
+            store.clone(),
+            split_markets,
+            split_tx,
+            split_min_edge,
+        );
+
+        let split_interval = Duration::from_millis(config.split.scan_interval_ms);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(split_interval);
+            loop {
+                interval.tick().await;
+                split_scanner.scan_all();
+            }
+        });
+
+        info!(
+            scan_interval_ms = config.split.scan_interval_ms,
+            min_edge = config.split.min_net_edge,
+            execute = config.split.execute,
+            "split arb scanner enabled"
+        );
+    } else {
+        info!("split arb scanner disabled (set split.enabled=true in config)");
+    }
+
+    // --- Resolution Sniper (Strategy 1B) ---
+    let (sniper_tx, mut sniper_rx) = mpsc::unbounded_channel::<SniperEvent>();
+    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<sniper::ResolutionSignal>();
+
+    let sniper_executor = SniperExecutor::new(store.clone(), api_client.clone(), config.sniper.execute);
+
+    let sniper_engine: Option<Arc<Mutex<SniperEngine>>> = if config.sniper.enabled {
+        let mut engine = SniperEngine::new(
+            store.clone(),
+            sniper_tx,
+            config.sniper.min_confidence,
+        );
+
+        // Auto-map markets to resolution sources
+        let sniper_markets: Vec<TrackedMarket> = markets
+            .iter()
+            .filter_map(TrackedMarket::from_discovered)
+            .collect();
+        let mappings = auto_map_markets(&sniper_markets);
+        for mapping in &mappings {
+            info!(
+                cid = %mapping.condition_id,
+                source = %mapping.source_type,
+                question = %mapping.question,
+                "sniper: mapped market"
+            );
+            engine.add_mapping(mapping.clone());
+        }
+
+        info!(
+            mapped = mappings.len(),
+            total = sniper_markets.len(),
+            confidence = config.sniper.min_confidence,
+            execute = config.sniper.execute,
+            "resolution sniper enabled"
+        );
+
+        Some(Arc::new(Mutex::new(engine)))
+    } else {
+        info!("resolution sniper disabled (set sniper.enabled=true in config)");
+        None
+    };
+
+    // Crypto threshold watcher (feeds into sniper)
+    let crypto_watcher: Option<Arc<Mutex<CryptoThresholdWatcher>>> =
+        if config.sniper.enabled && config.sniper.crypto_enabled {
+            let watcher = CryptoThresholdWatcher::new();
+            // Watches are auto-populated from sniper mappings with crypto source type
+            let shared = Arc::new(Mutex::new(watcher));
+            info!("crypto threshold watcher enabled for sniper");
+            Some(shared)
+        } else {
+            None
+        };
+
+    // --- Lifecycle Manager (Strategy 1C) ---
+    let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel::<LifecycleEvent>();
+
+    let lifecycle: Option<Arc<Mutex<LifecycleManager>>> = if config.lifecycle.enabled {
+        let stale_threshold = Duration::from_secs(config.lifecycle.stale_threshold_hours * 3600);
+        let manager = LifecycleManager::new(store.clone(), lifecycle_tx, stale_threshold);
+        let shared = Arc::new(Mutex::new(manager));
+
+        let lc_for_tick = shared.clone();
+        let tick_interval = Duration::from_secs(config.lifecycle.tick_interval_secs);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick_interval);
+            loop {
+                interval.tick().await;
+                lc_for_tick.lock().await.tick();
+            }
+        });
+
+        info!(
+            stale_hours = config.lifecycle.stale_threshold_hours,
+            drip_batch = config.lifecycle.drip_sell_batch,
+            drip_interval = config.lifecycle.drip_sell_interval_secs,
+            "lifecycle manager enabled"
+        );
+        Some(shared)
+    } else {
+        info!("lifecycle manager disabled (set lifecycle.enabled=true in config)");
+        None
+    };
+
+    // --- Metrics Tracker ---
+    let metrics = Arc::new(Mutex::new(MetricsTracker::new(
+        Decimal::from_str(&config.arb.max_total_exposure.to_string()).unwrap_or(Decimal::from(500)),
+    )));
+
+    // Metrics summary every 5 minutes
+    let metrics_for_summary = metrics.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            metrics_for_summary.lock().await.log_summary();
+        }
+    });
+
     // --- Dashboard (launched after all modules so it can reference them) ---
     if config.dashboard.enabled {
         if let Some(ref store_ref) = state_store {
@@ -638,6 +785,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                     RtdsEvent::CryptoPrice { symbol, price } => {
                         debug!(symbol = %symbol, price = %price, "crypto price");
+                        // Feed RTDS crypto prices to sniper threshold watcher
+                        if let Some(ref watcher) = crypto_watcher {
+                            if let Ok(dec_price) = Decimal::from_str(&price) {
+                                let signals = watcher.lock().await.check_price(&symbol, dec_price);
+                                for sig in signals {
+                                    let _ = signal_tx.send(sig);
+                                }
+                            }
+                        }
                     }
                     RtdsEvent::RawEvent(_) => {}
                 }
@@ -768,7 +924,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             Some(agg_event) = agg_rx.recv() => {
-                if let AggregatorEvent::PriceUpdate(agg) = agg_event {
+                if let AggregatorEvent::PriceUpdate(ref agg) = agg_event {
                     info!(
                         symbol = %agg.symbol,
                         price = %agg.price,
@@ -776,6 +932,14 @@ async fn main() -> anyhow::Result<()> {
                         confidence = %agg.confidence,
                         "price signal"
                     );
+
+                    // Feed price to crypto threshold watcher for sniper
+                    if let Some(ref watcher) = crypto_watcher {
+                        let signals = watcher.lock().await.check_price(&agg.symbol, agg.price);
+                        for sig in signals {
+                            let _ = signal_tx.send(sig);
+                        }
+                    }
                 }
             }
 
@@ -991,6 +1155,194 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            Some(split_event) = split_rx.recv() => {
+                match split_event {
+                    SplitEvent::OpportunityDetected(opp) => {
+                        info!(
+                            market = %opp.question,
+                            dir = %opp.direction,
+                            outcomes = opp.num_outcomes,
+                            sum = %opp.price_sum,
+                            gross = %opp.gross_edge,
+                            net_tob = %opp.net_edge_tob,
+                            fillable = %opp.min_fillable_shares,
+                            tiers = opp.tier_analyses.len(),
+                            priority = opp.high_priority,
+                            "SPLIT ARB OPPORTUNITY"
+                        );
+                        for tier in &opp.tier_analyses {
+                            if tier.expected_profit_usd > Decimal::ZERO {
+                                info!(
+                                    tier = %tier.tier_usd,
+                                    edge = %tier.net_edge,
+                                    profit = %tier.expected_profit_usd,
+                                    fillable = tier.fully_fillable,
+                                    "  tier analysis"
+                                );
+                            }
+                        }
+                    }
+                    SplitEvent::OpportunityGone { condition_id, direction } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            dir = %direction,
+                            "split opp gone"
+                        );
+                    }
+                    SplitEvent::ScanComplete { markets_scanned, buy_merge_opps, split_sell_opps } => {
+                        if buy_merge_opps > 0 || split_sell_opps > 0 {
+                            info!(
+                                scanned = markets_scanned,
+                                buy_merge = buy_merge_opps,
+                                split_sell = split_sell_opps,
+                                "split scan"
+                            );
+                        }
+                    }
+                    SplitEvent::ScanDiagnostics { total_markets, multi_outcome_markets, tightest_buy_sum, tightest_sell_sum, near_misses } => {
+                        info!(
+                            total = total_markets,
+                            multi = multi_outcome_markets,
+                            buy_tightest = ?tightest_buy_sum,
+                            sell_tightest = ?tightest_sell_sum,
+                            near_misses = near_misses,
+                            "SPLIT SCAN diagnostics"
+                        );
+                    }
+                }
+            }
+
+            Some(sniper_event) = sniper_rx.recv() => {
+                match sniper_event {
+                    SniperEvent::SignalReceived { condition_id, source, confidence } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            source = %source,
+                            confidence = confidence,
+                            "SNIPER signal received"
+                        );
+                    }
+                    SniperEvent::SnipeDispatched { condition_id, question, num_orders } => {
+                        info!(
+                            market = %question,
+                            orders = num_orders,
+                            "SNIPER dispatched"
+                        );
+                    }
+                    SniperEvent::OnChainResolution { condition_id, winning_outcome } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            winner = %winning_outcome,
+                            "on-chain resolution"
+                        );
+                        // Notify lifecycle manager
+                        if let Some(ref lc) = lifecycle {
+                            lc.lock().await.on_resolution(&condition_id, &winning_outcome);
+                            lc.lock().await.on_chain_resolution_confirmed(&condition_id);
+                        }
+                    }
+                    SniperEvent::SignalIgnored { condition_id, confidence, reason } => {
+                        debug!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            confidence = confidence,
+                            reason = %reason,
+                            "sniper signal ignored"
+                        );
+                    }
+                }
+            }
+
+            Some(signal) = signal_rx.recv() => {
+                // Resolution signal from an external source — feed to sniper engine
+                if let Some(ref engine) = sniper_engine {
+                    let action = engine.lock().await.process_signal(signal);
+                    if let Some(action) = action {
+                        let profit = sniper_executor.execute(&action).await;
+                        // Record in metrics
+                        metrics.lock().await.record_trade(metrics::TradeRecord {
+                            condition_id: action.condition_id.clone(),
+                            strategy: "snipe".to_string(),
+                            direction: "buy_winner".to_string(),
+                            gross_edge: profit,
+                            fees: Decimal::ZERO,
+                            net_edge: profit,
+                            size_usd: profit,
+                            profit_usd: profit,
+                            fill_rate: 1.0, // Paper mode assumes full fill
+                            recorded_at: std::time::Instant::now(),
+                        });
+                    }
+                }
+            }
+
+            Some(lc_event) = lifecycle_rx.recv() => {
+                match lc_event {
+                    LifecycleEvent::PositionTracked { condition_id, strategy, legs, cost_basis } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            strategy = %strategy,
+                            legs = legs,
+                            cost = %cost_basis,
+                            "lifecycle: position tracked"
+                        );
+                    }
+                    LifecycleEvent::StateChanged { condition_id, from, to } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            from = %from,
+                            to = %to,
+                            "lifecycle: state change"
+                        );
+                    }
+                    LifecycleEvent::RedemptionQueued { condition_id, shares, expected_payout, .. } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            shares = %shares,
+                            payout = %expected_payout,
+                            "lifecycle: PAPER redemption queued"
+                        );
+                    }
+                    LifecycleEvent::DripSellQueued { condition_id, shares, target_price, .. } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            shares = %shares,
+                            target = %target_price,
+                            "lifecycle: PAPER drip sell"
+                        );
+                    }
+                    LifecycleEvent::StalePositionSell { condition_id, age_hours, discount_pct } => {
+                        warn!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            age_h = format!("{:.1}", age_hours),
+                            discount = format!("{:.1}%", discount_pct),
+                            "lifecycle: stale position"
+                        );
+                    }
+                    LifecycleEvent::PositionClosed { condition_id, realized_pnl } => {
+                        info!(
+                            cid = %condition_id[..12.min(condition_id.len())],
+                            pnl = %realized_pnl,
+                            "lifecycle: position closed"
+                        );
+                    }
+                    LifecycleEvent::PortfolioSummary { total_positions, active, exiting, redeemable, stale, total_cost_basis, total_mark_value, unrealized_pnl } => {
+                        if total_positions > 0 {
+                            info!(
+                                positions = total_positions,
+                                active = active,
+                                exiting = exiting,
+                                redeemable = redeemable,
+                                stale = stale,
+                                cost = %total_cost_basis,
+                                mark = %total_mark_value,
+                                unrealized = %unrealized_pnl,
+                                "PORTFOLIO SUMMARY"
+                            );
+                        }
+                    }
                 }
             }
 

@@ -137,6 +137,52 @@ min_remaining = 50
 poly_min_volume_usd = 100.0
 poly_min_depth_usd = 0.0
 
+[split]
+# Enable the enhanced multi-outcome split arbitrage scanner (Strategy 1A).
+# Detects bidirectional arbs: sum of asks < 1 (buy-and-merge) and
+# sum of bids > 1 (split-and-sell). Analyses depth at $100/$500/$1K/$5K tiers.
+enabled = true
+# Enable live execution (false = paper mode, logs opportunities)
+execute = false
+# Minimum net edge after fees to report
+min_net_edge = 0.005
+# Scan interval in milliseconds
+scan_interval_ms = 1000
+# Max USDC per split position
+max_position_usd = 500.0
+# Max total USDC across all open split positions
+max_total_exposure = 2000.0
+
+[sniper]
+# Enable the resolution sniping engine (Strategy 1B).
+# Monitors external data sources and fires when an outcome becomes
+# publicly knowable but the Polymarket book hasn't priced it in yet.
+enabled = true
+# Enable live execution (false = paper mode, logs estimated P&L)
+execute = false
+# Minimum confidence (0.0-1.0) to act on a resolution signal
+min_confidence = 0.95
+# Maximum price to pay for winning outcome tokens
+max_buy_price = 0.99
+# Enable crypto price threshold watching (uses existing exchange feeds)
+crypto_enabled = true
+# Poll interval for HTTP-based sources (Billboard, RT, USGS) in seconds
+http_poll_interval_secs = 30
+
+[lifecycle]
+# Enable position lifecycle management (Strategy 1C).
+# Manages exits: winning tokens queued for redemption, losing tokens
+# drip-sold, stale positions sold at discount.
+enabled = true
+# Hours before a position is considered stale (triggers discount sell)
+stale_threshold_hours = 24
+# Shares per drip-sell batch (rate limits selling to avoid book impact)
+drip_sell_batch = 1000.0
+# Seconds between drip-sell batches
+drip_sell_interval_secs = 35
+# Tick interval for lifecycle checks (seconds)
+tick_interval_secs = 10
+
 [logging]
 level = "info"
 json = false
