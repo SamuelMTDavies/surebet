@@ -725,6 +725,10 @@ pub struct OnChainConfig {
     /// How many blocks back to scan on startup for missed events.
     #[serde(default = "default_startup_lookback")]
     pub startup_lookback_blocks: u64,
+    /// Fallback Polygon WebSocket URLs to try when the primary is rate-limited
+    /// or unavailable. Rotated through on consecutive failures.
+    #[serde(default = "default_fallback_ws_urls")]
+    pub fallback_ws_urls: Vec<String>,
 }
 
 fn default_ctf_address() -> String {
@@ -751,6 +755,12 @@ fn default_checkpoint_path() -> String {
 fn default_startup_lookback() -> u64 {
     10
 }
+fn default_fallback_ws_urls() -> Vec<String> {
+    vec![
+        "wss://polygon-bor-rpc.publicnode.com".to_string(),
+        "wss://polygon.drpc.org".to_string(),
+    ]
+}
 
 impl Default for OnChainConfig {
     fn default() -> Self {
@@ -765,6 +775,7 @@ impl Default for OnChainConfig {
             max_latency_ms: default_max_latency_ms(),
             checkpoint_path: default_checkpoint_path(),
             startup_lookback_blocks: default_startup_lookback(),
+            fallback_ws_urls: default_fallback_ws_urls(),
         }
     }
 }

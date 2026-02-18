@@ -66,31 +66,58 @@ impl OnChainMonitor {
         })
     }
 
+    /// Build the list of WebSocket URLs to rotate through: primary first, then fallbacks.
+    fn ws_urls(&self) -> Vec<&str> {
+        let mut urls: Vec<&str> = Vec::new();
+        if !self.config.polygon_ws_url.is_empty() {
+            urls.push(&self.config.polygon_ws_url);
+        }
+        for url in &self.config.fallback_ws_urls {
+            if !url.is_empty() && urls.iter().all(|u| *u != url.as_str()) {
+                urls.push(url);
+            }
+        }
+        urls
+    }
+
     /// Main loop: connect, subscribe, process events, reconnect on failure.
+    /// Rotates through primary + fallback WebSocket URLs on consecutive failures.
     async fn run_forever(&self) {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
+        let urls = self.ws_urls();
+        if urls.is_empty() {
+            error!("no Polygon WebSocket URLs configured (primary or fallback)");
+            return;
+        }
+        let mut url_index = 0;
 
         loop {
-            info!(url = %self.config.polygon_ws_url, "connecting to Polygon WebSocket");
+            let url = urls[url_index];
+            info!(url = %url, provider = url_index + 1, total = urls.len(), "connecting to Polygon WebSocket");
 
-            match self.run_session().await {
+            match self.run_session_with_url(url).await {
                 Ok(()) => {
                     info!("Polygon WebSocket session ended cleanly");
                     backoff = Duration::from_secs(1);
+                    // On clean disconnect, stay on the same provider
                 }
                 Err(e) => {
                     let err_str = e.to_string();
                     let is_rate_limited = err_str.contains("429") || err_str.contains("Too Many Requests");
                     if is_rate_limited {
-                        // Jump straight to a longer backoff for rate limits
                         backoff = backoff.max(Duration::from_secs(15));
                         warn!(
+                            url = %url,
                             backoff_secs = backoff.as_secs(),
-                            "Polygon WebSocket rate limited (429), backing off"
+                            "Polygon WebSocket rate limited (429), rotating provider"
                         );
+                        // Rotate to next provider immediately on rate limit
+                        url_index = (url_index + 1) % urls.len();
                     } else {
-                        error!(error = %e, "Polygon WebSocket session error");
+                        error!(url = %url, error = %e, "Polygon WebSocket session error");
+                        // Rotate after consecutive failures on same provider
+                        url_index = (url_index + 1) % urls.len();
                     }
                     let _ = self.signal_tx.send(OnChainSignal::Disconnected {
                         reason: err_str,
@@ -100,6 +127,7 @@ impl OnChainMonitor {
 
             info!(
                 backoff_secs = backoff.as_secs(),
+                next_url = %urls[url_index],
                 "reconnecting to Polygon WebSocket"
             );
             tokio::time::sleep(backoff).await;
@@ -108,8 +136,8 @@ impl OnChainMonitor {
     }
 
     /// A single WebSocket session: connect, recover gap, subscribe, process.
-    async fn run_session(&self) -> anyhow::Result<()> {
-        let ws = WsConnect::new(&self.config.polygon_ws_url);
+    async fn run_session_with_url(&self, url: &str) -> anyhow::Result<()> {
+        let ws = WsConnect::new(url);
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
 
         let _ = self.signal_tx.send(OnChainSignal::Connected);
