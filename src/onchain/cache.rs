@@ -157,11 +157,60 @@ impl MarketCache {
         None
     }
 
-    /// Look up a market by its UMA questionId.
+    /// Look up a market by its UMA questionId (cache only, no API call).
     pub fn get_by_question_id(&self, question_id_hex: &str) -> Option<CachedMarket> {
         self.question_to_condition
             .get(question_id_hex)
             .and_then(|cid| self.by_condition_id.get(cid.value()).map(|e| e.clone()))
+    }
+
+    /// Fast async lookup by question_id: check cache first, then single Gamma API
+    /// attempt (no retries — designed for latency-critical resolution sniping).
+    pub async fn lookup_by_question_id(&self, question_id_hex: &str) -> Option<CachedMarket> {
+        // Fast path: already in cache
+        if let Some(market) = self.get_by_question_id(question_id_hex) {
+            return Some(market);
+        }
+
+        // Single Gamma API attempt — no retries, speed is critical
+        let url = format!(
+            "{}/markets?question_id={}",
+            self.gamma_url, question_id_hex
+        );
+        match self.http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(markets) = resp.json::<Vec<GammaMarket>>().await {
+                    if let Some(market) = markets.into_iter().next() {
+                        if let Some(cached) = self.parse_gamma_market(&market) {
+                            info!(
+                                question_id = %question_id_hex,
+                                condition_id = %cached.condition_id,
+                                question = %cached.question,
+                                "market resolved via Gamma API (question_id lookup)"
+                            );
+                            self.insert(cached.clone());
+                            return Some(cached);
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                debug!(
+                    status = %resp.status(),
+                    question_id = %question_id_hex,
+                    "Gamma API question_id lookup returned non-success"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    question_id = %question_id_hex,
+                    "Gamma API question_id lookup failed"
+                );
+            }
+        }
+
+        None
     }
 
     /// Look up a market by its conditionId.

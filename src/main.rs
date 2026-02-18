@@ -1619,6 +1619,18 @@ async fn main() -> anyhow::Result<()> {
                                 "SPLIT ARB TARGET: multi-outcome market created on-chain"
                             );
                         }
+
+                        // Eagerly populate the event market cache so resolution
+                        // lookups later will hit instantly (the monitor's cache is
+                        // shared via Arc<DashMap>, but this fires an extra lookup
+                        // from the event handler side for redundancy).
+                        if let Some(ref cache) = event_market_cache {
+                            let cache = cache.clone();
+                            let cid_hex = format!("{:x}", condition_id);
+                            tokio::spawn(async move {
+                                cache.lookup_condition(&cid_hex).await;
+                            });
+                        }
                     }
                     OnChainSignal::ResolutionProposed {
                         question_id,
@@ -1643,11 +1655,27 @@ async fn main() -> anyhow::Result<()> {
 
                         // Scan ONLY the matched market's order book for snipeable orders.
                         // Map question_id → CachedMarket → clob_token_ids → order books.
+                        // Fast path: in-memory DashMap lookup (nanoseconds).
+                        // Fallback: single Gamma API call by question_id (no retries).
                         {
                             let qid_hex = format!("{:x}", question_id);
-                            let cached = event_market_cache
-                                .as_ref()
-                                .and_then(|cache| cache.get_by_question_id(&qid_hex));
+
+                            // Try cache first (instant), then async Gamma lookup (single attempt)
+                            let cached = match event_market_cache.as_ref() {
+                                Some(cache) => {
+                                    let sync_hit = cache.get_by_question_id(&qid_hex);
+                                    if sync_hit.is_some() {
+                                        sync_hit
+                                    } else {
+                                        warn!(
+                                            question_id = %qid_hex,
+                                            "question_id not in cache, trying Gamma API"
+                                        );
+                                        cache.lookup_by_question_id(&qid_hex).await
+                                    }
+                                }
+                                None => None,
+                            };
 
                             if let Some(market) = cached {
                                 let one = Decimal::from(1);
