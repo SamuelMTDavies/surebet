@@ -26,6 +26,8 @@ pub enum OnChainSignal {
         proposer: Address,
         block_number: u64,
         timestamp: u64,
+        /// Gamma API numeric market ID parsed from the UMA ancillary data.
+        market_id: Option<String>,
         /// Monotonic instant when the monitor first saw this event.
         detected_at: Instant,
         /// Milliseconds between block timestamp and our detection.

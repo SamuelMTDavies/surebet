@@ -17,6 +17,8 @@ use tracing::{debug, info, warn};
 pub struct CachedMarket {
     pub condition_id: String,
     pub question_id: Option<String>,
+    /// Gamma API numeric market ID (from ancillary data `market_id: <num>`).
+    pub market_id: Option<String>,
     pub question: String,
     pub slug: Option<String>,
     pub outcomes: Vec<String>,
@@ -35,6 +37,8 @@ pub struct MarketCache {
     question_to_condition: Arc<DashMap<String, String>>,
     /// CLOB token_id → (conditionId, outcome_index)
     token_to_condition: Arc<DashMap<String, (String, usize)>>,
+    /// Gamma numeric market_id → conditionId
+    market_id_to_condition: Arc<DashMap<String, String>>,
     /// Gamma API base URL
     gamma_url: String,
     /// HTTP client for Gamma API queries
@@ -42,11 +46,15 @@ pub struct MarketCache {
 }
 
 /// Gamma API market response (subset of fields we need).
+/// Field names match the Gamma API's camelCase JSON.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GammaMarket {
     #[serde(default)]
-    condition_id: String,
+    id: Option<serde_json::Value>, // numeric ID, can be int or string
     #[serde(default)]
+    condition_id: String,
+    #[serde(default, rename = "questionID")]
     question_id: Option<String>,
     #[serde(default)]
     question: String,
@@ -68,6 +76,7 @@ impl MarketCache {
             by_condition_id: Arc::new(DashMap::new()),
             question_to_condition: Arc::new(DashMap::new()),
             token_to_condition: Arc::new(DashMap::new()),
+            market_id_to_condition: Arc::new(DashMap::new()),
             gamma_url,
             http: Client::new(),
         }
@@ -164,48 +173,50 @@ impl MarketCache {
             .and_then(|cid| self.by_condition_id.get(cid.value()).map(|e| e.clone()))
     }
 
-    /// Fast async lookup by question_id: check cache first, then single Gamma API
-    /// attempt (no retries — designed for latency-critical resolution sniping).
-    pub async fn lookup_by_question_id(&self, question_id_hex: &str) -> Option<CachedMarket> {
+    /// Look up a market by its Gamma numeric market_id (cache only).
+    pub fn get_by_market_id(&self, market_id: &str) -> Option<CachedMarket> {
+        self.market_id_to_condition
+            .get(market_id)
+            .and_then(|cid| self.by_condition_id.get(cid.value()).map(|e| e.clone()))
+    }
+
+    /// Fast async lookup by Gamma numeric market_id: cache first, then
+    /// single GET /markets/{id} call (no retries — latency-critical path).
+    pub async fn lookup_by_market_id(&self, market_id: &str) -> Option<CachedMarket> {
         // Fast path: already in cache
-        if let Some(market) = self.get_by_question_id(question_id_hex) {
+        if let Some(market) = self.get_by_market_id(market_id) {
             return Some(market);
         }
 
-        // Single Gamma API attempt — no retries, speed is critical
-        let url = format!(
-            "{}/markets?question_id={}",
-            self.gamma_url, question_id_hex
-        );
+        // Single Gamma API attempt — direct ID lookup is fast
+        let url = format!("{}/markets/{}", self.gamma_url, market_id);
         match self.http.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(markets) = resp.json::<Vec<GammaMarket>>().await {
-                    if let Some(market) = markets.into_iter().next() {
-                        if let Some(cached) = self.parse_gamma_market(&market) {
-                            info!(
-                                question_id = %question_id_hex,
-                                condition_id = %cached.condition_id,
-                                question = %cached.question,
-                                "market resolved via Gamma API (question_id lookup)"
-                            );
-                            self.insert(cached.clone());
-                            return Some(cached);
-                        }
+                if let Ok(market) = resp.json::<GammaMarket>().await {
+                    if let Some(cached) = self.parse_gamma_market(&market) {
+                        info!(
+                            market_id = %market_id,
+                            condition_id = %cached.condition_id,
+                            question = %cached.question,
+                            "market resolved via Gamma API (market_id lookup)"
+                        );
+                        self.insert(cached.clone());
+                        return Some(cached);
                     }
                 }
             }
             Ok(resp) => {
                 debug!(
                     status = %resp.status(),
-                    question_id = %question_id_hex,
-                    "Gamma API question_id lookup returned non-success"
+                    market_id = %market_id,
+                    "Gamma API market_id lookup returned non-success"
                 );
             }
             Err(e) => {
                 warn!(
                     error = %e,
-                    question_id = %question_id_hex,
-                    "Gamma API question_id lookup failed"
+                    market_id = %market_id,
+                    "Gamma API market_id lookup failed"
                 );
             }
         }
@@ -237,6 +248,14 @@ impl MarketCache {
             if !qid.is_empty() {
                 self.question_to_condition
                     .insert(qid.clone(), cid.clone());
+            }
+        }
+
+        // Map market_id → conditionId
+        if let Some(ref mid) = market.market_id {
+            if !mid.is_empty() {
+                self.market_id_to_condition
+                    .insert(mid.clone(), cid.clone());
             }
         }
 
@@ -272,9 +291,25 @@ impl MarketCache {
             return None;
         }
 
+        // Strip "0x" prefix for consistent cache keys (our on-chain hex is always without 0x)
+        let cid = market.condition_id.strip_prefix("0x")
+            .unwrap_or(&market.condition_id)
+            .to_lowercase();
+        let qid = market.question_id.as_ref().map(|q| {
+            q.strip_prefix("0x").unwrap_or(q).to_lowercase()
+        });
+
+        // Extract numeric market ID from Gamma API response
+        let mid = market.id.as_ref().map(|v| match v {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            _ => String::new(),
+        }).filter(|s| !s.is_empty());
+
         Some(CachedMarket {
-            condition_id: market.condition_id.clone(),
-            question_id: market.question_id.clone(),
+            condition_id: cid,
+            question_id: qid,
+            market_id: mid,
             question: market.question.clone(),
             slug: market.slug.clone(),
             outcomes,

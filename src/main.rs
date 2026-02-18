@@ -1637,6 +1637,7 @@ async fn main() -> anyhow::Result<()> {
                         proposed_price,
                         proposer,
                         block_number,
+                        market_id,
                         detected_at,
                         chain_latency_ms,
                         ..
@@ -1645,6 +1646,7 @@ async fn main() -> anyhow::Result<()> {
                         let receive_elapsed_ms = detected_at.elapsed().as_millis() as u64;
                         warn!(
                             question_id = %question_id,
+                            market_id = ?market_id,
                             proposed = outcome,
                             proposer = %proposer,
                             block = block_number,
@@ -1654,27 +1656,32 @@ async fn main() -> anyhow::Result<()> {
                         );
 
                         // Scan ONLY the matched market's order book for snipeable orders.
-                        // Map question_id → CachedMarket → clob_token_ids → order books.
-                        // Fast path: in-memory DashMap lookup (nanoseconds).
-                        // Fallback: single Gamma API call by question_id (no retries).
+                        // Use the Gamma numeric market_id parsed from the UMA ancillary data
+                        // to look up the market via cache or direct Gamma API call.
+                        // Fast path: in-memory DashMap (nanoseconds).
+                        // Fallback: GET /markets/{id} (single attempt, ~100ms).
                         {
-                            let qid_hex = format!("{:x}", question_id);
-
-                            // Try cache first (instant), then async Gamma lookup (single attempt)
-                            let cached = match event_market_cache.as_ref() {
-                                Some(cache) => {
-                                    let sync_hit = cache.get_by_question_id(&qid_hex);
+                            let cached = match (event_market_cache.as_ref(), market_id.as_ref()) {
+                                (Some(cache), Some(mid)) => {
+                                    let sync_hit = cache.get_by_market_id(mid);
                                     if sync_hit.is_some() {
                                         sync_hit
                                     } else {
                                         warn!(
-                                            question_id = %qid_hex,
-                                            "question_id not in cache, trying Gamma API"
+                                            market_id = %mid,
+                                            "market_id not in cache, fetching from Gamma API"
                                         );
-                                        cache.lookup_by_question_id(&qid_hex).await
+                                        cache.lookup_by_market_id(mid).await
                                     }
                                 }
-                                None => None,
+                                (_, None) => {
+                                    warn!(
+                                        question_id = %question_id,
+                                        "no market_id in ancillary data — cannot map to market"
+                                    );
+                                    None
+                                }
+                                (None, _) => None,
                             };
 
                             if let Some(market) = cached {
@@ -1683,7 +1690,7 @@ async fn main() -> anyhow::Result<()> {
                                 let token_count = market.clob_token_ids.len();
 
                                 warn!(
-                                    question_id = %qid_hex,
+                                    market_id = ?market_id,
                                     condition_id = %market.condition_id,
                                     question = %market.question,
                                     outcomes = ?market.outcomes,
@@ -1756,9 +1763,10 @@ async fn main() -> anyhow::Result<()> {
                                 );
                             } else {
                                 warn!(
-                                    question_id = %qid_hex,
+                                    question_id = %question_id,
+                                    market_id = ?market_id,
                                     proposed = outcome,
-                                    "SNIPE SCAN: could not map question_id to market — not in cache"
+                                    "SNIPE SCAN: could not resolve market — no cache hit or API match"
                                 );
                             }
                         }

@@ -520,9 +520,12 @@ impl OnChainMonitor {
 
         // Extract questionId from ancillaryData (contains market_id and question text)
         let question_id = extract_question_id_from_ancillary(data);
+        // Extract Gamma numeric market_id from "market_id: <digits>" in ancillary text
+        let market_id = extract_market_id_from_ancillary(data);
 
         info!(
             question_id = %question_id,
+            market_id = ?market_id,
             proposed_price = proposed_price,
             proposer = %proposer,
             expiration_ts = expiration_ts,
@@ -542,6 +545,7 @@ impl OnChainMonitor {
             proposer,
             block_number,
             timestamp,
+            market_id,
             detected_at,
             chain_latency_ms,
         });
@@ -805,6 +809,55 @@ fn extract_question_id_from_ancillary(data: &[u8]) -> B256 {
     // ancillaryData + timestamp combination.
     use crate::onchain::abi::keccak256;
     keccak256(ancillary)
+}
+
+/// Extract the Gamma API numeric `market_id` from UMA ancillary data text.
+///
+/// The ancillary data for Polymarket events contains a substring like:
+///   "... market_id: 1337784 res_data: ..."
+/// This numeric ID maps directly to Gamma's `/markets/{id}` endpoint.
+fn extract_market_id_from_ancillary(data: &[u8]) -> Option<String> {
+    if data.len() < 96 {
+        return None;
+    }
+
+    let offset_bytes: [u8; 32] = data[64..96].try_into().ok()?;
+    let offset: usize = U256::from_be_bytes(offset_bytes).try_into().ok()?;
+
+    if offset == 0 || offset + 32 > data.len() {
+        return None;
+    }
+
+    let len_bytes: [u8; 32] = data[offset..offset + 32].try_into().ok()?;
+    let len: usize = U256::from_be_bytes(len_bytes).try_into().ok()?;
+
+    if len == 0 || offset + 32 + len > data.len() {
+        return None;
+    }
+
+    let ancillary = &data[offset + 32..offset + 32 + len];
+    let text = std::str::from_utf8(ancillary).ok()?;
+
+    // Look for "market_id: <digits>"
+    if let Some(pos) = text.find("market_id: ") {
+        let after = &text[pos + "market_id: ".len()..];
+        let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+
+    // Fallback: "market_id:" (no space)
+    if let Some(pos) = text.find("market_id:") {
+        let after = &text[pos + "market_id:".len()..];
+        let trimmed = after.trim_start();
+        let id: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+
+    None
 }
 
 /// Attempt to derive a conditionId hint from a CTF token ID.
