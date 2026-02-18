@@ -7,6 +7,7 @@
 //!   GET /api/positions    → JSON list of positions
 //!   GET /api/fills        → JSON list of recent fills
 //!   GET /api/pnl          → JSON PnL totals
+//!   GET /api/strategies   → JSON strategy snapshots (split, sniper, lifecycle, metrics)
 
 use crate::anomaly::AnomalyDetector;
 use crate::crossbook::CrossbookScanner;
@@ -16,9 +17,124 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
+use rust_decimal::Decimal;
+use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
+
+/// Strategy-level snapshot updated by the main event loop.
+/// The dashboard reads this without needing access to the actual scanner/engine objects.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StrategySnapshot {
+    pub split: SplitSnapshot,
+    pub sniper: SniperSnapshot,
+    pub lifecycle: LifecycleSnapshot,
+    pub metrics: MetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SplitSnapshot {
+    pub enabled: bool,
+    pub active_opps: Vec<SplitOppEntry>,
+    pub total_scans: u64,
+    pub last_diagnostics: Option<SplitDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitOppEntry {
+    pub question: String,
+    pub direction: String,
+    pub num_outcomes: usize,
+    pub price_sum: String,
+    pub gross_edge: String,
+    pub net_edge_tob: String,
+    pub min_fillable: String,
+    pub high_priority: bool,
+    pub best_tier_profit: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SplitDiagnostics {
+    pub total_markets: usize,
+    pub multi_outcome: usize,
+    pub tightest_buy: Option<String>,
+    pub tightest_sell: Option<String>,
+    pub near_misses: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SniperSnapshot {
+    pub enabled: bool,
+    pub mapped_markets: usize,
+    pub sniped_count: usize,
+    pub recent_signals: VecDeque<SniperSignalEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SniperSignalEntry {
+    pub condition_id: String,
+    pub source: String,
+    pub confidence: f64,
+    pub action: String, // "dispatched", "ignored", "on_chain"
+    pub time: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LifecycleSnapshot {
+    pub enabled: bool,
+    pub total_positions: usize,
+    pub active: usize,
+    pub exiting: usize,
+    pub redeemable: usize,
+    pub stale: usize,
+    pub total_cost_basis: String,
+    pub total_mark_value: String,
+    pub unrealized_pnl: String,
+    pub recent_events: VecDeque<LifecycleEventEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleEventEntry {
+    pub condition_id: String,
+    pub event_type: String,
+    pub detail: String,
+    pub time: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MetricsSnapshot {
+    pub trades_5m: usize,
+    pub profit_5m: String,
+    pub avg_edge_5m: String,
+    pub avg_fill_rate_5m: String,
+    pub avg_latency_ms_5m: String,
+    pub trades_1h: usize,
+    pub profit_1h: String,
+    pub utilisation_pct: String,
+    pub capital_deployed: String,
+    pub capital_available: String,
+}
+
+/// Max recent entries to keep in dashboard snapshots.
+const MAX_RECENT: usize = 50;
+
+impl StrategySnapshot {
+    pub fn push_sniper_signal(&mut self, entry: SniperSignalEntry) {
+        if self.sniper.recent_signals.len() >= MAX_RECENT {
+            self.sniper.recent_signals.pop_back();
+        }
+        self.sniper.recent_signals.push_front(entry);
+    }
+
+    pub fn push_lifecycle_event(&mut self, entry: LifecycleEventEntry) {
+        if self.lifecycle.recent_events.len() >= MAX_RECENT {
+            self.lifecycle.recent_events.pop_back();
+        }
+        self.lifecycle.recent_events.push_front(entry);
+    }
+}
 
 /// Shared state for the dashboard routes.
 #[derive(Clone)]
@@ -26,6 +142,7 @@ pub struct DashboardState {
     pub store: Arc<Mutex<StateStore>>,
     pub anomaly_detector: Option<Arc<Mutex<AnomalyDetector>>>,
     pub crossbook_scanner: Option<Arc<Mutex<CrossbookScanner>>>,
+    pub strategy_snapshot: Arc<Mutex<StrategySnapshot>>,
 }
 
 /// Build the Axum router.
@@ -39,6 +156,7 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/pnl", get(api_pnl))
         .route("/api/anomalies", get(api_anomalies))
         .route("/api/crossbook", get(api_crossbook))
+        .route("/api/strategies", get(api_strategies))
         .with_state(state)
 }
 
@@ -122,6 +240,11 @@ async fn api_crossbook(State(state): State<DashboardState>) -> impl IntoResponse
     }
 }
 
+async fn api_strategies(State(state): State<DashboardState>) -> impl IntoResponse {
+    let snap = state.strategy_snapshot.lock().await;
+    Json(snap.clone()).into_response()
+}
+
 // --- HTML Dashboard ---
 
 async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
@@ -140,6 +263,9 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
 
     let positions = store.get_all_positions().await.unwrap_or_default();
     let orders = store.get_all_open_orders().await.unwrap_or_default();
+
+    // Strategy snapshot
+    let strat = state.strategy_snapshot.lock().await.clone();
 
     // Build positions table rows
     let position_rows: String = if positions.is_empty() {
@@ -320,6 +446,75 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
         )
     };
 
+    // Build split arb rows
+    let split_rows: String = if strat.split.active_opps.is_empty() {
+        "<tr><td colspan=\"8\" style=\"text-align:center;color:#666\">No split arb opportunities</td></tr>".to_string()
+    } else {
+        strat.split.active_opps.iter().map(|o| {
+            let dir_color = if o.direction == "BUY_MERGE" { "#3498db" } else { "#e67e22" };
+            let prio = if o.high_priority { "<span style=\"color:#f1c40f\">&#x2605;</span>" } else { "" };
+            format!(
+                "<tr><td>{} {}</td><td style=\"color:{}\">{}</td><td>{}</td><td>{}</td><td style=\"color:#2ecc71\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                &o.question[..o.question.len().min(40)],
+                prio,
+                dir_color,
+                o.direction,
+                o.num_outcomes,
+                o.price_sum,
+                o.net_edge_tob,
+                o.min_fillable,
+                o.best_tier_profit.as_deref().unwrap_or("-"),
+                o.gross_edge,
+            )
+        }).collect()
+    };
+
+    // Build sniper signal rows
+    let sniper_rows: String = if strat.sniper.recent_signals.is_empty() {
+        "<tr><td colspan=\"5\" style=\"text-align:center;color:#666\">No sniper signals yet</td></tr>".to_string()
+    } else {
+        strat.sniper.recent_signals.iter().take(20).map(|s| {
+            let action_color = match s.action.as_str() {
+                "dispatched" => "#2ecc71",
+                "on_chain" => "#3498db",
+                "ignored" => "#8b949e",
+                _ => "#c9d1d9",
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{:.2}</td><td style=\"color:{}\">{}</td><td>{}</td></tr>",
+                &s.condition_id[..s.condition_id.len().min(12)],
+                s.source,
+                s.confidence,
+                action_color,
+                s.action,
+                &s.time,
+            )
+        }).collect()
+    };
+
+    // Build lifecycle rows
+    let lifecycle_rows: String = if strat.lifecycle.recent_events.is_empty() {
+        "<tr><td colspan=\"4\" style=\"text-align:center;color:#666\">No lifecycle events</td></tr>".to_string()
+    } else {
+        strat.lifecycle.recent_events.iter().take(20).map(|e| {
+            let type_color = match e.event_type.as_str() {
+                "redemption" => "#2ecc71",
+                "drip_sell" => "#e67e22",
+                "stale" => "#e74c3c",
+                "state_change" => "#3498db",
+                _ => "#c9d1d9",
+            };
+            format!(
+                "<tr><td>{}</td><td style=\"color:{}\">{}</td><td>{}</td><td>{}</td></tr>",
+                &e.condition_id[..e.condition_id.len().min(12)],
+                type_color,
+                e.event_type,
+                e.detail,
+                &e.time,
+            )
+        }).collect()
+    };
+
     // PnL color
     let pnl_color = |s: &str| -> &str {
         if s.starts_with('-') {
@@ -330,6 +525,10 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
             "#2ecc71"
         }
     };
+
+    // Split diagnostics for card
+    let split_diag = strat.split.last_diagnostics.as_ref();
+    let split_near = split_diag.map(|d| d.near_misses).unwrap_or(0);
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -351,7 +550,14 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
   th {{ background: #21262d; color: #8b949e; text-align: left; padding: 8px 12px; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.5px; }}
   td {{ padding: 8px 12px; border-top: 1px solid #21262d; font-size: 0.85em; }}
   tr:hover {{ background: #1c2128; }}
+  .metrics-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-bottom: 20px; }}
+  .metric {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 14px; }}
+  .metric .mlabel {{ color: #8b949e; font-size: 0.7em; text-transform: uppercase; }}
+  .metric .mval {{ font-size: 1.1em; font-weight: bold; margin-top: 2px; }}
   .auto {{ color: #484f58; font-size: 0.7em; margin-top: 15px; }}
+  .badge {{ display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; }}
+  .badge-on {{ background: #238636; color: #fff; }}
+  .badge-off {{ background: #30363d; color: #8b949e; }}
 </style>
 </head>
 <body>
@@ -379,10 +585,54 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
     <div class="value" style="color:{total_color}">${total_pnl}</div>
   </div>
   <div class="card">
+    <div class="label">Split Arbs</div>
+    <div class="value" style="color:#2ecc71">{split_opps}</div>
+  </div>
+  <div class="card">
+    <div class="label">Sniper Signals</div>
+    <div class="value" style="color:#e67e22">{sniper_signals}</div>
+  </div>
+  <div class="card">
+    <div class="label">Managed Pos</div>
+    <div class="value">{lifecycle_pos}</div>
+  </div>
+  <div class="card">
     <div class="label">Anomalies</div>
     <div class="value" style="color:#f39c12">{anomaly_count}</div>
   </div>
 </div>
+
+<h2>Metrics (5min / 1hr)</h2>
+<div class="metrics-grid">
+  <div class="metric"><div class="mlabel">Trades (5m)</div><div class="mval">{m_trades_5m}</div></div>
+  <div class="metric"><div class="mlabel">Profit (5m)</div><div class="mval" style="color:{m_profit_5m_color}">${m_profit_5m}</div></div>
+  <div class="metric"><div class="mlabel">Avg Edge (5m)</div><div class="mval">{m_edge_5m}</div></div>
+  <div class="metric"><div class="mlabel">Fill Rate (5m)</div><div class="mval">{m_fill_5m}</div></div>
+  <div class="metric"><div class="mlabel">Latency (5m)</div><div class="mval">{m_latency_5m}</div></div>
+  <div class="metric"><div class="mlabel">Trades (1h)</div><div class="mval">{m_trades_1h}</div></div>
+  <div class="metric"><div class="mlabel">Profit (1h)</div><div class="mval" style="color:{m_profit_1h_color}">${m_profit_1h}</div></div>
+  <div class="metric"><div class="mlabel">Utilisation</div><div class="mval">{m_util}</div></div>
+  <div class="metric"><div class="mlabel">Deployed</div><div class="mval">${m_deployed}</div></div>
+  <div class="metric"><div class="mlabel">Available</div><div class="mval">${m_available}</div></div>
+</div>
+
+<h2>Split Arb Opportunities <span class="badge {split_badge}">{split_status}</span> (near-misses: {split_near})</h2>
+<table>
+  <tr><th>Market</th><th>Direction</th><th>Outcomes</th><th>Sum</th><th>Net Edge</th><th>Fillable</th><th>Tier Profit</th><th>Gross</th></tr>
+  {split_rows}
+</table>
+
+<h2>Resolution Sniper <span class="badge {sniper_badge}">{sniper_status}</span> ({sniper_mapped} mapped)</h2>
+<table>
+  <tr><th>Condition</th><th>Source</th><th>Confidence</th><th>Action</th><th>Time</th></tr>
+  {sniper_rows}
+</table>
+
+<h2>Position Lifecycle <span class="badge {lifecycle_badge}">{lifecycle_status}</span></h2>
+<table>
+  <tr><th>Condition</th><th>Event</th><th>Detail</th><th>Time</th></tr>
+  {lifecycle_rows}
+</table>
 
 <h2>Cross-Bookmaker Odds ({crossbook_count} arbs)</h2>
 <table>
@@ -414,7 +664,7 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
   {fill_rows}
 </table>
 
-<div class="auto">Auto-refresh 5s | API: /api/summary, /api/orders, /api/positions, /api/fills, /api/pnl, /api/anomalies, /api/crossbook</div>
+<div class="auto">Auto-refresh 5s | API: /api/summary, /api/orders, /api/positions, /api/fills, /api/pnl, /api/anomalies, /api/crossbook, /api/strategies</div>
 </body>
 </html>"#,
         open_orders = summary.total_open_orders,
@@ -425,9 +675,41 @@ async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
         daily_color = pnl_color(&summary.daily_pnl),
         total_color = pnl_color(&summary.total_pnl),
         anomaly_count = anomaly_count,
-        anomaly_rows = anomaly_rows,
+        // Strategy cards
+        split_opps = strat.split.active_opps.len(),
+        sniper_signals = strat.sniper.recent_signals.len(),
+        lifecycle_pos = strat.lifecycle.total_positions,
+        // Metrics
+        m_trades_5m = strat.metrics.trades_5m,
+        m_profit_5m = strat.metrics.profit_5m,
+        m_profit_5m_color = pnl_color(&strat.metrics.profit_5m),
+        m_edge_5m = strat.metrics.avg_edge_5m,
+        m_fill_5m = strat.metrics.avg_fill_rate_5m,
+        m_latency_5m = strat.metrics.avg_latency_ms_5m,
+        m_trades_1h = strat.metrics.trades_1h,
+        m_profit_1h = strat.metrics.profit_1h,
+        m_profit_1h_color = pnl_color(&strat.metrics.profit_1h),
+        m_util = strat.metrics.utilisation_pct,
+        m_deployed = strat.metrics.capital_deployed,
+        m_available = strat.metrics.capital_available,
+        // Split
+        split_badge = if strat.split.enabled { "badge-on" } else { "badge-off" },
+        split_status = if strat.split.enabled { "ON" } else { "OFF" },
+        split_near = split_near,
+        split_rows = split_rows,
+        // Sniper
+        sniper_badge = if strat.sniper.enabled { "badge-on" } else { "badge-off" },
+        sniper_status = if strat.sniper.enabled { "ON" } else { "OFF" },
+        sniper_mapped = strat.sniper.mapped_markets,
+        sniper_rows = sniper_rows,
+        // Lifecycle
+        lifecycle_badge = if strat.lifecycle.enabled { "badge-on" } else { "badge-off" },
+        lifecycle_status = if strat.lifecycle.enabled { "ON" } else { "OFF" },
+        lifecycle_rows = lifecycle_rows,
+        // Crossbook
         crossbook_count = crossbook_count,
         crossbook_rows = crossbook_rows,
+        anomaly_rows = anomaly_rows,
         position_rows = position_rows,
         order_rows = order_rows,
         fill_rows = fill_rows,

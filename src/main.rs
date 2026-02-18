@@ -484,6 +484,24 @@ async fn main() -> anyhow::Result<()> {
         info!("split arb scanner disabled (set split.enabled=true in config)");
     }
 
+    // --- Strategy Snapshot (shared between event loop and dashboard) ---
+    // Created early so sniper/metrics/lifecycle setup can populate initial values.
+    let strategy_snapshot = Arc::new(Mutex::new(dashboard::StrategySnapshot {
+        split: dashboard::SplitSnapshot {
+            enabled: config.split.enabled,
+            ..Default::default()
+        },
+        sniper: dashboard::SniperSnapshot {
+            enabled: config.sniper.enabled,
+            ..Default::default()
+        },
+        lifecycle: dashboard::LifecycleSnapshot {
+            enabled: config.lifecycle.enabled,
+            ..Default::default()
+        },
+        metrics: dashboard::MetricsSnapshot::default(),
+    }));
+
     // --- Resolution Sniper (Strategy 1B) ---
     let (sniper_tx, mut sniper_rx) = mpsc::unbounded_channel::<SniperEvent>();
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<sniper::ResolutionSignal>();
@@ -520,6 +538,9 @@ async fn main() -> anyhow::Result<()> {
             execute = config.sniper.execute,
             "resolution sniper enabled"
         );
+
+        // Update snapshot with mapped market count
+        strategy_snapshot.lock().await.sniper.mapped_markets = mappings.len();
 
         Some(Arc::new(Mutex::new(engine)))
     } else {
@@ -574,13 +595,40 @@ async fn main() -> anyhow::Result<()> {
         Decimal::from_str(&config.arb.max_total_exposure.to_string()).unwrap_or(Decimal::from(500)),
     )));
 
-    // Metrics summary every 5 minutes
+    // Metrics summary every 60 seconds (update dashboard snapshot) + full log every 5 minutes
     let metrics_for_summary = metrics.clone();
+    let snapshot_for_metrics = strategy_snapshot.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut tick_count = 0u64;
         loop {
             interval.tick().await;
-            metrics_for_summary.lock().await.log_summary();
+            tick_count += 1;
+            let m = metrics_for_summary.lock().await;
+
+            // Update dashboard snapshot every tick (60s)
+            let m5 = m.window_metrics(Duration::from_secs(300));
+            let m60 = m.window_metrics(Duration::from_secs(3600));
+            {
+                let mut snap = snapshot_for_metrics.lock().await;
+                snap.metrics = dashboard::MetricsSnapshot {
+                    trades_5m: m5.count,
+                    profit_5m: m5.total_profit.to_string(),
+                    avg_edge_5m: m5.avg_edge.to_string(),
+                    avg_fill_rate_5m: format!("{:.1}%", m5.avg_fill_rate * 100.0),
+                    avg_latency_ms_5m: format!("{:.1}ms", m5.avg_latency_ms),
+                    trades_1h: m60.count,
+                    profit_1h: m60.total_profit.to_string(),
+                    utilisation_pct: format!("{:.1}%", m60.utilisation_pct),
+                    capital_deployed: m60.capital_deployed.to_string(),
+                    capital_available: m60.capital_available.to_string(),
+                };
+            }
+
+            // Full log summary every 5 ticks (300s)
+            if tick_count % 5 == 0 {
+                m.log_summary();
+            }
         }
     });
 
@@ -591,6 +639,7 @@ async fn main() -> anyhow::Result<()> {
                 store: store_ref.clone(),
                 anomaly_detector: anomaly.clone(),
                 crossbook_scanner: crossbook.clone(),
+                strategy_snapshot: strategy_snapshot.clone(),
             };
             let bind = config.dashboard.bind.clone();
             tokio::spawn(async move {
@@ -1160,7 +1209,7 @@ async fn main() -> anyhow::Result<()> {
 
             Some(split_event) = split_rx.recv() => {
                 match split_event {
-                    SplitEvent::OpportunityDetected(opp) => {
+                    SplitEvent::OpportunityDetected(ref opp) => {
                         info!(
                             market = %opp.question,
                             dir = %opp.direction,
@@ -1173,24 +1222,36 @@ async fn main() -> anyhow::Result<()> {
                             priority = opp.high_priority,
                             "SPLIT ARB OPPORTUNITY"
                         );
-                        for tier in &opp.tier_analyses {
-                            if tier.expected_profit_usd > Decimal::ZERO {
-                                info!(
-                                    tier = %tier.tier_usd,
-                                    edge = %tier.net_edge,
-                                    profit = %tier.expected_profit_usd,
-                                    fillable = tier.fully_fillable,
-                                    "  tier analysis"
-                                );
-                            }
-                        }
+                        // Update dashboard snapshot
+                        let best_tier = opp.tier_analyses.iter()
+                            .filter(|t| t.expected_profit_usd > Decimal::ZERO)
+                            .last()
+                            .map(|t| format!("${}", t.expected_profit_usd));
+                        let entry = dashboard::SplitOppEntry {
+                            question: opp.question.clone(),
+                            direction: opp.direction.to_string(),
+                            num_outcomes: opp.num_outcomes,
+                            price_sum: opp.price_sum.to_string(),
+                            gross_edge: opp.gross_edge.to_string(),
+                            net_edge_tob: opp.net_edge_tob.to_string(),
+                            min_fillable: opp.min_fillable_shares.to_string(),
+                            high_priority: opp.high_priority,
+                            best_tier_profit: best_tier,
+                        };
+                        let mut snap = strategy_snapshot.lock().await;
+                        // Replace existing or push new
+                        snap.split.active_opps.retain(|e| !(e.question == entry.question && e.direction == entry.direction));
+                        snap.split.active_opps.push(entry);
                     }
-                    SplitEvent::OpportunityGone { condition_id, direction } => {
+                    SplitEvent::OpportunityGone { ref condition_id, direction } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             dir = %direction,
                             "split opp gone"
                         );
+                        let dir_str = direction.to_string();
+                        let mut snap = strategy_snapshot.lock().await;
+                        snap.split.active_opps.retain(|e| e.direction != dir_str);
                     }
                     SplitEvent::ScanComplete { markets_scanned, buy_merge_opps, split_sell_opps } => {
                         if buy_merge_opps > 0 || split_sell_opps > 0 {
@@ -1201,6 +1262,7 @@ async fn main() -> anyhow::Result<()> {
                                 "split scan"
                             );
                         }
+                        strategy_snapshot.lock().await.split.total_scans += 1;
                     }
                     SplitEvent::ScanDiagnostics { total_markets, multi_outcome_markets, tightest_buy_sum, tightest_sell_sum, near_misses } => {
                         info!(
@@ -1211,46 +1273,87 @@ async fn main() -> anyhow::Result<()> {
                             near_misses = near_misses,
                             "SPLIT SCAN diagnostics"
                         );
+                        strategy_snapshot.lock().await.split.last_diagnostics = Some(dashboard::SplitDiagnostics {
+                            total_markets,
+                            multi_outcome: multi_outcome_markets,
+                            tightest_buy: tightest_buy_sum.map(|d| d.to_string()),
+                            tightest_sell: tightest_sell_sum.map(|d| d.to_string()),
+                            near_misses,
+                        });
                     }
                 }
             }
 
             Some(sniper_event) = sniper_rx.recv() => {
                 match sniper_event {
-                    SniperEvent::SignalReceived { condition_id, source, confidence } => {
+                    SniperEvent::SignalReceived { ref condition_id, ref source, confidence } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             source = %source,
                             confidence = confidence,
                             "SNIPER signal received"
                         );
+                        let now = chrono::Utc::now().format("%H:%M:%S").to_string();
+                        strategy_snapshot.lock().await.push_sniper_signal(dashboard::SniperSignalEntry {
+                            condition_id: condition_id.clone(),
+                            source: source.clone(),
+                            confidence,
+                            action: "received".to_string(),
+                            time: now,
+                        });
                     }
-                    SniperEvent::SnipeDispatched { condition_id, question, num_orders } => {
+                    SniperEvent::SnipeDispatched { ref condition_id, ref question, num_orders } => {
                         info!(
                             market = %question,
                             orders = num_orders,
                             "SNIPER dispatched"
                         );
+                        let now = chrono::Utc::now().format("%H:%M:%S").to_string();
+                        let mut snap = strategy_snapshot.lock().await;
+                        snap.sniper.sniped_count += 1;
+                        snap.push_sniper_signal(dashboard::SniperSignalEntry {
+                            condition_id: condition_id.clone(),
+                            source: format!("{} orders", num_orders),
+                            confidence: 1.0,
+                            action: "dispatched".to_string(),
+                            time: now,
+                        });
                     }
-                    SniperEvent::OnChainResolution { condition_id, winning_outcome } => {
+                    SniperEvent::OnChainResolution { ref condition_id, ref winning_outcome } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             winner = %winning_outcome,
                             "on-chain resolution"
                         );
+                        let now = chrono::Utc::now().format("%H:%M:%S").to_string();
+                        strategy_snapshot.lock().await.push_sniper_signal(dashboard::SniperSignalEntry {
+                            condition_id: condition_id.clone(),
+                            source: format!("on-chain → {}", winning_outcome),
+                            confidence: 1.0,
+                            action: "on_chain".to_string(),
+                            time: now,
+                        });
                         // Notify lifecycle manager
                         if let Some(ref lc) = lifecycle {
-                            lc.lock().await.on_resolution(&condition_id, &winning_outcome);
-                            lc.lock().await.on_chain_resolution_confirmed(&condition_id);
+                            lc.lock().await.on_resolution(condition_id, winning_outcome);
+                            lc.lock().await.on_chain_resolution_confirmed(condition_id);
                         }
                     }
-                    SniperEvent::SignalIgnored { condition_id, confidence, reason } => {
+                    SniperEvent::SignalIgnored { ref condition_id, confidence, ref reason } => {
                         debug!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             confidence = confidence,
                             reason = %reason,
                             "sniper signal ignored"
                         );
+                        let now = chrono::Utc::now().format("%H:%M:%S").to_string();
+                        strategy_snapshot.lock().await.push_sniper_signal(dashboard::SniperSignalEntry {
+                            condition_id: condition_id.clone(),
+                            source: reason.clone(),
+                            confidence,
+                            action: "ignored".to_string(),
+                            time: now,
+                        });
                     }
                 }
             }
@@ -1279,8 +1382,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             Some(lc_event) = lifecycle_rx.recv() => {
+                let now = chrono::Utc::now().format("%H:%M:%S").to_string();
                 match lc_event {
-                    LifecycleEvent::PositionTracked { condition_id, strategy, legs, cost_basis } => {
+                    LifecycleEvent::PositionTracked { ref condition_id, strategy, legs, cost_basis } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             strategy = %strategy,
@@ -1288,45 +1392,81 @@ async fn main() -> anyhow::Result<()> {
                             cost = %cost_basis,
                             "lifecycle: position tracked"
                         );
+                        strategy_snapshot.lock().await.push_lifecycle_event(dashboard::LifecycleEventEntry {
+                            condition_id: condition_id.clone(),
+                            event_type: "tracked".to_string(),
+                            detail: format!("{} ({} legs, cost ${})", strategy, legs, cost_basis),
+                            time: now,
+                        });
                     }
-                    LifecycleEvent::StateChanged { condition_id, from, to } => {
+                    LifecycleEvent::StateChanged { ref condition_id, from, to } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             from = %from,
                             to = %to,
                             "lifecycle: state change"
                         );
+                        strategy_snapshot.lock().await.push_lifecycle_event(dashboard::LifecycleEventEntry {
+                            condition_id: condition_id.clone(),
+                            event_type: "state_change".to_string(),
+                            detail: format!("{} → {}", from, to),
+                            time: now,
+                        });
                     }
-                    LifecycleEvent::RedemptionQueued { condition_id, shares, expected_payout, .. } => {
+                    LifecycleEvent::RedemptionQueued { ref condition_id, shares, expected_payout, .. } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             shares = %shares,
                             payout = %expected_payout,
                             "lifecycle: PAPER redemption queued"
                         );
+                        strategy_snapshot.lock().await.push_lifecycle_event(dashboard::LifecycleEventEntry {
+                            condition_id: condition_id.clone(),
+                            event_type: "redemption".to_string(),
+                            detail: format!("{} shares → ${} payout", shares, expected_payout),
+                            time: now,
+                        });
                     }
-                    LifecycleEvent::DripSellQueued { condition_id, shares, target_price, .. } => {
+                    LifecycleEvent::DripSellQueued { ref condition_id, shares, target_price, .. } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             shares = %shares,
                             target = %target_price,
                             "lifecycle: PAPER drip sell"
                         );
+                        strategy_snapshot.lock().await.push_lifecycle_event(dashboard::LifecycleEventEntry {
+                            condition_id: condition_id.clone(),
+                            event_type: "drip_sell".to_string(),
+                            detail: format!("{} shares @ ${}", shares, target_price),
+                            time: now,
+                        });
                     }
-                    LifecycleEvent::StalePositionSell { condition_id, age_hours, discount_pct } => {
+                    LifecycleEvent::StalePositionSell { ref condition_id, age_hours, discount_pct } => {
                         warn!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             age_h = format!("{:.1}", age_hours),
                             discount = format!("{:.1}%", discount_pct),
                             "lifecycle: stale position"
                         );
+                        strategy_snapshot.lock().await.push_lifecycle_event(dashboard::LifecycleEventEntry {
+                            condition_id: condition_id.clone(),
+                            event_type: "stale".to_string(),
+                            detail: format!("{:.1}h old, selling at {:.1}% discount", age_hours, discount_pct),
+                            time: now,
+                        });
                     }
-                    LifecycleEvent::PositionClosed { condition_id, realized_pnl } => {
+                    LifecycleEvent::PositionClosed { ref condition_id, realized_pnl } => {
                         info!(
                             cid = %condition_id[..12.min(condition_id.len())],
                             pnl = %realized_pnl,
                             "lifecycle: position closed"
                         );
+                        strategy_snapshot.lock().await.push_lifecycle_event(dashboard::LifecycleEventEntry {
+                            condition_id: condition_id.clone(),
+                            event_type: "closed".to_string(),
+                            detail: format!("PnL: ${}", realized_pnl),
+                            time: now,
+                        });
                     }
                     LifecycleEvent::PortfolioSummary { total_positions, active, exiting, redeemable, stale, total_cost_basis, total_mark_value, unrealized_pnl } => {
                         if total_positions > 0 {
@@ -1342,6 +1482,16 @@ async fn main() -> anyhow::Result<()> {
                                 "PORTFOLIO SUMMARY"
                             );
                         }
+                        // Update lifecycle snapshot with portfolio summary
+                        let mut snap = strategy_snapshot.lock().await;
+                        snap.lifecycle.total_positions = total_positions;
+                        snap.lifecycle.active = active;
+                        snap.lifecycle.exiting = exiting;
+                        snap.lifecycle.redeemable = redeemable;
+                        snap.lifecycle.stale = stale;
+                        snap.lifecycle.total_cost_basis = total_cost_basis.to_string();
+                        snap.lifecycle.total_mark_value = total_mark_value.to_string();
+                        snap.lifecycle.unrealized_pnl = unrealized_pnl.to_string();
                     }
                 }
             }
