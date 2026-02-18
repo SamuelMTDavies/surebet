@@ -1,6 +1,7 @@
 //! On-chain signal types emitted by the Polygon event monitor.
 
 use alloy::primitives::{Address, B256, U256};
+use std::time::Instant;
 
 /// Signals emitted by the on-chain monitor, consumed by the main event loop.
 #[derive(Debug, Clone)]
@@ -25,6 +26,10 @@ pub enum OnChainSignal {
         proposer: Address,
         block_number: u64,
         timestamp: u64,
+        /// Monotonic instant when the monitor first saw this event.
+        detected_at: Instant,
+        /// Milliseconds between block timestamp and our detection.
+        chain_latency_ms: u64,
     },
 
     /// A previously proposed resolution was disputed.
@@ -33,6 +38,8 @@ pub enum OnChainSignal {
         question_id: B256,
         block_number: u64,
         timestamp: u64,
+        detected_at: Instant,
+        chain_latency_ms: u64,
     },
 
     /// A condition was resolved on-chain (final settlement).
@@ -45,6 +52,8 @@ pub enum OnChainSignal {
         payout_numerators: Vec<U256>,
         block_number: u64,
         timestamp: u64,
+        detected_at: Instant,
+        chain_latency_ms: u64,
     },
 
     /// A new token was registered on a CTF Exchange, confirming

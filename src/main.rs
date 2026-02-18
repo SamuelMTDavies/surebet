@@ -1435,9 +1435,10 @@ async fn main() -> anyhow::Result<()> {
             Some(signal) = signal_rx.recv() => {
                 // Resolution signal from an external source — feed to sniper engine
                 if let Some(ref engine) = sniper_engine {
+                    let signal_received = std::time::Instant::now();
                     let action = engine.lock().await.process_signal(signal);
                     if let Some(action) = action {
-                        let profit = sniper_executor.execute(&action).await;
+                        let profit = sniper_executor.execute(&action, signal_received).await;
                         // Record in metrics
                         metrics.lock().await.record_trade(metrics::TradeRecord {
                             condition_id: action.condition_id.clone(),
@@ -1620,14 +1621,19 @@ async fn main() -> anyhow::Result<()> {
                         proposed_price,
                         proposer,
                         block_number,
+                        detected_at,
+                        chain_latency_ms,
                         ..
                     } => {
                         let outcome = if proposed_price > 0 { "YES" } else { "NO" };
+                        let receive_elapsed_ms = detected_at.elapsed().as_millis() as u64;
                         warn!(
                             question_id = %question_id,
                             proposed = outcome,
                             proposer = %proposer,
                             block = block_number,
+                            chain_ms = chain_latency_ms,
+                            channel_ms = receive_elapsed_ms,
                             "ON-CHAIN: RESOLUTION PROPOSED — sniping window open"
                         );
                         // Feed to sniper as on-chain resolution signal
@@ -1636,9 +1642,24 @@ async fn main() -> anyhow::Result<()> {
                             let action = engine.lock().await.on_chain_resolution(
                                 &qid_str,
                                 outcome,
+                                detected_at,
                             );
-                            if let Some(action) = action {
-                                let profit = sniper_executor.execute(&action).await;
+                            if let Some(ref action) = action {
+                                let profit = sniper_executor.execute(action, detected_at).await;
+                                let order_ready_ms = detected_at.elapsed().as_millis() as u64;
+                                info!(
+                                    chain_ms = chain_latency_ms,
+                                    pipeline_ms = order_ready_ms,
+                                    total_ms = chain_latency_ms + order_ready_ms,
+                                    profit = %profit,
+                                    "SNIPE LATENCY: chain={}ms | pipeline={}ms | total={}ms",
+                                    chain_latency_ms, order_ready_ms, chain_latency_ms + order_ready_ms
+                                );
+                                metrics.lock().await.record_latency(
+                                    "snipe-onchain",
+                                    &action.condition_id,
+                                    Duration::from_millis(chain_latency_ms + order_ready_ms),
+                                );
                                 metrics.lock().await.record_trade(metrics::TradeRecord {
                                     condition_id: action.condition_id.clone(),
                                     strategy: "snipe-onchain".to_string(),
@@ -1657,11 +1678,13 @@ async fn main() -> anyhow::Result<()> {
                     OnChainSignal::ResolutionDisputed {
                         question_id,
                         block_number,
+                        chain_latency_ms,
                         ..
                     } => {
                         error!(
                             question_id = %question_id,
                             block = block_number,
+                            chain_ms = chain_latency_ms,
                             "ON-CHAIN: RESOLUTION DISPUTED — cancel any snipe orders!"
                         );
                     }
@@ -1670,6 +1693,7 @@ async fn main() -> anyhow::Result<()> {
                         question_id,
                         payout_numerators,
                         block_number,
+                        chain_latency_ms,
                         ..
                     } => {
                         // Determine winning outcome from payouts
@@ -1683,6 +1707,7 @@ async fn main() -> anyhow::Result<()> {
                             winner_index = winner_idx,
                             payouts = ?payout_numerators,
                             block = block_number,
+                            chain_ms = chain_latency_ms,
                             "ON-CHAIN: resolution finalised — trigger redemption"
                         );
                         // Notify lifecycle manager

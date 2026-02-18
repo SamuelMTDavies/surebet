@@ -319,6 +319,7 @@ impl SniperEngine {
         &mut self,
         condition_id: &str,
         winning_outcome: &str,
+        detected_at: Instant,
     ) -> Option<SnipeAction> {
         let _ = self.event_tx.send(SniperEvent::OnChainResolution {
             condition_id: condition_id.to_string(),
@@ -335,7 +336,7 @@ impl SniperEngine {
             return None;
         }
 
-        // Build signal from on-chain event
+        // Build signal from on-chain event — use the original detection time
         let mapping = self.mappings.get(condition_id)?;
         let mut outcomes = HashMap::new();
         for (label, _) in &mapping.outcomes {
@@ -352,7 +353,7 @@ impl SniperEngine {
             outcomes,
             confidence: 1.0,
             evidence: format!("MarketResolved: winner={}", winning_outcome),
-            observed_at: Instant::now(),
+            observed_at: detected_at,
         };
 
         self.process_signal(signal)

@@ -30,8 +30,10 @@ impl SniperExecutor {
     }
 
     /// Process a snipe action. In paper mode, estimates the available edge.
+    /// `detected_at` is the monotonic instant when the on-chain event was first
+    /// received — used to measure end-to-end pipeline latency.
     /// Returns estimated profit in USDC.
-    pub async fn execute(&self, action: &SnipeAction) -> Decimal {
+    pub async fn execute(&self, action: &SnipeAction, detected_at: Instant) -> Decimal {
         let start = Instant::now();
         let mut total_estimated_profit = Decimal::ZERO;
 
@@ -42,6 +44,8 @@ impl SniperExecutor {
                 SnipeSide::BuyWinner => "BUY_WINNER",
                 SnipeSide::SellLoser => "SELL_LOSER",
             };
+
+            let e2e_us = detected_at.elapsed().as_micros();
 
             info!(
                 market = %action.question,
@@ -54,7 +58,8 @@ impl SniperExecutor {
                 levels_consumed = estimated.levels_consumed,
                 source = %action.signal.source,
                 confidence = action.signal.confidence,
-                latency_us = start.elapsed().as_micros(),
+                exec_us = start.elapsed().as_micros(),
+                e2e_us = e2e_us,
                 "SNIPE PAPER TRADE"
             );
 
@@ -66,6 +71,7 @@ impl SniperExecutor {
                 market = %action.question,
                 total_profit = %total_estimated_profit,
                 orders = action.orders.len(),
+                pipeline_us = detected_at.elapsed().as_micros(),
                 "SNIPE TOTAL ESTIMATE"
             );
         }

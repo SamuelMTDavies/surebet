@@ -305,13 +305,13 @@ impl OnChainMonitor {
                     .await?;
             }
             t if t == abi::CONDITION_RESOLUTION_TOPIC => {
-                self.handle_condition_resolution(log, block_number, block_timestamp)?;
+                self.handle_condition_resolution(log, block_number, block_timestamp, receive_time_ms)?;
             }
             t if t == abi::PRICE_PROPOSED_TOPIC => {
-                self.handle_price_proposed(log, block_number, block_timestamp)?;
+                self.handle_price_proposed(log, block_number, block_timestamp, receive_time_ms)?;
             }
             t if t == abi::PRICE_DISPUTED_TOPIC => {
-                self.handle_price_disputed(log, block_number, block_timestamp)?;
+                self.handle_price_disputed(log, block_number, block_timestamp, receive_time_ms)?;
             }
             t if t == abi::TRANSFER_SINGLE_ERC1155_TOPIC => {
                 self.handle_transfer_single(log, block_number, block_timestamp)?;
@@ -407,6 +407,7 @@ impl OnChainMonitor {
         log: &Log,
         block_number: u64,
         timestamp: u64,
+        receive_time_ms: u64,
     ) -> anyhow::Result<()> {
         let condition_id = log.topics().get(1).copied().unwrap_or_default();
         let oracle = Address::from_slice(
@@ -468,6 +469,12 @@ impl OnChainMonitor {
             "RESOLUTION FINALISED: ConditionResolution"
         );
 
+        let detected_at = std::time::Instant::now();
+        let chain_latency_ms = if timestamp > 0 {
+            receive_time_ms.saturating_sub(timestamp * 1000)
+        } else {
+            0
+        };
         let _ = self.signal_tx.send(OnChainSignal::ResolutionFinalised {
             condition_id,
             oracle,
@@ -476,6 +483,8 @@ impl OnChainMonitor {
             payout_numerators,
             block_number,
             timestamp,
+            detected_at,
+            chain_latency_ms,
         });
 
         Ok(())
@@ -488,6 +497,7 @@ impl OnChainMonitor {
         log: &Log,
         block_number: u64,
         timestamp: u64,
+        receive_time_ms: u64,
     ) -> anyhow::Result<()> {
         // identifier is topic[1] — this is the UMA identifier (often "YES_OR_NO_QUERY")
         let _identifier = log.topics().get(1).copied().unwrap_or_default();
@@ -541,12 +551,20 @@ impl OnChainMonitor {
             "RESOLUTION PROPOSED: PriceProposed"
         );
 
+        let detected_at = std::time::Instant::now();
+        let chain_latency_ms = if timestamp > 0 {
+            receive_time_ms.saturating_sub(timestamp * 1000)
+        } else {
+            0
+        };
         let _ = self.signal_tx.send(OnChainSignal::ResolutionProposed {
             question_id,
             proposed_price,
             proposer,
             block_number,
             timestamp,
+            detected_at,
+            chain_latency_ms,
         });
 
         Ok(())
@@ -558,6 +576,7 @@ impl OnChainMonitor {
         log: &Log,
         block_number: u64,
         timestamp: u64,
+        receive_time_ms: u64,
     ) -> anyhow::Result<()> {
         let question_id = extract_question_id_from_log(log, &log.data().data);
 
@@ -567,10 +586,18 @@ impl OnChainMonitor {
             "RESOLUTION DISPUTED: PriceDisputed"
         );
 
+        let detected_at = std::time::Instant::now();
+        let chain_latency_ms = if timestamp > 0 {
+            receive_time_ms.saturating_sub(timestamp * 1000)
+        } else {
+            0
+        };
         let _ = self.signal_tx.send(OnChainSignal::ResolutionDisputed {
             question_id,
             block_number,
             timestamp,
+            detected_at,
+            chain_latency_ms,
         });
 
         Ok(())
