@@ -80,9 +80,20 @@ impl OnChainMonitor {
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
-                    error!(error = %e, "Polygon WebSocket session error");
+                    let err_str = e.to_string();
+                    let is_rate_limited = err_str.contains("429") || err_str.contains("Too Many Requests");
+                    if is_rate_limited {
+                        // Jump straight to a longer backoff for rate limits
+                        backoff = backoff.max(Duration::from_secs(15));
+                        warn!(
+                            backoff_secs = backoff.as_secs(),
+                            "Polygon WebSocket rate limited (429), backing off"
+                        );
+                    } else {
+                        error!(error = %e, "Polygon WebSocket session error");
+                    }
                     let _ = self.signal_tx.send(OnChainSignal::Disconnected {
-                        reason: e.to_string(),
+                        reason: err_str,
                     });
                 }
             }
@@ -212,15 +223,17 @@ impl OnChainMonitor {
     }
 
     /// Recover missed events for a block range using eth_getLogs.
+    /// Uses small chunks with delays between requests to stay under RPC rate limits.
     async fn recover_gap<P: Provider>(
         &self,
         provider: &P,
         from_block: u64,
         to_block: u64,
     ) -> anyhow::Result<usize> {
-        // Process in chunks of 2000 blocks to avoid RPC limits
-        let chunk_size = 2000u64;
+        let chunk_size = 500u64;
         let mut total_events = 0;
+        let mut retry_delay = Duration::from_millis(500);
+        let max_retry_delay = Duration::from_secs(30);
 
         let mut start = from_block;
         while start <= to_block {
@@ -250,18 +263,37 @@ impl OnChainMonitor {
                             self.update_checkpoint(bn);
                         }
                     }
+
+                    // Reset retry delay on success, pause briefly between chunks
+                    retry_delay = Duration::from_millis(500);
+                    start = end + 1;
+                    if start <= to_block {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        from = start,
-                        to = end,
-                        "failed to get historical logs for block range"
-                    );
+                    let err_str = e.to_string();
+                    if err_str.contains("429") || err_str.contains("Too Many Requests") {
+                        warn!(
+                            delay_ms = retry_delay.as_millis() as u64,
+                            from = start,
+                            to = end,
+                            "rate limited during gap recovery, backing off"
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(max_retry_delay);
+                        // Don't advance start — retry the same chunk
+                    } else {
+                        warn!(
+                            error = %e,
+                            from = start,
+                            to = end,
+                            "failed to get historical logs for block range"
+                        );
+                        start = end + 1;
+                    }
                 }
             }
-
-            start = end + 1;
         }
 
         Ok(total_events)

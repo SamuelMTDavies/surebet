@@ -749,7 +749,7 @@ fn default_checkpoint_path() -> String {
     "onchain_checkpoint.txt".to_string()
 }
 fn default_startup_lookback() -> u64 {
-    100
+    10
 }
 
 impl Default for OnChainConfig {
