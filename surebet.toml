@@ -187,7 +187,7 @@ tick_interval_secs = 10
 # Enable on-chain event monitoring via Polygon WebSocket.
 # Subscribes to CTF and UMA Oracle events for earliest possible signals
 # on new market creation and resolution proposals.
-enabled = false
+enabled = true
 # Polygon WebSocket RPC URL (also supports POLYGON_WS_URL env var).
 # Options: Alchemy, QuickNode, Infura — e.g.:
 #   wss://polygon-mainnet.g.alchemy.com/v2/{API_KEY}
