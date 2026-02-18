@@ -139,7 +139,7 @@ impl StrategySnapshot {
 /// Shared state for the dashboard routes.
 #[derive(Clone)]
 pub struct DashboardState {
-    pub store: Arc<Mutex<StateStore>>,
+    pub store: Option<Arc<Mutex<StateStore>>>,
     pub anomaly_detector: Option<Arc<Mutex<AnomalyDetector>>>,
     pub crossbook_scanner: Option<Arc<Mutex<CrossbookScanner>>>,
     pub strategy_snapshot: Arc<Mutex<StrategySnapshot>>,
@@ -173,48 +173,78 @@ pub async fn serve(state: DashboardState, bind_addr: &str) -> anyhow::Result<()>
 
 async fn api_summary(
     State(state): State<DashboardState>,
-) -> Result<Json<ExposureSummary>, StatusCode> {
-    let mut store = state.store.lock().await;
-    store
-        .get_exposure_summary()
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+) -> impl IntoResponse {
+    if let Some(ref store) = state.store {
+        let mut s = store.lock().await;
+        match s.get_exposure_summary().await {
+            Ok(summary) => Json(serde_json::to_value(summary).unwrap_or_default()).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        Json(serde_json::json!({
+            "total_open_orders": 0,
+            "total_positions": 0,
+            "total_exposure_usd": "0",
+            "total_pnl": "0",
+            "daily_pnl": "0",
+            "recent_fills": []
+        })).into_response()
+    }
 }
 
 async fn api_orders(State(state): State<DashboardState>) -> impl IntoResponse {
-    let mut store = state.store.lock().await;
-    match store.get_all_open_orders().await {
-        Ok(orders) => Json(orders).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    if let Some(ref store) = state.store {
+        let mut s = store.lock().await;
+        match s.get_all_open_orders().await {
+            Ok(orders) => Json(orders).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        Json(serde_json::json!([])).into_response()
     }
 }
 
 async fn api_positions(State(state): State<DashboardState>) -> impl IntoResponse {
-    let mut store = state.store.lock().await;
-    match store.get_all_positions().await {
-        Ok(positions) => Json(positions).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    if let Some(ref store) = state.store {
+        let mut s = store.lock().await;
+        match s.get_all_positions().await {
+            Ok(positions) => Json(positions).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        Json(serde_json::json!([])).into_response()
     }
 }
 
 async fn api_fills(State(state): State<DashboardState>) -> impl IntoResponse {
-    let mut store = state.store.lock().await;
-    match store.get_recent_fills(100).await {
-        Ok(fills) => Json(fills).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    if let Some(ref store) = state.store {
+        let mut s = store.lock().await;
+        match s.get_recent_fills(100).await {
+            Ok(fills) => Json(fills).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        Json(serde_json::json!([])).into_response()
     }
 }
 
 async fn api_pnl(State(state): State<DashboardState>) -> impl IntoResponse {
-    let mut store = state.store.lock().await;
-    let total = store.get_total_pnl().await.unwrap_or_default();
-    let daily = store.get_daily_pnl().await.unwrap_or_default();
-    Json(serde_json::json!({
-        "total_pnl": total.to_string(),
-        "daily_pnl": daily.to_string(),
-    }))
-    .into_response()
+    if let Some(ref store) = state.store {
+        let mut s = store.lock().await;
+        let total = s.get_total_pnl().await.unwrap_or_default();
+        let daily = s.get_daily_pnl().await.unwrap_or_default();
+        Json(serde_json::json!({
+            "total_pnl": total.to_string(),
+            "daily_pnl": daily.to_string(),
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({
+            "total_pnl": "0",
+            "daily_pnl": "0",
+        }))
+        .into_response()
+    }
 }
 
 async fn api_anomalies(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -248,21 +278,24 @@ async fn api_strategies(State(state): State<DashboardState>) -> impl IntoRespons
 // --- HTML Dashboard ---
 
 async fn dashboard_html(State(state): State<DashboardState>) -> Html<String> {
-    let mut store = state.store.lock().await;
-    let summary = store
-        .get_exposure_summary()
-        .await
-        .unwrap_or_else(|_| ExposureSummary {
-            total_open_orders: 0,
-            total_positions: 0,
-            total_exposure_usd: "0".to_string(),
-            total_pnl: "0".to_string(),
-            daily_pnl: "0".to_string(),
-            recent_fills: vec![],
-        });
+    let default_summary = ExposureSummary {
+        total_open_orders: 0,
+        total_positions: 0,
+        total_exposure_usd: "0".to_string(),
+        total_pnl: "0".to_string(),
+        daily_pnl: "0".to_string(),
+        recent_fills: vec![],
+    };
 
-    let positions = store.get_all_positions().await.unwrap_or_default();
-    let orders = store.get_all_open_orders().await.unwrap_or_default();
+    let (summary, positions, orders) = if let Some(ref store) = state.store {
+        let mut s = store.lock().await;
+        let sum = s.get_exposure_summary().await.unwrap_or(default_summary);
+        let pos = s.get_all_positions().await.unwrap_or_default();
+        let ord = s.get_all_open_orders().await.unwrap_or_default();
+        (sum, pos, ord)
+    } else {
+        (default_summary, vec![], vec![])
+    };
 
     // Strategy snapshot
     let strat = state.strategy_snapshot.lock().await.clone();

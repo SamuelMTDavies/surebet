@@ -633,23 +633,23 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- Dashboard (launched after all modules so it can reference them) ---
+    // Dashboard now works without Valkey — strategy snapshots are always available.
     if config.dashboard.enabled {
-        if let Some(ref store_ref) = state_store {
-            let dash_state = DashboardState {
-                store: store_ref.clone(),
-                anomaly_detector: anomaly.clone(),
-                crossbook_scanner: crossbook.clone(),
-                strategy_snapshot: strategy_snapshot.clone(),
-            };
-            let bind = config.dashboard.bind.clone();
-            tokio::spawn(async move {
-                if let Err(e) = dashboard::serve(dash_state, &bind).await {
-                    error!(error = %e, "dashboard server error");
-                }
-            });
-        } else {
-            warn!("dashboard enabled but Valkey not available — dashboard disabled");
+        let dash_state = DashboardState {
+            store: state_store.clone(),
+            anomaly_detector: anomaly.clone(),
+            crossbook_scanner: crossbook.clone(),
+            strategy_snapshot: strategy_snapshot.clone(),
+        };
+        let bind = config.dashboard.bind.clone();
+        if state_store.is_none() {
+            info!("dashboard starting without Valkey — Valkey-backed data will be empty");
         }
+        tokio::spawn(async move {
+            if let Err(e) = dashboard::serve(dash_state, &bind).await {
+                error!(error = %e, "dashboard server error");
+            }
+        });
     } else {
         info!("dashboard disabled (set dashboard.enabled=true in config)");
     }
