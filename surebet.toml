@@ -205,7 +205,7 @@ neg_risk_adapter = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 # This is the Oracle contract, NOT the UmaCtfAdapter.
 uma_oracle_adapter = "0xeE3Afe347D5C74317041E2618C49534dAf887c24"
 # Alert if event processing latency exceeds this (ms)
-max_latency_ms = 2000
+max_latency_ms = 3000
 # File to persist last processed block for gap recovery on restart
 checkpoint_path = "onchain_checkpoint.txt"
 # How many blocks back to scan on startup

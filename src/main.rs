@@ -682,6 +682,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- On-Chain Event Monitor (Polygon WebSocket) ---
     let (onchain_tx, mut onchain_rx) = mpsc::unbounded_channel::<OnChainSignal>();
+    let mut event_market_cache: Option<MarketCache> = None;
 
     if config.onchain.enabled && !config.onchain.polygon_ws_url.is_empty() {
         // Build the market cache from Gamma API
@@ -690,6 +691,9 @@ async fn main() -> anyhow::Result<()> {
             Ok(count) => info!(markets = count, "on-chain market cache loaded"),
             Err(e) => warn!(error = %e, "failed to load market cache (will populate on demand)"),
         }
+
+        // Keep a clone for the event handler to map question_id → market tokens
+        event_market_cache = Some(market_cache.clone());
 
         let monitor = OnChainMonitor::new(
             config.onchain.clone(),
@@ -1637,69 +1641,98 @@ async fn main() -> anyhow::Result<()> {
                             "ON-CHAIN: RESOLUTION PROPOSED — sniping window open"
                         );
 
-                        // Scan ALL tracked order books for stale orders we could snipe.
-                        // This runs regardless of whether the sniper engine can map the
-                        // question_id to a specific market — we want to see what's sitting
-                        // on every book at the moment a resolution fires.
+                        // Scan ONLY the matched market's order book for snipeable orders.
+                        // Map question_id → CachedMarket → clob_token_ids → order books.
                         {
-                            let one = Decimal::from(1);
-                            let summaries = store.summary();
-                            let mut books_with_opportunity = 0usize;
-                            let mut grand_total_profit = Decimal::ZERO;
-                            for s in &summaries {
-                                if let Some(book) = store.get_book(&s.asset_id) {
-                                    // Asks below $0.95 = potential winning outcome to buy
-                                    let mut ask_shares = Decimal::ZERO;
-                                    let mut ask_profit = Decimal::ZERO;
-                                    let mut ask_details = Vec::new();
-                                    let threshold = Decimal::from_str("0.95").unwrap();
-                                    for (&price, &size) in book.asks.levels.iter() {
-                                        if price <= threshold {
-                                            ask_shares += size;
-                                            ask_profit += (one - price) * size;
-                                            ask_details.push(format!("{}@${}", size, price));
-                                        }
-                                    }
-                                    // Bids above $0.05 = potential losing outcome to sell into
-                                    let mut bid_shares = Decimal::ZERO;
-                                    let mut bid_profit = Decimal::ZERO;
-                                    let mut bid_details = Vec::new();
-                                    let floor = Decimal::from_str("0.05").unwrap();
-                                    for (&price, &size) in book.bids.levels.iter().rev() {
-                                        if price >= floor {
-                                            bid_shares += size;
-                                            bid_profit += price * size;
-                                            bid_details.push(format!("{}@${}", size, price));
-                                        }
-                                    }
+                            let qid_hex = format!("{:x}", question_id);
+                            let cached = event_market_cache
+                                .as_ref()
+                                .and_then(|cache| cache.get_by_question_id(&qid_hex));
 
-                                    let total = ask_profit + bid_profit;
-                                    if total > Decimal::ZERO {
-                                        books_with_opportunity += 1;
+                            if let Some(market) = cached {
+                                let one = Decimal::from(1);
+                                let mut grand_total_profit = Decimal::ZERO;
+                                let token_count = market.clob_token_ids.len();
+
+                                warn!(
+                                    question_id = %qid_hex,
+                                    condition_id = %market.condition_id,
+                                    question = %market.question,
+                                    outcomes = ?market.outcomes,
+                                    tokens = token_count,
+                                    "MATCHED MARKET for resolution"
+                                );
+
+                                for (idx, token_id) in market.clob_token_ids.iter().enumerate() {
+                                    let outcome_label = market.outcomes.get(idx)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("?");
+
+                                    if let Some(book) = store.get_book(token_id) {
+                                        // Asks ≤ $0.95 = winning outcome shares to buy cheap
+                                        let mut ask_shares = Decimal::ZERO;
+                                        let mut ask_profit = Decimal::ZERO;
+                                        let mut ask_details = Vec::new();
+                                        let threshold = Decimal::from_str("0.95").unwrap();
+                                        for (&price, &size) in book.asks.levels.iter() {
+                                            if price <= threshold {
+                                                ask_shares += size;
+                                                ask_profit += (one - price) * size;
+                                                ask_details.push(format!("{}@${}", size, price));
+                                            }
+                                        }
+                                        // Bids ≥ $0.05 = losing outcome shares to sell into
+                                        let mut bid_shares = Decimal::ZERO;
+                                        let mut bid_profit = Decimal::ZERO;
+                                        let mut bid_details = Vec::new();
+                                        let floor = Decimal::from_str("0.05").unwrap();
+                                        for (&price, &size) in book.bids.levels.iter().rev() {
+                                            if price >= floor {
+                                                bid_shares += size;
+                                                bid_profit += price * size;
+                                                bid_details.push(format!("{}@${}", size, price));
+                                            }
+                                        }
+
+                                        let total = ask_profit + bid_profit;
                                         grand_total_profit += total;
+
                                         warn!(
-                                            asset = %&s.asset_id[..12.min(s.asset_id.len())],
-                                            best_bid = %s.best_bid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                                            best_ask = %s.best_ask.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                                            outcome = outcome_label,
+                                            token = %&token_id[..16.min(token_id.len())],
+                                            best_bid = %book.bids.best(true).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
+                                            best_ask = %book.asks.best(false).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
                                             ask_snipe_shares = %ask_shares,
-                                            ask_snipe_profit = %ask_profit,
+                                            ask_snipe_profit = %format!("${:.2}", ask_profit),
                                             ask_levels = %ask_details.join(" | "),
                                             bid_snipe_shares = %bid_shares,
-                                            bid_snipe_profit = %bid_profit,
+                                            bid_snipe_profit = %format!("${:.2}", bid_profit),
                                             bid_levels = %bid_details.join(" | "),
-                                            "BOOK SNAPSHOT: stale orders on book"
+                                            "SNIPE BOOK: {} outcome", outcome_label
+                                        );
+                                    } else {
+                                        warn!(
+                                            outcome = outcome_label,
+                                            token = %&token_id[..16.min(token_id.len())],
+                                            "SNIPE BOOK: no order book data for this token"
                                         );
                                     }
                                 }
+
+                                warn!(
+                                    question = %market.question,
+                                    proposed = outcome,
+                                    tokens_scanned = token_count,
+                                    total_potential_profit = %format!("${:.2}", grand_total_profit),
+                                    "SNIPE SCAN COMPLETE"
+                                );
+                            } else {
+                                warn!(
+                                    question_id = %qid_hex,
+                                    proposed = outcome,
+                                    "SNIPE SCAN: could not map question_id to market — not in cache"
+                                );
                             }
-                            warn!(
-                                question_id = %question_id,
-                                proposed = outcome,
-                                books_scanned = summaries.len(),
-                                books_with_opportunity = books_with_opportunity,
-                                total_potential_profit = %grand_total_profit,
-                                "SNIPE SCAN COMPLETE"
-                            );
                         }
 
                         // Feed to sniper engine for execution (if market mapping exists)
