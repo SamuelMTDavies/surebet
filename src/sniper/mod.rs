@@ -23,7 +23,7 @@
 pub mod executor;
 pub mod sources;
 
-use crate::arb::TrackedMarket;
+use crate::market::TrackedMarket;
 use crate::orderbook::OrderBookStore;
 use rust_decimal::Decimal;
 use std::collections::HashMap;

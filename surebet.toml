@@ -1,4 +1,4 @@
-# Surebet - Polymarket Trading Engine Configuration
+# Surebet - Polymarket Resolution Sniping Engine
 # Secrets should be set via environment variables, not here.
 # See .env.example for required env vars.
 
@@ -20,56 +20,6 @@ categories = []
 # Categories to exclude
 exclude_categories = []
 
-[arb]
-# Enable cross-outcome arb scanner
-enabled = true
-# Enable live execution (false = scan-only / paper mode)
-execute = false
-# Minimum net edge after fees to report/execute (0.005 = $0.005 per $1)
-min_net_edge = 0.005
-# Scan interval in milliseconds
-scan_interval_ms = 1000
-# Max USDC per arb position
-max_position_usd = 100.0
-# Max total USDC across all open positions
-max_total_exposure = 500.0
-
-[maker]
-# Enable passive market-making strategy (posts bids on both sides of binary markets)
-enabled = true
-# Enable live execution (false = paper mode, logs orders without placing them)
-execute = false
-# Target bid sum as fraction of $1.00 (0.97 = $0.03 edge per round-trip)
-target_bid_sum = 0.97
-# Order size in shares per leg
-order_size = 10.0
-# Minimum spread to post into (won't make in very tight markets)
-min_spread = 0.02
-# Maximum inventory imbalance before pausing a side
-max_inventory_imbalance = 50.0
-# Requote interval in seconds
-requote_interval_secs = 5
-# Minimum price change to trigger a requote
-requote_threshold = 0.01
-# Seconds to wait for second leg fill before unwinding (leg risk timeout)
-fill_timeout_secs = 30
-# Fraction of spread to chase on unfilled leg after partial fill (0.0-1.0)
-# 0.5 = move halfway to the ask; 1.0 = match the ask (aggressive)
-aggressive_reprice_pct = 0.50
-# Max seconds since last trade on an outcome before skipping that market
-# Prevents posting in markets with no taker flow on one side
-min_activity_age_secs = 300
-
-[feeds]
-# Enable Binance/Coinbase price feeds for Chainlink oracle prediction
-enabled = false
-# Binance WebSocket symbols (lowercase)
-binance_symbols = ["btcusdt", "ethusdt"]
-# Coinbase product IDs
-coinbase_products = ["BTC-USD", "ETH-USD"]
-# Max age (seconds) before a price observation is stale
-max_observation_age_secs = 5
-
 [valkey]
 # Valkey/Redis connection URL (also supports VALKEY_URL env var)
 url = "redis://127.0.0.1:6379"
@@ -82,24 +32,6 @@ prefix = "surebet"
 enabled = true
 # Dashboard bind address
 bind = "127.0.0.1:3030"
-
-[anomaly]
-# Enable the anomaly detector (surfaces suspicious trades for review)
-enabled = true
-# Scan interval in milliseconds
-scan_interval_ms = 5000
-# Rolling window for trade history per asset (seconds)
-window_secs = 300
-# A single trade this many × the average size = "whale" trade
-whale_size_multiplier = 10.0
-# Volume in window must exceed this × previous window to flag "volume spike"
-volume_spike_multiplier = 5.0
-# Price must move this % from the rolling mean to flag "price dislocation"
-price_move_pct = 10.0
-# Bid/ask depth ratio threshold for "book imbalance" (5.0 = one side 5× heavier)
-book_imbalance_ratio = 5.0
-# Max anomalies to keep in memory for the dashboard
-max_anomalies = 200
 
 [crossbook]
 # Enable the cross-bookmaker arb scanner (auto-enables if ODDS_API_KEY is set)
@@ -137,24 +69,8 @@ min_remaining = 50
 poly_min_volume_usd = 100.0
 poly_min_depth_usd = 0.0
 
-[split]
-# Enable the enhanced multi-outcome split arbitrage scanner (Strategy 1A).
-# Detects bidirectional arbs: sum of asks < 1 (buy-and-merge) and
-# sum of bids > 1 (split-and-sell). Analyses depth at $100/$500/$1K/$5K tiers.
-enabled = true
-# Enable live execution (false = paper mode, logs opportunities)
-execute = false
-# Minimum net edge after fees to report
-min_net_edge = 0.005
-# Scan interval in milliseconds
-scan_interval_ms = 1000
-# Max USDC per split position
-max_position_usd = 500.0
-# Max total USDC across all open split positions
-max_total_exposure = 2000.0
-
 [sniper]
-# Enable the resolution sniping engine (Strategy 1B).
+# Enable the resolution sniping engine.
 # Monitors external data sources and fires when an outcome becomes
 # publicly knowable but the Polymarket book hasn't priced it in yet.
 enabled = true
@@ -168,20 +84,6 @@ max_buy_price = 0.99
 crypto_enabled = true
 # Poll interval for HTTP-based sources (Billboard, RT, USGS) in seconds
 http_poll_interval_secs = 30
-
-[lifecycle]
-# Enable position lifecycle management (Strategy 1C).
-# Manages exits: winning tokens queued for redemption, losing tokens
-# drip-sold, stale positions sold at discount.
-enabled = true
-# Hours before a position is considered stale (triggers discount sell)
-stale_threshold_hours = 24
-# Shares per drip-sell batch (rate limits selling to avoid book impact)
-drip_sell_batch = 1000.0
-# Seconds between drip-sell batches
-drip_sell_interval_secs = 35
-# Tick interval for lifecycle checks (seconds)
-tick_interval_secs = 10
 
 [onchain]
 # Enable on-chain event monitoring via Polygon WebSocket.

@@ -14,7 +14,7 @@
 pub mod fetcher;
 pub mod matcher;
 
-use crate::arb::TrackedMarket;
+use crate::market::TrackedMarket;
 use crate::config::CrossbookConfig;
 use crate::orderbook::OrderBookStore;
 use chrono::{DateTime, Utc};

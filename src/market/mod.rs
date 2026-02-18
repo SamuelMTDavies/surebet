@@ -202,6 +202,36 @@ impl MarketDiscovery {
     }
 }
 
+/// A tracked market with its outcome token IDs.
+/// Used by the sniper, crossbook scanner, and main orchestrator.
+#[derive(Debug, Clone)]
+pub struct TrackedMarket {
+    pub condition_id: String,
+    pub question: String,
+    /// Ordered list of (outcome_label, token_id) pairs.
+    /// For binary: [("Yes", token_yes), ("No", token_no)]
+    pub outcomes: Vec<(String, String)>,
+}
+
+impl TrackedMarket {
+    pub fn from_discovered(m: &DiscoveredMarket) -> Option<Self> {
+        if m.clob_token_ids.len() < 2 || m.outcomes.len() != m.clob_token_ids.len() {
+            return None;
+        }
+        let outcomes = m
+            .outcomes
+            .iter()
+            .zip(m.clob_token_ids.iter())
+            .map(|(label, tid)| (label.clone(), tid.clone()))
+            .collect();
+        Some(Self {
+            condition_id: m.condition_id.clone(),
+            question: m.question.clone(),
+            outcomes,
+        })
+    }
+}
+
 /// Categorize markets by their edge potential based on depth/volume characteristics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeProfile {

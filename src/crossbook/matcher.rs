@@ -12,7 +12,7 @@
 //! We match by extracting team names from the Polymarket question and
 //! comparing against the bookmaker's team names.
 
-use crate::arb::TrackedMarket;
+use crate::market::TrackedMarket;
 use crate::crossbook::fetcher::BookmakerMatch;
 use tracing::debug;
 

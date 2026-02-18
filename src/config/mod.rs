@@ -18,27 +18,15 @@ pub struct Config {
     #[serde(default)]
     pub filters: FilterConfig,
     #[serde(default)]
-    pub arb: ArbConfig,
-    #[serde(default)]
-    pub maker: MakerStrategyConfig,
-    #[serde(default)]
-    pub feeds: FeedsConfig,
-    #[serde(default)]
     pub valkey: ValkeyConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
-    pub anomaly: AnomalyConfig,
-    #[serde(default)]
     pub crossbook: CrossbookConfig,
     #[serde(default)]
-    pub split: SplitConfig,
-    #[serde(default)]
     pub sniper: SniperConfig,
-    #[serde(default)]
-    pub lifecycle: LifecycleConfig,
     #[serde(default)]
     pub onchain: OnChainConfig,
 }
@@ -88,127 +76,6 @@ pub struct FilterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ArbConfig {
-    /// Enable the arb scanner.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Enable live execution (false = scan-only / paper mode).
-    #[serde(default)]
-    pub execute: bool,
-    /// Minimum net edge after fees to report/execute.
-    #[serde(default = "default_min_edge")]
-    pub min_net_edge: f64,
-    /// Scan interval in milliseconds.
-    #[serde(default = "default_scan_interval_ms")]
-    pub scan_interval_ms: u64,
-    /// Max USDC per position.
-    #[serde(default = "default_max_position")]
-    pub max_position_usd: f64,
-    /// Max total USDC exposure.
-    #[serde(default = "default_max_exposure")]
-    pub max_total_exposure: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MakerStrategyConfig {
-    /// Enable the passive maker strategy.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Enable live execution (false = paper mode, logs orders without placing them).
-    #[serde(default)]
-    pub execute: bool,
-    /// Target bid sum as fraction of $1.00 (lower = more edge, less fill).
-    #[serde(default = "default_target_bid_sum")]
-    pub target_bid_sum: f64,
-    /// Order size in shares per leg.
-    #[serde(default = "default_order_size")]
-    pub order_size: f64,
-    /// Minimum spread to post into.
-    #[serde(default = "default_maker_min_spread")]
-    pub min_spread: f64,
-    /// Maximum inventory imbalance before pausing.
-    #[serde(default = "default_max_imbalance")]
-    pub max_inventory_imbalance: f64,
-    /// Requote interval in seconds.
-    #[serde(default = "default_requote_interval")]
-    pub requote_interval_secs: u64,
-    /// Minimum price change to trigger requote.
-    #[serde(default = "default_requote_threshold")]
-    pub requote_threshold: f64,
-    /// Seconds to wait for second leg after first fill before unwinding.
-    #[serde(default = "default_fill_timeout_secs")]
-    pub fill_timeout_secs: u64,
-    /// Fraction of spread to chase on unfilled leg after partial fill (0.0-1.0).
-    #[serde(default = "default_aggressive_reprice_pct")]
-    pub aggressive_reprice_pct: f64,
-    /// Max seconds since last trade on an outcome before skipping that market.
-    #[serde(default = "default_min_activity_age_secs")]
-    pub min_activity_age_secs: u64,
-}
-
-fn default_target_bid_sum() -> f64 {
-    0.97
-}
-fn default_order_size() -> f64 {
-    10.0
-}
-fn default_maker_min_spread() -> f64 {
-    0.02
-}
-fn default_max_imbalance() -> f64 {
-    50.0
-}
-fn default_requote_interval() -> u64 {
-    5
-}
-fn default_requote_threshold() -> f64 {
-    0.01
-}
-fn default_fill_timeout_secs() -> u64 {
-    30
-}
-fn default_aggressive_reprice_pct() -> f64 {
-    0.50
-}
-fn default_min_activity_age_secs() -> u64 {
-    300
-}
-
-impl Default for MakerStrategyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            execute: false,
-            target_bid_sum: default_target_bid_sum(),
-            order_size: default_order_size(),
-            min_spread: default_maker_min_spread(),
-            max_inventory_imbalance: default_max_imbalance(),
-            requote_interval_secs: default_requote_interval(),
-            requote_threshold: default_requote_threshold(),
-            fill_timeout_secs: default_fill_timeout_secs(),
-            aggressive_reprice_pct: default_aggressive_reprice_pct(),
-            min_activity_age_secs: default_min_activity_age_secs(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FeedsConfig {
-    /// Enable external exchange feeds (Binance, Coinbase).
-    #[serde(default)]
-    pub enabled: bool,
-    /// Binance symbols to track, e.g. ["btcusdt", "ethusdt"].
-    #[serde(default = "default_binance_symbols")]
-    pub binance_symbols: Vec<String>,
-    /// Coinbase product IDs to track, e.g. ["BTC-USD", "ETH-USD"].
-    #[serde(default = "default_coinbase_products")]
-    pub coinbase_products: Vec<String>,
-    /// Max observation age in seconds before considered stale.
-    #[serde(default = "default_max_obs_age")]
-    pub max_observation_age_secs: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ValkeyConfig {
     /// Valkey/Redis connection URL.
     #[serde(default = "default_valkey_url")]
@@ -217,23 +84,6 @@ pub struct ValkeyConfig {
     /// vs "surebet:live") to share one Valkey without key collisions.
     #[serde(default = "default_valkey_prefix")]
     pub prefix: String,
-}
-
-fn default_valkey_url() -> String {
-    "redis://127.0.0.1:6379".to_string()
-}
-
-fn default_valkey_prefix() -> String {
-    "surebet".to_string()
-}
-
-impl Default for ValkeyConfig {
-    fn default() -> Self {
-        Self {
-            url: default_valkey_url(),
-            prefix: default_valkey_prefix(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -246,101 +96,12 @@ pub struct DashboardConfig {
     pub bind: String,
 }
 
-fn default_dashboard_enabled() -> bool {
-    true
-}
-
-fn default_dashboard_bind() -> String {
-    "127.0.0.1:3030".to_string()
-}
-
-impl Default for DashboardConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_dashboard_enabled(),
-            bind: default_dashboard_bind(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
     #[serde(default)]
     pub json: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AnomalyConfig {
-    /// Enable the anomaly detector.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Scan interval in milliseconds.
-    #[serde(default = "default_anomaly_scan_interval")]
-    pub scan_interval_ms: u64,
-    /// Rolling window for trade history per asset (seconds).
-    #[serde(default = "default_anomaly_window")]
-    pub window_secs: u64,
-    /// A single trade this many times the average trade size is a "whale" trade.
-    #[serde(default = "default_whale_multiplier")]
-    pub whale_size_multiplier: f64,
-    /// Trade size as fraction of top-5 depth to flag as "thin-book aggression".
-    #[serde(default = "default_depth_fraction")]
-    pub depth_aggression_fraction: f64,
-    /// Volume in window must exceed this multiple of the previous window to flag "volume spike".
-    #[serde(default = "default_volume_spike")]
-    pub volume_spike_multiplier: f64,
-    /// Price must move this many percent from the rolling mean to flag "price dislocation".
-    #[serde(default = "default_price_move_pct")]
-    pub price_move_pct: f64,
-    /// Bid/ask depth ratio threshold to flag "book imbalance" (e.g. 5.0 means one side 5x heavier).
-    #[serde(default = "default_imbalance_ratio")]
-    pub book_imbalance_ratio: f64,
-    /// Maximum number of anomalies to keep in memory for the dashboard.
-    #[serde(default = "default_max_anomalies")]
-    pub max_anomalies: usize,
-}
-
-fn default_anomaly_scan_interval() -> u64 {
-    5000
-}
-fn default_anomaly_window() -> u64 {
-    300
-}
-fn default_whale_multiplier() -> f64 {
-    10.0
-}
-fn default_depth_fraction() -> f64 {
-    0.20
-}
-fn default_volume_spike() -> f64 {
-    5.0
-}
-fn default_price_move_pct() -> f64 {
-    10.0
-}
-fn default_imbalance_ratio() -> f64 {
-    5.0
-}
-fn default_max_anomalies() -> usize {
-    200
-}
-
-impl Default for AnomalyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            scan_interval_ms: default_anomaly_scan_interval(),
-            window_secs: default_anomaly_window(),
-            whale_size_multiplier: default_whale_multiplier(),
-            depth_aggression_fraction: default_depth_fraction(),
-            volume_spike_multiplier: default_volume_spike(),
-            price_move_pct: default_price_move_pct(),
-            book_imbalance_ratio: default_imbalance_ratio(),
-            max_anomalies: default_max_anomalies(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -392,211 +153,6 @@ pub struct CrossbookConfig {
     pub min_remaining: u32,
 }
 
-fn default_odds_api_url() -> String {
-    "https://api.the-odds-api.com/v4/sports".to_string()
-}
-fn default_odds_regions() -> String {
-    "uk,eu".to_string()
-}
-fn default_odds_markets() -> String {
-    "h2h,h2h_lay".to_string()
-}
-fn default_sports_keys() -> Vec<String> {
-    // Trimmed to 4 key leagues to stay within the 500 req/month free tier.
-    // At 6-hour fetch intervals: 4 sports × 4 fetches/day × 30 days = 480 req/month.
-    vec![
-        "soccer_epl".to_string(),
-        "soccer_spain_la_liga".to_string(),
-        "soccer_germany_bundesliga".to_string(),
-        "soccer_uefa_champs_league".to_string(),
-    ]
-}
-fn default_crossbook_fetch_interval() -> u64 {
-    21600 // 6 hours — conservative for 500 req/month budget
-}
-fn default_crossbook_scan_interval() -> u64 {
-    5000
-}
-fn default_crossbook_min_edge() -> f64 {
-    1.0
-}
-fn default_crossbook_max_results() -> usize {
-    100
-}
-fn default_monthly_budget() -> u32 {
-    500
-}
-fn default_min_remaining() -> u32 {
-    50
-}
-fn default_crossbook_poly_min_volume() -> f64 {
-    100.0
-}
-fn default_crossbook_poly_min_depth() -> f64 {
-    0.0
-}
-
-impl Default for CrossbookConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            odds_api_key: String::new(),
-            odds_api_url: default_odds_api_url(),
-            regions: default_odds_regions(),
-            markets: default_odds_markets(),
-            sports_keys: default_sports_keys(),
-            fetch_interval_secs: default_crossbook_fetch_interval(),
-            scan_interval_ms: default_crossbook_scan_interval(),
-            min_edge_pct: default_crossbook_min_edge(),
-            max_results: default_crossbook_max_results(),
-            monthly_budget: default_monthly_budget(),
-            min_remaining: default_min_remaining(),
-            poly_min_volume_usd: default_crossbook_poly_min_volume(),
-            poly_min_depth_usd: default_crossbook_poly_min_depth(),
-        }
-    }
-}
-
-fn default_clob_url() -> String {
-    "https://clob.polymarket.com".to_string()
-}
-fn default_clob_ws_url() -> String {
-    "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string()
-}
-fn default_rtds_ws_url() -> String {
-    "wss://ws-live-data.polymarket.com".to_string()
-}
-fn default_gamma_url() -> String {
-    "https://gamma-api.polymarket.com".to_string()
-}
-fn default_min_volume() -> f64 {
-    10_000.0
-}
-fn default_min_depth() -> f64 {
-    1_000.0
-}
-fn default_max_spread() -> f64 {
-    5.0
-}
-fn default_log_level() -> String {
-    "info".to_string()
-}
-fn default_true() -> bool {
-    true
-}
-fn default_min_edge() -> f64 {
-    0.005
-}
-fn default_scan_interval_ms() -> u64 {
-    1000
-}
-fn default_max_position() -> f64 {
-    100.0
-}
-fn default_max_exposure() -> f64 {
-    500.0
-}
-fn default_binance_symbols() -> Vec<String> {
-    vec!["btcusdt".to_string(), "ethusdt".to_string()]
-}
-fn default_coinbase_products() -> Vec<String> {
-    vec!["BTC-USD".to_string(), "ETH-USD".to_string()]
-}
-fn default_max_obs_age() -> u64 {
-    5
-}
-
-impl Default for FilterConfig {
-    fn default() -> Self {
-        Self {
-            min_volume_usd: default_min_volume(),
-            min_depth_usd: default_min_depth(),
-            max_spread_pct: default_max_spread(),
-            categories: Vec::new(),
-            exclude_categories: Vec::new(),
-        }
-    }
-}
-
-impl Default for ArbConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            execute: false,
-            min_net_edge: default_min_edge(),
-            scan_interval_ms: default_scan_interval_ms(),
-            max_position_usd: default_max_position(),
-            max_total_exposure: default_max_exposure(),
-        }
-    }
-}
-
-impl Default for FeedsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            binance_symbols: default_binance_symbols(),
-            coinbase_products: default_coinbase_products(),
-            max_observation_age_secs: default_max_obs_age(),
-        }
-    }
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            json: false,
-        }
-    }
-}
-
-// --- Split arb config ---
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SplitConfig {
-    /// Enable the split arb scanner.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Enable live execution (false = paper mode).
-    #[serde(default)]
-    pub execute: bool,
-    /// Minimum net edge after fees to report/execute.
-    #[serde(default = "default_min_edge")]
-    pub min_net_edge: f64,
-    /// Scan interval in milliseconds.
-    #[serde(default = "default_scan_interval_ms")]
-    pub scan_interval_ms: u64,
-    /// Max USDC per split position.
-    #[serde(default = "default_split_max_position")]
-    pub max_position_usd: f64,
-    /// Max total USDC across all open split positions.
-    #[serde(default = "default_split_max_exposure")]
-    pub max_total_exposure: f64,
-}
-
-fn default_split_max_position() -> f64 {
-    500.0
-}
-fn default_split_max_exposure() -> f64 {
-    2000.0
-}
-
-impl Default for SplitConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            execute: false,
-            min_net_edge: default_min_edge(),
-            scan_interval_ms: default_scan_interval_ms(),
-            max_position_usd: default_split_max_position(),
-            max_total_exposure: default_split_max_exposure(),
-        }
-    }
-}
-
-// --- Sniper config ---
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SniperConfig {
     /// Enable the resolution sniper.
@@ -618,77 +174,6 @@ pub struct SniperConfig {
     #[serde(default = "default_http_poll_secs")]
     pub http_poll_interval_secs: u64,
 }
-
-fn default_min_confidence() -> f64 {
-    0.95
-}
-fn default_max_buy_price() -> f64 {
-    0.99
-}
-fn default_http_poll_secs() -> u64 {
-    30
-}
-
-impl Default for SniperConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            execute: false,
-            min_confidence: default_min_confidence(),
-            max_buy_price: default_max_buy_price(),
-            crypto_enabled: true,
-            http_poll_interval_secs: default_http_poll_secs(),
-        }
-    }
-}
-
-// --- Lifecycle config ---
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LifecycleConfig {
-    /// Enable the position lifecycle manager.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Hours before a position is considered stale (triggers discount sell).
-    #[serde(default = "default_stale_hours")]
-    pub stale_threshold_hours: u64,
-    /// Shares to sell per drip batch (for losing/stale positions).
-    #[serde(default = "default_drip_batch")]
-    pub drip_sell_batch: f64,
-    /// Seconds between drip sell batches.
-    #[serde(default = "default_drip_interval")]
-    pub drip_sell_interval_secs: u64,
-    /// Tick interval in seconds for lifecycle checks.
-    #[serde(default = "default_lifecycle_tick")]
-    pub tick_interval_secs: u64,
-}
-
-fn default_stale_hours() -> u64 {
-    24
-}
-fn default_drip_batch() -> f64 {
-    1000.0
-}
-fn default_drip_interval() -> u64 {
-    35
-}
-fn default_lifecycle_tick() -> u64 {
-    10
-}
-
-impl Default for LifecycleConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            stale_threshold_hours: default_stale_hours(),
-            drip_sell_batch: default_drip_batch(),
-            drip_sell_interval_secs: default_drip_interval(),
-            tick_interval_secs: default_lifecycle_tick(),
-        }
-    }
-}
-
-// --- On-chain event monitoring config ---
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnChainConfig {
@@ -731,6 +216,97 @@ pub struct OnChainConfig {
     pub fallback_ws_urls: Vec<String>,
 }
 
+// --- Default functions ---
+
+fn default_clob_url() -> String {
+    "https://clob.polymarket.com".to_string()
+}
+fn default_clob_ws_url() -> String {
+    "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string()
+}
+fn default_rtds_ws_url() -> String {
+    "wss://ws-live-data.polymarket.com".to_string()
+}
+fn default_gamma_url() -> String {
+    "https://gamma-api.polymarket.com".to_string()
+}
+fn default_min_volume() -> f64 {
+    10_000.0
+}
+fn default_min_depth() -> f64 {
+    1_000.0
+}
+fn default_max_spread() -> f64 {
+    5.0
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_valkey_url() -> String {
+    "redis://127.0.0.1:6379".to_string()
+}
+fn default_valkey_prefix() -> String {
+    "surebet".to_string()
+}
+fn default_dashboard_enabled() -> bool {
+    true
+}
+fn default_dashboard_bind() -> String {
+    "127.0.0.1:3030".to_string()
+}
+fn default_odds_api_url() -> String {
+    "https://api.the-odds-api.com/v4/sports".to_string()
+}
+fn default_odds_regions() -> String {
+    "uk,eu".to_string()
+}
+fn default_odds_markets() -> String {
+    "h2h,h2h_lay".to_string()
+}
+fn default_sports_keys() -> Vec<String> {
+    vec![
+        "soccer_epl".to_string(),
+        "soccer_spain_la_liga".to_string(),
+        "soccer_germany_bundesliga".to_string(),
+        "soccer_uefa_champs_league".to_string(),
+    ]
+}
+fn default_crossbook_fetch_interval() -> u64 {
+    21600
+}
+fn default_crossbook_scan_interval() -> u64 {
+    5000
+}
+fn default_crossbook_min_edge() -> f64 {
+    1.0
+}
+fn default_crossbook_max_results() -> usize {
+    100
+}
+fn default_monthly_budget() -> u32 {
+    500
+}
+fn default_min_remaining() -> u32 {
+    50
+}
+fn default_crossbook_poly_min_volume() -> f64 {
+    100.0
+}
+fn default_crossbook_poly_min_depth() -> f64 {
+    0.0
+}
+fn default_min_confidence() -> f64 {
+    0.95
+}
+fn default_max_buy_price() -> f64 {
+    0.99
+}
+fn default_http_poll_secs() -> u64 {
+    30
+}
 fn default_ctf_address() -> String {
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
 }
@@ -760,6 +336,81 @@ fn default_fallback_ws_urls() -> Vec<String> {
         "wss://polygon-bor-rpc.publicnode.com".to_string(),
         "wss://polygon.drpc.org".to_string(),
     ]
+}
+
+// --- Default impls ---
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            min_volume_usd: default_min_volume(),
+            min_depth_usd: default_min_depth(),
+            max_spread_pct: default_max_spread(),
+            categories: Vec::new(),
+            exclude_categories: Vec::new(),
+        }
+    }
+}
+
+impl Default for ValkeyConfig {
+    fn default() -> Self {
+        Self {
+            url: default_valkey_url(),
+            prefix: default_valkey_prefix(),
+        }
+    }
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dashboard_enabled(),
+            bind: default_dashboard_bind(),
+        }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            json: false,
+        }
+    }
+}
+
+impl Default for CrossbookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            odds_api_key: String::new(),
+            odds_api_url: default_odds_api_url(),
+            regions: default_odds_regions(),
+            markets: default_odds_markets(),
+            sports_keys: default_sports_keys(),
+            fetch_interval_secs: default_crossbook_fetch_interval(),
+            scan_interval_ms: default_crossbook_scan_interval(),
+            min_edge_pct: default_crossbook_min_edge(),
+            max_results: default_crossbook_max_results(),
+            monthly_budget: default_monthly_budget(),
+            min_remaining: default_min_remaining(),
+            poly_min_volume_usd: default_crossbook_poly_min_volume(),
+            poly_min_depth_usd: default_crossbook_poly_min_depth(),
+        }
+    }
+}
+
+impl Default for SniperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            execute: false,
+            min_confidence: default_min_confidence(),
+            max_buy_price: default_max_buy_price(),
+            crypto_enabled: true,
+            http_poll_interval_secs: default_http_poll_secs(),
+        }
+    }
 }
 
 impl Default for OnChainConfig {
@@ -828,16 +479,12 @@ impl Config {
                 api_passphrase: std::env::var("POLY_API_PASSPHRASE").unwrap_or_default(),
             },
             filters: FilterConfig::default(),
-            arb: ArbConfig::default(),
-            maker: MakerStrategyConfig::default(),
-            feeds: FeedsConfig::default(),
             valkey: ValkeyConfig {
                 url: std::env::var("VALKEY_URL").unwrap_or_else(|_| default_valkey_url()),
                 prefix: std::env::var("VALKEY_PREFIX").unwrap_or_else(|_| default_valkey_prefix()),
             },
             dashboard: DashboardConfig::default(),
             logging: LoggingConfig::default(),
-            anomaly: AnomalyConfig::default(),
             crossbook: {
                 let key = std::env::var("ODDS_API_KEY").unwrap_or_default();
                 let auto_enable = !key.is_empty();
@@ -847,9 +494,7 @@ impl Config {
                     ..CrossbookConfig::default()
                 }
             },
-            split: SplitConfig::default(),
             sniper: SniperConfig::default(),
-            lifecycle: LifecycleConfig::default(),
             onchain: {
                 let ws_url = std::env::var("POLYGON_WS_URL").unwrap_or_default();
                 let auto_enable = !ws_url.is_empty();
