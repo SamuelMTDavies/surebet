@@ -113,6 +113,19 @@ checkpoint_path = "onchain_checkpoint.txt"
 # How many blocks back to scan on startup
 startup_lookback_blocks = 100
 
+[harvester]
+# Stale order harvester — scans for fee-free markets near their end date
+# that still have stale orders on the book.
+# Maximum price to pay for winning outcome (sweep asks up to this)
+max_buy_price = 0.999
+# Minimum price to accept when selling losing outcomes (hit bids above this)
+min_sell_price = 0.001
+# End date window: show markets ending within this many days ahead,
+# plus any markets up to 24h past their end date still accepting orders.
+end_date_window_days = 2
+# Maximum number of markets to display
+max_display = 50
+
 [logging]
 level = "info"
 json = false

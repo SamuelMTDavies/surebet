@@ -60,5 +60,13 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 
 # On-chain event monitoring (Polygon/EVM)
-alloy = { version = "1", features = ["provider-ws", "rpc-types-eth"] }
+alloy = { version = "1", features = ["provider-ws", "provider-http", "rpc-types-eth"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+[[bin]]
+name = "event_chronology"
+path = "src/bin/event_chronology.rs"
+
+[[bin]]
+name = "harvester"
+path = "src/bin/harvester.rs"

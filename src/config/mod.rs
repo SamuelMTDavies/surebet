@@ -29,6 +29,8 @@ pub struct Config {
     pub sniper: SniperConfig,
     #[serde(default)]
     pub onchain: OnChainConfig,
+    #[serde(default)]
+    pub harvester: HarvesterConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +218,23 @@ pub struct OnChainConfig {
     pub fallback_ws_urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HarvesterConfig {
+    /// Maximum price to pay for winning outcome (sweep asks up to this).
+    #[serde(default = "default_harvester_max_buy")]
+    pub max_buy_price: f64,
+    /// Minimum price to sell losing outcomes (hit bids above this).
+    #[serde(default = "default_harvester_min_sell")]
+    pub min_sell_price: f64,
+    /// End date window: markets ending within this many days from now
+    /// (also includes markets whose end date is in the past, up to 24h ago).
+    #[serde(default = "default_harvester_end_date_window")]
+    pub end_date_window_days: i64,
+    /// Maximum number of markets to display in the list.
+    #[serde(default = "default_harvester_max_display")]
+    pub max_display: usize,
+}
+
 // --- Default functions ---
 
 fn default_clob_url() -> String {
@@ -306,6 +325,18 @@ fn default_max_buy_price() -> f64 {
 }
 fn default_http_poll_secs() -> u64 {
     30
+}
+fn default_harvester_max_buy() -> f64 {
+    0.995
+}
+fn default_harvester_min_sell() -> f64 {
+    0.005
+}
+fn default_harvester_end_date_window() -> i64 {
+    1
+}
+fn default_harvester_max_display() -> usize {
+    50
 }
 fn default_ctf_address() -> String {
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
@@ -431,6 +462,17 @@ impl Default for OnChainConfig {
     }
 }
 
+impl Default for HarvesterConfig {
+    fn default() -> Self {
+        Self {
+            max_buy_price: default_harvester_max_buy(),
+            min_sell_price: default_harvester_min_sell(),
+            end_date_window_days: default_harvester_end_date_window(),
+            max_display: default_harvester_max_display(),
+        }
+    }
+}
+
 impl Config {
     /// Load config from a TOML file, then overlay environment variables for secrets.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -495,6 +537,7 @@ impl Config {
                 }
             },
             sniper: SniperConfig::default(),
+            harvester: HarvesterConfig::default(),
             onchain: {
                 let ws_url = std::env::var("POLYGON_WS_URL").unwrap_or_default();
                 let auto_enable = !ws_url.is_empty();
