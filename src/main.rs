@@ -803,9 +803,15 @@ async fn main() -> anyhow::Result<()> {
                                 // Polymarket taker fee: fee_rate = price * (1 - price) * 0.0222
                                 // (complementary pricing — peaks at ~0.55% near p=0.50)
                                 let fee_coeff = Decimal::from_str("0.0222").unwrap();
+                                let max_buy = Decimal::from_str(&config.sniper.max_buy_price.to_string()).unwrap();
+                                let min_sell = Decimal::from_str("0.05").unwrap();
                                 let mut grand_total_gross = Decimal::ZERO;
                                 let mut grand_total_fees = Decimal::ZERO;
                                 let token_count = market.clob_token_ids.len();
+
+                                // Determine which outcome wins based on proposed_price.
+                                // proposed_price > 0 → YES wins (index 0), == 0 → NO wins (index 1)
+                                let winning_idx: usize = if proposed_price > 0 { 0 } else { 1 };
 
                                 warn!(
                                     market_id = ?market_id,
@@ -813,6 +819,7 @@ async fn main() -> anyhow::Result<()> {
                                     question = %market.question,
                                     outcomes = ?market.outcomes,
                                     tokens = token_count,
+                                    winning = market.outcomes.get(winning_idx).map(|s| s.as_str()).unwrap_or("?"),
                                     "MATCHED MARKET for resolution"
                                 );
 
@@ -820,6 +827,12 @@ async fn main() -> anyhow::Result<()> {
                                     let outcome_label = market.outcomes.get(idx)
                                         .map(|s| s.as_str())
                                         .unwrap_or("?");
+                                    let is_winner = idx == winning_idx;
+
+                                    // Directional logic:
+                                    //   Winner token → BUY (sweep asks) — pays out $1.00 on resolution
+                                    //   Loser token  → SELL (hit bids) — becomes worthless on resolution
+                                    // Skip the other direction (buying losers / selling winners).
 
                                     // Try in-memory book first, fall back to REST API fetch
                                     let book = match store.get_book(token_id) {
@@ -838,62 +851,76 @@ async fn main() -> anyhow::Result<()> {
                                     };
 
                                     if let Some(book) = book {
-                                        // Asks ≤ max_buy_price = winning outcome shares to buy cheap
-                                        let mut ask_shares = Decimal::ZERO;
-                                        let mut ask_gross = Decimal::ZERO;
-                                        let mut ask_fees = Decimal::ZERO;
-                                        let mut ask_details = Vec::new();
-                                        let threshold = Decimal::from_str(&config.sniper.max_buy_price.to_string()).unwrap();
-                                        for (&price, &size) in book.asks.levels.iter() {
-                                            if price <= threshold {
-                                                let gross = (one - price) * size;
-                                                // Fee on the buy: rate = p * (1-p) * 0.0222
-                                                let fee = price * (one - price) * fee_coeff * size;
-                                                ask_shares += size;
-                                                ask_gross += gross;
-                                                ask_fees += fee;
-                                                ask_details.push(format!("{}@${}", size, price));
+                                        if is_winner {
+                                            // BUY winner: sweep asks up to max_buy_price.
+                                            // Each share bought at price p pays out $1.00, profit = (1-p) - fee.
+                                            let mut shares = Decimal::ZERO;
+                                            let mut cost = Decimal::ZERO;
+                                            let mut gross = Decimal::ZERO;
+                                            let mut fees = Decimal::ZERO;
+                                            let mut details = Vec::new();
+                                            for (&price, &size) in book.asks.levels.iter() {
+                                                if price <= max_buy {
+                                                    let level_cost = price * size;
+                                                    let level_gross = (one - price) * size;
+                                                    let level_fee = price * (one - price) * fee_coeff * size;
+                                                    shares += size;
+                                                    cost += level_cost;
+                                                    gross += level_gross;
+                                                    fees += level_fee;
+                                                    details.push(format!("{}@${}", size, price));
+                                                }
                                             }
-                                        }
-                                        // Bids ≥ $0.05 = losing outcome shares to sell into
-                                        let mut bid_shares = Decimal::ZERO;
-                                        let mut bid_gross = Decimal::ZERO;
-                                        let mut bid_fees = Decimal::ZERO;
-                                        let mut bid_details = Vec::new();
-                                        let floor = Decimal::from_str("0.05").unwrap();
-                                        for (&price, &size) in book.bids.levels.iter().rev() {
-                                            if price >= floor {
-                                                let gross = price * size;
-                                                let fee = price * (one - price) * fee_coeff * size;
-                                                bid_shares += size;
-                                                bid_gross += gross;
-                                                bid_fees += fee;
-                                                bid_details.push(format!("{}@${}", size, price));
+                                            grand_total_gross += gross;
+                                            grand_total_fees += fees;
+
+                                            warn!(
+                                                action = "BUY_WINNER",
+                                                outcome = outcome_label,
+                                                token = %&token_id[..16.min(token_id.len())],
+                                                best_ask = %book.asks.best(false).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
+                                                shares = %shares,
+                                                cost = %format!("${:.4}", cost),
+                                                gross = %format!("${:.4}", gross),
+                                                fees = %format!("${:.4}", fees),
+                                                net = %format!("${:.4}", gross - fees),
+                                                levels = %details.join(" | "),
+                                                "SNIPE: buy winning outcome"
+                                            );
+                                        } else {
+                                            // SELL loser: hit bids above min_sell.
+                                            // These shares become worthless, so selling at any price > 0 is pure profit.
+                                            // (Requires holding these tokens — from prior minting/splitting.)
+                                            let mut shares = Decimal::ZERO;
+                                            let mut gross = Decimal::ZERO;
+                                            let mut fees = Decimal::ZERO;
+                                            let mut details = Vec::new();
+                                            for (&price, &size) in book.bids.levels.iter().rev() {
+                                                if price >= min_sell {
+                                                    let level_gross = price * size;
+                                                    let level_fee = price * (one - price) * fee_coeff * size;
+                                                    shares += size;
+                                                    gross += level_gross;
+                                                    fees += level_fee;
+                                                    details.push(format!("{}@${}", size, price));
+                                                }
                                             }
+                                            grand_total_gross += gross;
+                                            grand_total_fees += fees;
+
+                                            warn!(
+                                                action = "SELL_LOSER",
+                                                outcome = outcome_label,
+                                                token = %&token_id[..16.min(token_id.len())],
+                                                best_bid = %book.bids.best(true).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
+                                                shares = %shares,
+                                                gross = %format!("${:.4}", gross),
+                                                fees = %format!("${:.4}", fees),
+                                                net = %format!("${:.4}", gross - fees),
+                                                levels = %details.join(" | "),
+                                                "SNIPE: sell losing outcome (requires held tokens)"
+                                            );
                                         }
-
-                                        let total_gross = ask_gross + bid_gross;
-                                        let total_fees = ask_fees + bid_fees;
-                                        grand_total_gross += total_gross;
-                                        grand_total_fees += total_fees;
-
-                                        warn!(
-                                            outcome = outcome_label,
-                                            token = %&token_id[..16.min(token_id.len())],
-                                            best_bid = %book.bids.best(true).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
-                                            best_ask = %book.asks.best(false).map(|(p,_)| p.to_string()).unwrap_or_else(|| "-".into()),
-                                            ask_snipe_shares = %ask_shares,
-                                            ask_gross = %format!("${:.4}", ask_gross),
-                                            ask_fees = %format!("${:.4}", ask_fees),
-                                            ask_net = %format!("${:.4}", ask_gross - ask_fees),
-                                            ask_levels = %ask_details.join(" | "),
-                                            bid_snipe_shares = %bid_shares,
-                                            bid_gross = %format!("${:.4}", bid_gross),
-                                            bid_fees = %format!("${:.4}", bid_fees),
-                                            bid_net = %format!("${:.4}", bid_gross - bid_fees),
-                                            bid_levels = %bid_details.join(" | "),
-                                            "SNIPE BOOK: {} outcome", outcome_label
-                                        );
                                     } else {
                                         warn!(
                                             outcome = outcome_label,
@@ -908,10 +935,10 @@ async fn main() -> anyhow::Result<()> {
                                     question = %market.question,
                                     proposed = outcome,
                                     tokens_scanned = token_count,
-                                    gross_profit = %format!("${:.4}", grand_total_gross),
+                                    gross = %format!("${:.4}", grand_total_gross),
                                     fees = %format!("${:.4}", grand_total_fees),
-                                    net_profit = %format!("${:.4}", grand_net),
-                                    "SNIPE SCAN COMPLETE"
+                                    net = %format!("${:.4}", grand_net),
+                                    "SNIPE SCAN COMPLETE (directional)"
                                 );
                             } else {
                                 warn!(
