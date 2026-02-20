@@ -58,6 +58,8 @@ async fn main() -> Result<()> {
 
     let max_buy = Decimal::from_str(&format!("{}", harvester.max_buy_price))
         .unwrap_or_else(|_| Decimal::from_str("0.995").unwrap());
+    let min_sell = Decimal::from_str(&format!("{}", harvester.min_sell_price))
+        .unwrap_or_else(|_| Decimal::from_str("0.005").unwrap());
 
     println!("=== Stale Order Harvester ===");
     println!(
@@ -98,7 +100,7 @@ async fn main() -> Result<()> {
         let book = book_store.fetch_rest_book(clob_url, token_id).await;
 
         let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, max_buy),
+            Some(ref b) => build_outcome_info(&label, token_id, b, max_buy, min_sell),
             None => OutcomeInfo {
                 label: label.clone(),
                 token_id: token_id.clone(),
@@ -106,37 +108,63 @@ async fn main() -> Result<()> {
                 sweepable_shares: Decimal::ZERO,
                 sweepable_cost: Decimal::ZERO,
                 sweepable_profit: Decimal::ZERO,
+                best_bid: None,
+                sellable_shares: Decimal::ZERO,
+                sellable_revenue: Decimal::ZERO,
             },
         };
         outcome_infos.push(info);
     }
 
-    // Display outcomes with book data
+    // Display outcomes with book data — both buy and sell sides
     println!();
     println!("Market: \"{}\"", market.question);
+    println!();
     for (i, info) in outcome_infos.iter().enumerate() {
         let ask_str = info
             .best_ask
             .map(|p| format!("${}", p))
             .unwrap_or_else(|| "none".to_string());
-        let pct = if info.sweepable_cost > Decimal::ZERO {
+        let bid_str = info
+            .best_bid
+            .map(|p| format!("${}", p))
+            .unwrap_or_else(|| "none".to_string());
+        let buy_pct = if info.sweepable_cost > Decimal::ZERO {
             let pct_val = (info.sweepable_profit / info.sweepable_cost)
                 * Decimal::from(100);
             format!("{:.2}%", pct_val)
         } else {
             "-".to_string()
         };
+
+        // If this outcome wins, sell-loser revenue = sum of bids on OTHER outcomes
+        let sell_losers_rev: Decimal = outcome_infos
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, o)| o.sellable_revenue)
+            .sum();
+        let combined = info.sweepable_profit + sell_losers_rev;
+
         println!(
-            "  [{}] {:<20} best ask: {:<8} | {} shares available (<=${}) | cost ${} → profit ${} ({})",
-            i,
-            info.label,
-            ask_str,
-            info.sweepable_shares,
-            max_buy,
-            info.sweepable_cost,
-            info.sweepable_profit,
-            pct,
+            "  [{}] {:<20} ask: {:<8} bid: {:<8}",
+            i, info.label, ask_str, bid_str,
         );
+        println!(
+            "      BUY:  {} shares ≤${} | cost ${:.4} → profit ${:.4} ({})",
+            info.sweepable_shares, max_buy, info.sweepable_cost, info.sweepable_profit, buy_pct,
+        );
+        if sell_losers_rev > Decimal::ZERO {
+            println!(
+                "      SELL: split+sell losers → ${:.4} revenue",
+                sell_losers_rev,
+            );
+            println!(
+                "      COMBINED: ${:.4}",
+                combined,
+            );
+        }
+        println!();
     }
 
     // ── Step 4: Select winner ───────────────────────────────────────────────
@@ -146,8 +174,17 @@ async fn main() -> Result<()> {
     // ── Step 5: Plan orders ─────────────────────────────────────────────────
 
     let winner = &outcome_infos[winner_idx];
-    if winner.sweepable_shares == Decimal::ZERO {
-        println!("\nNo asks available at or below ${} for \"{}\".", max_buy, winner.label);
+
+    // Sell-loser revenue from OTHER outcomes (split+sell strategy)
+    let sell_losers_revenue: Decimal = outcome_infos
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != winner_idx)
+        .map(|(_, o)| o.sellable_revenue)
+        .sum();
+
+    if winner.sweepable_shares == Decimal::ZERO && sell_losers_revenue == Decimal::ZERO {
+        println!("\nNo opportunity for \"{}\" — no asks to buy, no loser bids to sell into.", winner.label);
         return Ok(());
     }
 
@@ -160,6 +197,7 @@ async fn main() -> Result<()> {
         profit: winner.sweepable_profit,
     };
 
+    let combined_profit = order.profit + sell_losers_revenue;
     let pct = if order.cost > Decimal::ZERO {
         let v = (order.profit / order.cost) * Decimal::from(100);
         format!("{:.2}%", v)
@@ -173,6 +211,16 @@ async fn main() -> Result<()> {
         "  BUY \"{}\"  {} shares @ limit ${}  |  cost ${}  |  profit ${} ({})",
         order.label, order.shares, order.price, order.cost, order.profit, pct,
     );
+    if sell_losers_revenue > Decimal::ZERO {
+        println!(
+            "  SELL losers (split+sell)  |  revenue ${}",
+            sell_losers_revenue,
+        );
+        println!(
+            "  COMBINED PROFIT: ${}",
+            combined_profit,
+        );
+    }
     println!(
         "  Mode: {}",
         if live_mode {

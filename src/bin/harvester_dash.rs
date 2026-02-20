@@ -34,6 +34,8 @@ struct AppState {
     api: Option<Arc<ClobApiClient>>,
     activity: Arc<RwLock<Vec<ActivityEntry>>>,
     max_buy: Decimal,
+    #[allow(dead_code)]
+    min_sell: Decimal,
     live_mode: bool,
 }
 
@@ -90,6 +92,8 @@ async fn main() -> Result<()> {
 
     let max_buy = Decimal::from_str(&format!("{}", harvester.max_buy_price))
         .unwrap_or_else(|_| Decimal::from_str("0.995").unwrap());
+    let min_sell = Decimal::from_str(&format!("{}", harvester.min_sell_price))
+        .unwrap_or_else(|_| Decimal::from_str("0.005").unwrap());
 
     let bind_addr = config
         .harvester
@@ -128,7 +132,7 @@ async fn main() -> Result<()> {
             let book = book_store.fetch_rest_book(&clob_url, token_id).await;
 
             let info = match book {
-                Some(ref b) => build_outcome_info(&label, token_id, b, max_buy),
+                Some(ref b) => build_outcome_info(&label, token_id, b, max_buy, min_sell),
                 None => OutcomeInfo {
                     label: label.clone(),
                     token_id: token_id.clone(),
@@ -136,6 +140,9 @@ async fn main() -> Result<()> {
                     sweepable_shares: Decimal::ZERO,
                     sweepable_cost: Decimal::ZERO,
                     sweepable_profit: Decimal::ZERO,
+                    best_bid: None,
+                    sellable_shares: Decimal::ZERO,
+                    sellable_revenue: Decimal::ZERO,
                 },
             };
             outcomes.push(info);
@@ -177,6 +184,7 @@ async fn main() -> Result<()> {
         api,
         activity: Arc::new(RwLock::new(Vec::new())),
         max_buy,
+        min_sell,
         live_mode,
     };
 
@@ -419,24 +427,55 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
         };
 
         // Outcome sub-rows
+        //
+        // For each outcome we show:
+        //   BUY side  — sweep asks (buy-winner strategy)
+        //   SELL side — hit bids (sell-loser via split strategy)
+        //
+        // When you "Select Winner" on outcome X:
+        //   1. Buy X tokens from asks (profit = shares - cost)
+        //   2. Split USDC to get loser tokens for every OTHER outcome,
+        //      sell those into their bids (revenue is pure profit,
+        //      since the split winner token redeems at $1).
         let mut outcome_html = String::new();
-        for info in &mwb.outcomes {
+        let n_outcomes = mwb.outcomes.len();
+
+        for (oi, info) in mwb.outcomes.iter().enumerate() {
             let ask_str = info
                 .best_ask
                 .map(|p| format!("${}", p))
                 .unwrap_or_else(|| "-".to_string());
-            let pct = if info.sweepable_cost > Decimal::ZERO {
+            let bid_str = info
+                .best_bid
+                .map(|p| format!("${}", p))
+                .unwrap_or_else(|| "-".to_string());
+            let buy_pct = if info.sweepable_cost > Decimal::ZERO {
                 let v = (info.sweepable_profit / info.sweepable_cost) * Decimal::from(100);
                 format!("{:.2}%", v)
             } else {
                 "-".to_string()
             };
-            let profit_color = if info.sweepable_profit > Decimal::ZERO {
+
+            // Calculate combined profit if THIS outcome is the winner:
+            //   buy_winner_profit + sum of sell revenue for ALL OTHER outcomes
+            let buy_profit = info.sweepable_profit;
+            let sell_losers_revenue: Decimal = mwb
+                .outcomes
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != oi)
+                .map(|(_, o)| o.sellable_revenue)
+                .sum();
+            let combined_profit = buy_profit + sell_losers_revenue;
+
+            let profit_color = if combined_profit > Decimal::ZERO {
                 "#2ecc71"
             } else {
                 "#8b949e"
             };
-            let btn = if info.sweepable_shares > Decimal::ZERO {
+
+            let has_opportunity = info.sweepable_shares > Decimal::ZERO || sell_losers_revenue > Decimal::ZERO;
+            let btn = if has_opportunity {
                 format!(
                     r#"<button class="harvest-btn" onclick="harvest('{}','{}','{}')">Select Winner</button>"#,
                     info.token_id,
@@ -447,23 +486,37 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
                 String::new()
             };
 
+            // Show sell-loser detail only when there's something
+            let sell_detail = if sell_losers_revenue > Decimal::ZERO && n_outcomes >= 2 {
+                format!(
+                    r#"<span style="color:#8b949e;font-size:0.8em"> + ${:.4} sell losers</span>"#,
+                    sell_losers_revenue,
+                )
+            } else {
+                String::new()
+            };
+
             outcome_html.push_str(&format!(
                 r#"<div class="outcome-row">
-                    <span class="outcome-label">{}</span>
-                    <span class="outcome-ask">{}</span>
-                    <span class="outcome-shares">{} shares</span>
-                    <span class="outcome-cost">${:.4}</span>
-                    <span class="outcome-profit" style="color:{}">${:.4} ({})</span>
-                    {}
+                    <span class="outcome-label">{label}</span>
+                    <span class="outcome-ask">ask {ask}</span>
+                    <span class="outcome-bid">bid {bid}</span>
+                    <span class="outcome-shares">{buy_shares} buy / {sell_shares} sell</span>
+                    <span class="outcome-cost">${buy_cost:.4}</span>
+                    <span class="outcome-profit" style="color:{profit_color}">${combined:.4} ({buy_pct}){sell_detail}</span>
+                    {btn}
                 </div>"#,
-                info.label,
-                ask_str,
-                info.sweepable_shares,
-                info.sweepable_cost,
-                profit_color,
-                info.sweepable_profit,
-                pct,
-                btn,
+                label = info.label,
+                ask = ask_str,
+                bid = bid_str,
+                buy_shares = info.sweepable_shares,
+                sell_shares = info.sellable_shares,
+                buy_cost = info.sweepable_cost,
+                profit_color = profit_color,
+                combined = combined_profit,
+                buy_pct = buy_pct,
+                sell_detail = sell_detail,
+                btn = btn,
             ));
         }
 
@@ -546,7 +599,8 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   .outcomes {{ display: flex; flex-direction: column; gap: 4px; }}
   .outcome-row {{ display: flex; align-items: center; gap: 12px; padding: 4px 8px; background: #0d1117; border-radius: 4px; font-size: 0.85em; flex-wrap: wrap; }}
   .outcome-label {{ min-width: 140px; font-weight: bold; color: #c9d1d9; }}
-  .outcome-ask {{ min-width: 70px; color: #8b949e; }}
+  .outcome-ask {{ min-width: 80px; color: #8b949e; }}
+  .outcome-bid {{ min-width: 80px; color: #8b949e; }}
   .outcome-shares {{ min-width: 120px; color: #8b949e; }}
   .outcome-cost {{ min-width: 100px; color: #8b949e; }}
   .outcome-profit {{ min-width: 140px; }}

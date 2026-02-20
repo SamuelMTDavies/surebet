@@ -62,14 +62,26 @@ pub struct HarvestableMarket {
 }
 
 /// Per-outcome book info.
+///
+/// Buy-side: sweep asks up to `max_buy` — profit comes from buying winner tokens
+/// below $1.00 and redeeming.
+///
+/// Sell-side: hit bids above `min_sell` — revenue from selling loser tokens
+/// obtained via CTF split ($1 USDC → 1 YES + 1 NO).  Every dollar sold
+/// is pure profit since the split is costless (minus negligible gas).
 #[derive(Debug, Clone, Serialize)]
 pub struct OutcomeInfo {
     pub label: String,
     pub token_id: String,
+    // Buy-winner side (asks)
     pub best_ask: Option<Decimal>,
     pub sweepable_shares: Decimal,
     pub sweepable_cost: Decimal,
     pub sweepable_profit: Decimal,
+    // Sell-loser side (bids) — for split+sell strategy
+    pub best_bid: Option<Decimal>,
+    pub sellable_shares: Decimal,
+    pub sellable_revenue: Decimal,
 }
 
 // ─── Gamma API scan ─────────────────────────────────────────────────────────
@@ -224,7 +236,9 @@ pub fn build_outcome_info(
     token_id: &str,
     book: &OrderBook,
     max_buy: Decimal,
+    min_sell: Decimal,
 ) -> OutcomeInfo {
+    // Buy side — sweep asks up to max_buy
     let best_ask = book.asks.best(false).map(|(p, _)| p);
 
     let mut shares = Decimal::ZERO;
@@ -239,6 +253,22 @@ pub fn build_outcome_info(
 
     let profit = shares - cost;
 
+    // Sell side — hit bids at or above min_sell.
+    // These are bids for LOSING tokens.  After a CTF split ($1 → 1 YES + 1 NO)
+    // the losing side can be sold into these bids for pure revenue.
+    let best_bid = book.bids.best(true).map(|(p, _)| p);
+
+    let mut sell_shares = Decimal::ZERO;
+    let mut sell_revenue = Decimal::ZERO;
+    // BTreeMap iterates ascending; bids should be walked top-down
+    for (&price, &size) in book.bids.levels.iter().rev() {
+        if price < min_sell {
+            break;
+        }
+        sell_shares += size;
+        sell_revenue += price * size;
+    }
+
     OutcomeInfo {
         label: label.to_string(),
         token_id: token_id.to_string(),
@@ -246,5 +276,8 @@ pub fn build_outcome_info(
         sweepable_shares: shares,
         sweepable_cost: cost,
         sweepable_profit: profit,
+        best_bid,
+        sellable_shares: sell_shares,
+        sellable_revenue: sell_revenue,
     }
 }
