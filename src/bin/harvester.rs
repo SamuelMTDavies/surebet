@@ -4,11 +4,13 @@
 //! subscribes to the WebSocket book stream and auto-buys any new asks that
 //! appear below the limit price until Ctrl-C.
 //!
+//! Navigation: type 'b' to go back, 'q' to quit at any prompt.
+//!
 //! Usage:
 //!   cargo run --bin harvester              # paper mode (default)
 //!   cargo run --bin harvester -- --live    # live execution
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use std::io::{self, Write};
@@ -32,6 +34,12 @@ struct PlannedOrder {
     shares: Decimal,
     cost: Decimal,
     profit: Decimal,
+}
+
+/// User input result — a selection, go back, or quit.
+enum Selection {
+    Index(usize),
+    Back,
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -61,13 +69,32 @@ async fn main() -> Result<()> {
     let min_sell = Decimal::from_str(&format!("{}", harvester.min_sell_price))
         .unwrap_or_else(|_| Decimal::from_str("0.005").unwrap());
 
+    // Build API client once (live mode)
+    let api = if live_mode {
+        let creds = L2Credentials::from_config(
+            &config.polymarket.api_key,
+            &config.polymarket.api_secret,
+            &config.polymarket.api_passphrase,
+        );
+        match creds {
+            Some(c) => Some(ClobApiClient::new(clob_url.clone(), c)),
+            None => {
+                println!("WARNING: --live but missing credentials, falling back to paper mode");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     println!("=== Stale Order Harvester ===");
     println!(
-        "Mode: {}  |  Buy limit: ${}  |  Window: {}d ahead + 24h past",
-        if live_mode { "LIVE" } else { "PAPER" },
+        "Mode: {}  |  Buy limit: ${}  |  Window: {}d",
+        if api.is_some() { "LIVE" } else { "PAPER" },
         max_buy,
         harvester.end_date_window_days,
     );
+    println!("  Type 'b' to go back, 'q' to quit at any prompt.");
     println!();
 
     // ── Step 1: Scan Gamma API ──────────────────────────────────────────────
@@ -80,228 +107,257 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── Step 2: Display ─────────────────────────────────────────────────────
-
-    display_markets(&markets);
-
-    // ── Step 3: Select market ───────────────────────────────────────────────
-
-    let selected_idx = prompt_market_selection(markets.len())?;
-    let market = &markets[selected_idx];
-
-    println!();
-    println!("Fetching order books for: {}", market.question);
-
     let book_store = Arc::new(OrderBookStore::new());
-    let mut outcome_infos = Vec::new();
 
-    for (i, token_id) in market.clob_token_ids.iter().enumerate() {
-        let label = market.outcomes.get(i).cloned().unwrap_or_else(|| format!("Outcome {}", i));
-        let book = book_store.fetch_rest_book(clob_url, token_id).await;
+    // ── Main loop: market selection → book → winner → execute → repeat ──
 
-        let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, max_buy, min_sell),
-            None => OutcomeInfo {
-                label: label.clone(),
-                token_id: token_id.clone(),
-                best_ask: None,
-                sweepable_shares: Decimal::ZERO,
-                sweepable_cost: Decimal::ZERO,
-                sweepable_profit: Decimal::ZERO,
-                best_bid: None,
-                sellable_shares: Decimal::ZERO,
-                sellable_revenue: Decimal::ZERO,
-            },
+    'market_loop: loop {
+        display_markets(&markets);
+
+        // ── Select market ────────────────────────────────────────────────
+        let selected_idx = match prompt_market_selection(markets.len())? {
+            Selection::Index(i) => i,
+            Selection::Back => {
+                println!("Already at the top level. Type 'q' to quit.");
+                continue;
+            }
         };
-        outcome_infos.push(info);
-    }
+        let market = &markets[selected_idx];
 
-    // Display outcomes with book data — both buy and sell sides
-    println!();
-    println!("Market: \"{}\"", market.question);
-    println!();
-    for (i, info) in outcome_infos.iter().enumerate() {
-        let ask_str = info
-            .best_ask
-            .map(|p| format!("${}", p))
-            .unwrap_or_else(|| "none".to_string());
-        let bid_str = info
-            .best_bid
-            .map(|p| format!("${}", p))
-            .unwrap_or_else(|| "none".to_string());
-        let buy_pct = if info.sweepable_cost > Decimal::ZERO {
-            let pct_val = (info.sweepable_profit / info.sweepable_cost)
-                * Decimal::from(100);
-            format!("{:.2}%", pct_val)
-        } else {
-            "-".to_string()
-        };
+        // ── Fetch book ───────────────────────────────────────────────────
+        'outcome_loop: loop {
+            println!();
+            println!("Fetching order books for: {}", market.question);
 
-        // If this outcome wins, sell-loser revenue = sum of bids on OTHER outcomes
-        let sell_losers_rev: Decimal = outcome_infos
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, o)| o.sellable_revenue)
-            .sum();
-        let combined = info.sweepable_profit + sell_losers_rev;
+            let mut outcome_infos = Vec::new();
+            for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+                let label = market.outcomes.get(i).cloned().unwrap_or_else(|| format!("Outcome {}", i));
+                let book = book_store.fetch_rest_book(clob_url, token_id).await;
 
-        println!(
-            "  [{}] {:<20} ask: {:<8} bid: {:<8}",
-            i, info.label, ask_str, bid_str,
-        );
-        println!(
-            "      BUY:  {} shares ≤${} | cost ${:.4} → profit ${:.4} ({})",
-            info.sweepable_shares, max_buy, info.sweepable_cost, info.sweepable_profit, buy_pct,
-        );
-        if sell_losers_rev > Decimal::ZERO {
+                let info = match book {
+                    Some(ref b) => build_outcome_info(&label, token_id, b, max_buy, min_sell),
+                    None => OutcomeInfo {
+                        label: label.clone(),
+                        token_id: token_id.clone(),
+                        best_ask: None,
+                        sweepable_shares: Decimal::ZERO,
+                        sweepable_cost: Decimal::ZERO,
+                        sweepable_profit: Decimal::ZERO,
+                        best_bid: None,
+                        sellable_shares: Decimal::ZERO,
+                        sellable_revenue: Decimal::ZERO,
+                    },
+                };
+                outcome_infos.push(info);
+            }
+
+            // Display outcomes
+            println!();
+            println!("Market: \"{}\"", market.question);
+            println!();
+            for (i, info) in outcome_infos.iter().enumerate() {
+                let ask_str = info
+                    .best_ask
+                    .map(|p| format!("${}", p))
+                    .unwrap_or_else(|| "none".to_string());
+                let bid_str = info
+                    .best_bid
+                    .map(|p| format!("${}", p))
+                    .unwrap_or_else(|| "none".to_string());
+                let buy_pct = if info.sweepable_cost > Decimal::ZERO {
+                    let pct_val = (info.sweepable_profit / info.sweepable_cost)
+                        * Decimal::from(100);
+                    format!("{:.2}%", pct_val)
+                } else {
+                    "-".to_string()
+                };
+
+                let sell_losers_rev: Decimal = outcome_infos
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, o)| o.sellable_revenue)
+                    .sum();
+                let combined = info.sweepable_profit + sell_losers_rev;
+
+                println!(
+                    "  [{}] {:<20} ask: {:<8} bid: {:<8}",
+                    i, info.label, ask_str, bid_str,
+                );
+                println!(
+                    "      BUY:  {} shares ≤${} | cost ${:.4} → profit ${:.4} ({})",
+                    info.sweepable_shares, max_buy, info.sweepable_cost, info.sweepable_profit, buy_pct,
+                );
+                if sell_losers_rev > Decimal::ZERO {
+                    println!(
+                        "      SELL: split+sell losers → ${:.4} revenue",
+                        sell_losers_rev,
+                    );
+                    println!(
+                        "      COMBINED: ${:.4}",
+                        combined,
+                    );
+                }
+                println!();
+            }
+
+            // ── Select winner ────────────────────────────────────────────
+            let winner_idx = match prompt_winner_selection(outcome_infos.len())? {
+                Selection::Index(i) => i,
+                Selection::Back => continue 'market_loop,
+            };
+
+            let winner = &outcome_infos[winner_idx];
+
+            let sell_losers_revenue: Decimal = outcome_infos
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != winner_idx)
+                .map(|(_, o)| o.sellable_revenue)
+                .sum();
+
+            if winner.sweepable_shares == Decimal::ZERO && sell_losers_revenue == Decimal::ZERO {
+                println!("\nNo opportunity for \"{}\" — no asks to buy, no loser bids to sell into.", winner.label);
+                println!("Press enter to go back to outcomes, or 'b' for market list.");
+                let mut buf = String::new();
+                io::stdin().read_line(&mut buf)?;
+                if buf.trim().eq_ignore_ascii_case("b") {
+                    continue 'market_loop;
+                }
+                continue 'outcome_loop;
+            }
+
+            let order = PlannedOrder {
+                token_id: winner.token_id.clone(),
+                label: winner.label.clone(),
+                price: max_buy,
+                shares: winner.sweepable_shares,
+                cost: winner.sweepable_cost,
+                profit: winner.sweepable_profit,
+            };
+
+            let combined_profit = order.profit + sell_losers_revenue;
+            let pct = if order.cost > Decimal::ZERO {
+                let v = (order.profit / order.cost) * Decimal::from(100);
+                format!("{:.2}%", v)
+            } else {
+                "-".to_string()
+            };
+
+            println!();
+            println!("=== Execution Plan ===");
             println!(
-                "      SELL: split+sell losers → ${:.4} revenue",
-                sell_losers_rev,
+                "  BUY \"{}\"  {} shares @ limit ${}  |  cost ${}  |  profit ${} ({})",
+                order.label, order.shares, order.price, order.cost, order.profit, pct,
             );
+            if sell_losers_revenue > Decimal::ZERO {
+                println!(
+                    "  SELL losers (split+sell)  |  revenue ${}",
+                    sell_losers_revenue,
+                );
+                println!(
+                    "  COMBINED PROFIT: ${}",
+                    combined_profit,
+                );
+            }
             println!(
-                "      COMBINED: ${:.4}",
-                combined,
+                "  Mode: {}",
+                if api.is_some() {
+                    "LIVE — order WILL be placed"
+                } else {
+                    "PAPER (use --live for real execution)"
+                }
             );
-        }
-        println!();
-    }
 
-    // ── Step 4: Select winner ───────────────────────────────────────────────
+            // ── Confirm ──────────────────────────────────────────────────
+            print!("\nProceed? [y/N/b]: ");
+            io::stdout().flush()?;
+            let mut confirm = String::new();
+            io::stdin().read_line(&mut confirm)?;
+            let trimmed = confirm.trim();
+            if trimmed.eq_ignore_ascii_case("b") {
+                continue 'outcome_loop;
+            }
+            if !trimmed.eq_ignore_ascii_case("y") {
+                println!("Skipped.");
+                continue 'outcome_loop;
+            }
 
-    let winner_idx = prompt_winner_selection(outcome_infos.len())?;
+            // ── Execute ──────────────────────────────────────────────────
 
-    // ── Step 5: Plan orders ─────────────────────────────────────────────────
+            if let Some(ref api) = api {
+                println!();
+                println!("Placing initial sweep order...");
 
-    let winner = &outcome_infos[winner_idx];
+                let resp = api
+                    .place_order(
+                        &order.token_id,
+                        &order.price.to_string(),
+                        &order.shares.to_string(),
+                        OrderSide::Buy,
+                    )
+                    .await;
 
-    // Sell-loser revenue from OTHER outcomes (split+sell strategy)
-    let sell_losers_revenue: Decimal = outcome_infos
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| *j != winner_idx)
-        .map(|(_, o)| o.sellable_revenue)
-        .sum();
+                match resp {
+                    Ok(r) if r.success => {
+                        println!(
+                            "  OK  BUY \"{}\" — order_id: {}, status: {}",
+                            order.label, r.order_id, r.status,
+                        );
+                    }
+                    Ok(r) => {
+                        println!("  FAIL BUY \"{}\" — error: {}", order.label, r.error_msg);
+                    }
+                    Err(e) => {
+                        println!("  ERR  BUY \"{}\" — {}", order.label, e);
+                    }
+                }
+            } else {
+                println!();
+                println!("Paper mode — no order placed.");
+            }
 
-    if winner.sweepable_shares == Decimal::ZERO && sell_losers_revenue == Decimal::ZERO {
-        println!("\nNo opportunity for \"{}\" — no asks to buy, no loser bids to sell into.", winner.label);
-        return Ok(());
-    }
+            // ── Post-trade menu ──────────────────────────────────────────
+            println!();
+            println!("Trade done. What next?");
+            println!("  [h] Enter hoover mode for \"{}\"", order.label);
+            println!("  [b] Back to market list");
+            println!("  [r] Re-fetch this market's book");
+            println!("  [q] Quit");
+            print!("> ");
+            io::stdout().flush()?;
 
-    let order = PlannedOrder {
-        token_id: winner.token_id.clone(),
-        label: winner.label.clone(),
-        price: max_buy,
-        shares: winner.sweepable_shares,
-        cost: winner.sweepable_cost,
-        profit: winner.sweepable_profit,
-    };
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice)?;
+            match choice.trim().to_lowercase().as_str() {
+                "h" => {
+                    println!();
+                    println!("=== Hoover Mode ===");
+                    println!("Monitoring book for new asks on \"{}\" ≤ ${}", order.label, max_buy);
+                    println!("Press Ctrl-C to stop and return to market list.");
+                    println!();
 
-    let combined_profit = order.profit + sell_losers_revenue;
-    let pct = if order.cost > Decimal::ZERO {
-        let v = (order.profit / order.cost) * Decimal::from(100);
-        format!("{:.2}%", v)
-    } else {
-        "-".to_string()
-    };
+                    hoover_loop(&book_store, &order.token_id, &order.label, max_buy, api.as_ref()).await?;
 
-    println!();
-    println!("=== Execution Plan ===");
-    println!(
-        "  BUY \"{}\"  {} shares @ limit ${}  |  cost ${}  |  profit ${} ({})",
-        order.label, order.shares, order.price, order.cost, order.profit, pct,
-    );
-    if sell_losers_revenue > Decimal::ZERO {
-        println!(
-            "  SELL losers (split+sell)  |  revenue ${}",
-            sell_losers_revenue,
-        );
-        println!(
-            "  COMBINED PROFIT: ${}",
-            combined_profit,
-        );
-    }
-    println!(
-        "  Mode: {}",
-        if live_mode {
-            "LIVE — order WILL be placed"
-        } else {
-            "PAPER (use --live for real execution)"
-        }
-    );
-
-    // Confirm
-    print!("\nProceed? [y/N]: ");
-    io::stdout().flush()?;
-    let mut confirm = String::new();
-    io::stdin().read_line(&mut confirm)?;
-    if !confirm.trim().eq_ignore_ascii_case("y") {
-        println!("Aborted.");
-        return Ok(());
-    }
-
-    // ── Step 6: Execute ─────────────────────────────────────────────────────
-
-    if !live_mode {
-        println!();
-        println!("Paper mode — no orders placed. Run with --live to execute.");
-        println!();
-        println!("=== Hoover Mode (paper) ===");
-        println!("Monitoring book for new asks on \"{}\" ≤ ${}", order.label, max_buy);
-        println!("Press Ctrl-C to stop.");
-        println!();
-
-        hoover_loop(&book_store, &order.token_id, &order.label, max_buy, None).await?;
-        return Ok(());
-    }
-
-    let creds = L2Credentials::from_config(
-        &config.polymarket.api_key,
-        &config.polymarket.api_secret,
-        &config.polymarket.api_passphrase,
-    );
-    let creds = match creds {
-        Some(c) => c,
-        None => bail!("Missing POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE for live mode"),
-    };
-    let api = ClobApiClient::new(clob_url.clone(), creds);
-
-    println!();
-    println!("Placing initial sweep order...");
-
-    let resp = api
-        .place_order(
-            &order.token_id,
-            &order.price.to_string(),
-            &order.shares.to_string(),
-            OrderSide::Buy,
-        )
-        .await;
-
-    match resp {
-        Ok(r) if r.success => {
-            println!(
-                "  OK  BUY \"{}\" — order_id: {}, status: {}",
-                order.label, r.order_id, r.status,
-            );
-        }
-        Ok(r) => {
-            println!("  FAIL BUY \"{}\" — error: {}", order.label, r.error_msg);
-        }
-        Err(e) => {
-            println!("  ERR  BUY \"{}\" — {}", order.label, e);
+                    println!();
+                    println!("Returning to market list...");
+                    continue 'market_loop;
+                }
+                "r" => {
+                    // Re-fetch book and show outcomes again
+                    continue 'outcome_loop;
+                }
+                "q" => {
+                    println!("Goodbye.");
+                    return Ok(());
+                }
+                _ => {
+                    // Default: back to market list
+                    continue 'market_loop;
+                }
+            }
         }
     }
-
-    println!();
-    println!("=== Hoover Mode (live) ===");
-    println!("Monitoring book for new asks on \"{}\" ≤ ${}", order.label, max_buy);
-    println!("Press Ctrl-C to stop.");
-    println!();
-
-    hoover_loop(&book_store, &order.token_id, &order.label, max_buy, Some(&api)).await?;
-
-    Ok(())
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -354,9 +410,9 @@ fn display_markets(markets: &[surebet::harvester::HarvestableMarket]) {
 
 // ─── Prompts ────────────────────────────────────────────────────────────────
 
-fn prompt_market_selection(count: usize) -> Result<usize> {
+fn prompt_market_selection(count: usize) -> Result<Selection> {
     loop {
-        print!("Enter market number (1-{}) or 'q' to quit: ", count);
+        print!("Enter market number (1-{}), 'b' back, 'q' quit: ", count);
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
@@ -365,27 +421,37 @@ fn prompt_market_selection(count: usize) -> Result<usize> {
         if trimmed.eq_ignore_ascii_case("q") {
             std::process::exit(0);
         }
+        if trimmed.eq_ignore_ascii_case("b") {
+            return Ok(Selection::Back);
+        }
 
         if let Ok(n) = trimmed.parse::<usize>() {
             if n >= 1 && n <= count {
-                return Ok(n - 1);
+                return Ok(Selection::Index(n - 1));
             }
         }
         println!("Invalid selection. Try again.");
     }
 }
 
-fn prompt_winner_selection(count: usize) -> Result<usize> {
+fn prompt_winner_selection(count: usize) -> Result<Selection> {
     loop {
-        print!("Select winning outcome number (0-{}): ", count - 1);
+        print!("Select winning outcome (0-{}), 'b' back: ", count - 1);
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         let trimmed = input.trim();
 
+        if trimmed.eq_ignore_ascii_case("q") {
+            std::process::exit(0);
+        }
+        if trimmed.eq_ignore_ascii_case("b") {
+            return Ok(Selection::Back);
+        }
+
         if let Ok(n) = trimmed.parse::<usize>() {
             if n < count {
-                return Ok(n);
+                return Ok(Selection::Index(n));
             }
         }
         println!("Invalid selection. Try again.");
