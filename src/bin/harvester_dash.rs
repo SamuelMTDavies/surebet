@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -146,25 +146,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Sort: soonest end date first. Markets whose end date is >24h past
-    // are pushed to the bottom (likely postponed/delayed, not resolved).
-    // Markets within 24h of their end date (either side) are treated as "live"
-    // since end dates in UTC can be misleading for events in other time zones.
-    let now = Utc::now();
-    let stale_cutoff = now - Duration::hours(24);
-    markets_with_books.sort_by(|a, b| {
-        let a_dt = a.market.end_date.unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
-        let b_dt = b.market.end_date.unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
-        let a_stale = a_dt < stale_cutoff;
-        let b_stale = b_dt < stale_cutoff;
-        // Only push to bottom if >24h past (truly stale/postponed)
-        match (a_stale, b_stale) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => a_dt.cmp(&b_dt), // soonest first
-        }
-    });
-
+    // Markets are already sorted by scan_markets() — soonest end date first,
+    // >24h-past pushed to bottom.  No need to re-sort here.
     println!("  Books fetched for {} markets (soonest end date first).", markets_with_books.len());
 
     // ── Step 3: Build API client ────────────────────────────────────────────
@@ -490,7 +473,10 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             m.question.clone()
         };
 
-        let poly_url = format!("https://polymarket.com/event/{}", m.condition_id);
+        let poly_url = match &m.slug {
+            Some(slug) => format!("https://polymarket.com/event/{}", slug),
+            None => format!("https://polymarket.com/event/{}", m.condition_id),
+        };
 
         market_rows.push_str(&format!(
             r#"<div class="market-card">

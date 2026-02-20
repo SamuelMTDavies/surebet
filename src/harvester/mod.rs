@@ -43,6 +43,8 @@ pub struct GammaMarket {
     pub neg_risk: Option<bool>,
     #[serde(default)]
     pub category: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Parsed market ready for display.
@@ -56,6 +58,7 @@ pub struct HarvestableMarket {
     pub end_date: Option<DateTime<Utc>>,
     pub is_neg_risk: bool,
     pub category: String,
+    pub slug: Option<String>,
 }
 
 /// Per-outcome book info.
@@ -185,13 +188,23 @@ pub async fn scan_markets(
             end_date,
             is_neg_risk: raw.neg_risk.unwrap_or(false),
             category: raw.category.clone().unwrap_or_default(),
+            slug: raw.slug.clone(),
         });
     }
 
+    // Sort: soonest end date first, >24h-past markets pushed to the bottom
+    // (likely postponed or delayed resolution, not useful for harvesting).
+    let stale_cutoff = Utc::now() - Duration::hours(24);
     results.sort_by(|a, b| {
         let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
         let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        a_dt.cmp(&b_dt)
+        let a_stale = a_dt < stale_cutoff;
+        let b_stale = b_dt < stale_cutoff;
+        match (a_stale, b_stale) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => a_dt.cmp(&b_dt),
+        }
     });
 
     results.truncate(max_display);
