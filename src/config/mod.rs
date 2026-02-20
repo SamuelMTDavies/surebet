@@ -233,6 +233,9 @@ pub struct HarvesterConfig {
     /// Maximum number of markets to display in the list.
     #[serde(default = "default_harvester_max_display")]
     pub max_display: usize,
+    /// Bind address for the harvester dashboard (harvester_dash binary).
+    #[serde(default)]
+    pub dash_bind: Option<String>,
 }
 
 // --- Default functions ---
@@ -469,6 +472,7 @@ impl Default for HarvesterConfig {
             min_sell_price: default_harvester_min_sell(),
             end_date_window_days: default_harvester_end_date_window(),
             max_display: default_harvester_max_display(),
+            dash_bind: None,
         }
     }
 }

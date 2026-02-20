@@ -8,8 +8,8 @@
 //!   cargo run --bin harvester              # paper mode (default)
 //!   cargo run --bin harvester -- --live    # live execution
 
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use anyhow::{bail, Result};
+use chrono::Utc;
 use rust_decimal::Decimal;
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -18,102 +18,35 @@ use tokio::sync::mpsc;
 
 use surebet::auth::{ClobApiClient, L2Credentials, OrderSide};
 use surebet::config::Config;
-use surebet::orderbook::{OrderBook, OrderBookStore};
+use surebet::harvester::{build_outcome_info, scan_markets, OutcomeInfo};
+use surebet::orderbook::OrderBookStore;
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
-// ─── Gamma API response type ────────────────────────────────────────────────
+// ─── CLI-only types ──────────────────────────────────────────────────────────
 
-/// Market from the Gamma API with all harvester-relevant fields.
-/// Queried via reqwest (not SDK) to access fields like `fees_enabled`.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GammaMarket {
-    #[serde(default)]
-    id: serde_json::Value,
-    #[serde(default)]
-    condition_id: Option<String>,
-    #[serde(default)]
-    question: Option<String>,
-    #[serde(default)]
-    outcomes: Option<String>,
-    #[serde(default)]
-    clob_token_ids: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    end_date_iso: Option<String>,
-    /// Full ISO 8601 / RFC3339 end date (e.g. "2026-02-22T12:00:00Z")
-    #[serde(default)]
-    end_date: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    active: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    closed: Option<bool>,
-    #[serde(default)]
-    accepting_orders: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    fees_enabled: Option<bool>,
-    #[serde(default)]
-    neg_risk: Option<bool>,
-    #[serde(default)]
-    category: Option<String>,
-}
-
-/// Parsed market ready for display.
-#[derive(Debug, Clone)]
-struct HarvestableMarket {
-    #[allow(dead_code)]
-    market_id: String,
-    #[allow(dead_code)]
-    condition_id: String,
-    question: String,
-    outcomes: Vec<String>,
-    clob_token_ids: Vec<String>,
-    end_date: Option<DateTime<Utc>>,
-    is_neg_risk: bool,
-    category: String,
-}
-
-/// Per-outcome book info after fetching.
-#[derive(Debug, Clone)]
-struct OutcomeInfo {
-    label: String,
-    token_id: String,
-    best_ask: Option<Decimal>,
-    sweepable_shares: Decimal, // total size available at asks <= max_buy_price
-    sweepable_cost: Decimal,   // total cost to buy those asks
-    sweepable_profit: Decimal, // shares - cost (each share pays $1 on resolution)
-}
-
-/// A planned BUY order for the winning outcome.
 #[derive(Debug)]
 struct PlannedOrder {
     token_id: String,
     label: String,
-    price: Decimal,  // limit price
-    shares: Decimal, // total shares to buy
-    cost: Decimal,   // total cost
-    profit: Decimal, // estimated profit (shares - cost, no fees)
+    price: Decimal,
+    shares: Decimal,
+    cost: Decimal,
+    profit: Decimal,
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install rustls crypto provider (required before any TLS)
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    // Load .env if available
     let _ = dotenvy::dotenv();
 
     let args: Vec<String> = std::env::args().collect();
     let live_mode = args.iter().any(|a| a == "--live");
 
-    // Load config
     let config = match Config::load(std::path::Path::new("surebet.toml")) {
         Ok(c) => c,
         Err(_) => Config::from_env(),
@@ -137,11 +70,11 @@ async fn main() -> Result<()> {
 
     // ── Step 1: Scan Gamma API ──────────────────────────────────────────────
 
-    println!("Scanning Gamma API for fee-free markets near end date...");
+    println!("Scanning Gamma API for markets near end date...");
     let markets = scan_markets(gamma_url, harvester.end_date_window_days, harvester.max_display).await?;
 
     if markets.is_empty() {
-        println!("No fee-free markets found matching criteria.");
+        println!("No markets found matching criteria.");
         return Ok(());
     }
 
@@ -157,7 +90,6 @@ async fn main() -> Result<()> {
     println!();
     println!("Fetching order books for: {}", market.question);
 
-    // Fetch books only for selected market
     let book_store = Arc::new(OrderBookStore::new());
     let mut outcome_infos = Vec::new();
 
@@ -275,7 +207,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Live mode: need credentials
     let creds = L2Credentials::from_config(
         &config.polymarket.api_key,
         &config.polymarket.api_secret,
@@ -325,155 +256,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ─── Gamma API scan ─────────────────────────────────────────────────────────
-
-async fn scan_markets(
-    gamma_url: &str,
-    end_date_window_days: i64,
-    max_display: usize,
-) -> Result<Vec<HarvestableMarket>> {
-    let http = reqwest::Client::new();
-    let now = Utc::now();
-
-    // Use server-side end_date_min/max filters to avoid fetching 5000+ markets.
-    // The Gamma API supports these as date strings (YYYY-MM-DD).
-    let date_min = (now - Duration::hours(24)).format("%Y-%m-%d").to_string();
-    // Add +1 day buffer so "2 days" includes full calendar days
-    let date_max = (now + Duration::days(end_date_window_days + 1))
-        .format("%Y-%m-%d")
-        .to_string();
-
-    let mut all_raw: Vec<GammaMarket> = Vec::new();
-    let mut offset = 0usize;
-    let limit = 100;
-
-    loop {
-        let url = format!(
-            "{}/markets?active=true&closed=false&end_date_min={}&end_date_max={}&limit={}&offset={}",
-            gamma_url, date_min, date_max, limit, offset,
-        );
-        let resp = http
-            .get(&url)
-            .send()
-            .await
-            .context("Gamma API request failed")?;
-
-        if !resp.status().is_success() {
-            bail!(
-                "Gamma API returned status {} at offset {}",
-                resp.status(),
-                offset
-            );
-        }
-
-        let page: Vec<GammaMarket> = resp.json().await.context("Failed to parse Gamma response")?;
-        let count = page.len();
-        if count == 0 {
-            break;
-        }
-        all_raw.extend(page);
-        offset += count;
-
-        // Safety limit
-        if offset > 2000 {
-            break;
-        }
-    }
-
-    let pages = if offset == 0 { 0 } else { (offset + limit - 1) / limit };
-    println!(
-        "  Fetched {} markets ending {} → {} ({} pages)",
-        all_raw.len(),
-        date_min,
-        date_max,
-        pages,
-    );
-
-    let mut results: Vec<HarvestableMarket> = Vec::new();
-
-    for raw in &all_raw {
-        // Must be accepting orders
-        if raw.accepting_orders != Some(true) {
-            continue;
-        }
-
-        // Must have condition_id and clob_token_ids
-        let condition_id = match &raw.condition_id {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => continue,
-        };
-
-        let token_ids_str = match &raw.clob_token_ids {
-            Some(s) if !s.is_empty() && s != "[]" => s.clone(),
-            _ => continue,
-        };
-
-        // Parse clob_token_ids (JSON-encoded string array)
-        let clob_token_ids: Vec<String> = match serde_json::from_str(&token_ids_str) {
-            Ok(ids) => ids,
-            Err(_) => continue,
-        };
-        if clob_token_ids.is_empty() {
-            continue;
-        }
-
-        // Parse outcomes
-        let outcomes: Vec<String> = raw
-            .outcomes
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        if outcomes.is_empty() {
-            continue;
-        }
-
-        // Parse full RFC3339 endDate for display/sorting
-        let end_date = raw
-            .end_date
-            .as_ref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
-
-        let question = raw.question.clone().unwrap_or_else(|| "???".to_string());
-        let market_id = match &raw.id {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            _ => "?".to_string(),
-        };
-
-        results.push(HarvestableMarket {
-            market_id,
-            condition_id,
-            question,
-            outcomes,
-            clob_token_ids,
-            end_date,
-            is_neg_risk: raw.neg_risk.unwrap_or(false),
-            category: raw.category.clone().unwrap_or_default(),
-        });
-    }
-
-    // Sort by end_date ascending (past/soonest first)
-    results.sort_by(|a, b| {
-        let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        a_dt.cmp(&b_dt)
-    });
-
-    // Cap display count
-    results.truncate(max_display);
-
-    println!(
-        "  After filtering: {} fee-free markets within end-date window",
-        results.len()
-    );
-
-    Ok(results)
-}
-
 // ─── Display ────────────────────────────────────────────────────────────────
 
-fn display_markets(markets: &[HarvestableMarket]) {
+fn display_markets(markets: &[surebet::harvester::HarvestableMarket]) {
     let now = Utc::now();
     println!();
     println!(
@@ -535,7 +320,7 @@ fn prompt_market_selection(count: usize) -> Result<usize> {
 
         if let Ok(n) = trimmed.parse::<usize>() {
             if n >= 1 && n <= count {
-                return Ok(n - 1); // 0-indexed
+                return Ok(n - 1);
             }
         }
         println!("Invalid selection. Try again.");
@@ -559,52 +344,8 @@ fn prompt_winner_selection(count: usize) -> Result<usize> {
     }
 }
 
-// ─── Book analysis ──────────────────────────────────────────────────────────
-
-fn build_outcome_info(
-    label: &str,
-    token_id: &str,
-    book: &OrderBook,
-    max_buy: Decimal,
-) -> OutcomeInfo {
-    let best_ask = book.asks.best(false).map(|(p, _)| p);
-
-    // Walk asks ascending — how many shares can we sweep at <= max_buy?
-    let mut shares = Decimal::ZERO;
-    let mut cost = Decimal::ZERO;
-    for (&price, &size) in book.asks.levels.iter() {
-        if price > max_buy {
-            break;
-        }
-        shares += size;
-        cost += price * size;
-    }
-
-    // Each share pays $1 on resolution, profit = shares - cost (no fees)
-    let profit = shares - cost;
-
-    OutcomeInfo {
-        label: label.to_string(),
-        token_id: token_id.to_string(),
-        best_ask,
-        sweepable_shares: shares,
-        sweepable_cost: cost,
-        sweepable_profit: profit,
-    }
-}
-
 // ─── Hoover Mode ─────────────────────────────────────────────────────────────
 
-/// Subscribe to the winning token's book via WebSocket and auto-buy any new
-/// asks that appear at or below `max_buy`.  Runs until Ctrl-C.
-///
-/// Logic: the WS book snapshots reflect the true state of the book. After our
-/// order fills, those asks disappear.  So on each update we simply check: are
-/// there asks ≤ max_buy?  If yes, and we don't have a pending order already
-/// covering them, fire a new buy.  We debounce by tracking the sweepable
-/// depth we last ordered against — only re-fire when it increases.
-///
-/// If `api` is None, runs in paper mode (logs but doesn't place orders).
 async fn hoover_loop(
     book_store: &Arc<OrderBookStore>,
     token_id: &str,
@@ -613,9 +354,8 @@ async fn hoover_loop(
     api: Option<&ClobApiClient>,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ClobEvent>();
-    let min_order = Decimal::from(5); // Polymarket minimum 5 USDC
+    let min_order = Decimal::from(5);
 
-    // Subscribe to the winning token's book stream
     start_clob_ws(
         (**book_store).clone(),
         event_tx,
@@ -626,9 +366,6 @@ async fn hoover_loop(
     let mut total_hoovered_shares = Decimal::ZERO;
     let mut total_hoovered_cost = Decimal::ZERO;
     let mode = if api.is_some() { "LIVE" } else { "PAPER" };
-
-    // Track the sweepable depth we last fired an order for.
-    // Only re-fire when current sweepable exceeds this (new liquidity appeared).
     let mut last_ordered_depth = Decimal::ZERO;
 
     loop {
@@ -640,13 +377,11 @@ async fn hoover_loop(
                             continue;
                         }
 
-                        // Read updated book from store
                         let book = match book_store.get_book(&asset_id) {
                             Some(b) => b,
                             None => continue,
                         };
 
-                        // Walk asks up to max_buy — this is the CURRENT truth
                         let mut sweepable_shares = Decimal::ZERO;
                         let mut sweepable_cost = Decimal::ZERO;
                         for (&price, &size) in book.asks.levels.iter() {
@@ -657,17 +392,13 @@ async fn hoover_loop(
                             sweepable_cost += price * size;
                         }
 
-                        // Nothing to buy or below minimum
                         if sweepable_shares <= Decimal::ZERO || sweepable_cost < min_order {
-                            // Book may have shrunk (our fill, or someone else took it)
-                            // Reset tracking so we detect future adds
                             if sweepable_shares < last_ordered_depth {
                                 last_ordered_depth = sweepable_shares;
                             }
                             continue;
                         }
 
-                        // Only fire if new liquidity since our last order
                         if sweepable_shares <= last_ordered_depth {
                             continue;
                         }
@@ -685,8 +416,6 @@ async fn hoover_loop(
                             now, sweepable_shares, max_buy, sweepable_cost, profit, pct,
                         );
 
-                        // Place order for the full sweepable amount at our limit price.
-                        // The CLOB will fill against resting asks up to our limit.
                         if let Some(api) = api {
                             let resp = api
                                 .place_order(
@@ -732,7 +461,7 @@ async fn hoover_loop(
                     Some(ClobEvent::Disconnected) => {
                         println!("[ws] Disconnected — will attempt reconnect...");
                     }
-                    Some(_) => { /* PriceChange / LastTradePrice — ignore */ }
+                    Some(_) => {}
                     None => {
                         println!("[ws] Event channel closed.");
                         break;
@@ -759,4 +488,3 @@ async fn hoover_loop(
 
     Ok(())
 }
-

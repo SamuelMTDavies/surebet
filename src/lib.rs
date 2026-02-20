@@ -5,5 +5,6 @@
 
 pub mod auth;
 pub mod config;
+pub mod harvester;
 pub mod orderbook;
 pub mod ws;

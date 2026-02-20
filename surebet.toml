@@ -125,6 +125,8 @@ min_sell_price = 0.001
 end_date_window_days = 2
 # Maximum number of markets to display
 max_display = 50
+# Dashboard bind address (harvester_dash binary)
+dash_bind = "127.0.0.1:3031"
 
 [logging]
 level = "info"

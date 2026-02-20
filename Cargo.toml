@@ -70,3 +70,7 @@ path = "src/bin/event_chronology.rs"
 [[bin]]
 name = "harvester"
 path = "src/bin/harvester.rs"
+
+[[bin]]
+name = "harvester_dash"
+path = "src/bin/harvester_dash.rs"
