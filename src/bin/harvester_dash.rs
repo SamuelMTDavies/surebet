@@ -1,12 +1,13 @@
-//! Harvester Web Dashboard — shows markets near end date with live order book
-//! data.  Select a winning outcome to execute a buy + enter hoover mode.
+//! Harvester Web Dashboard — shows markets near end date.  Click a market
+//! to fetch its order book on demand, then select a winning outcome to
+//! execute a buy + enter hoover mode.
 //!
 //! Usage:
 //!   cargo run --bin harvester_dash              # paper mode
 //!   cargo run --bin harvester_dash -- --live    # live execution
 
 use anyhow::{bail, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
@@ -29,20 +30,14 @@ use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
 #[derive(Clone)]
 struct AppState {
-    markets: Arc<RwLock<Vec<MarketWithBook>>>,
+    markets: Arc<RwLock<Vec<HarvestableMarket>>>,
     book_store: Arc<OrderBookStore>,
+    clob_url: String,
     api: Option<Arc<ClobApiClient>>,
     activity: Arc<RwLock<Vec<ActivityEntry>>>,
     max_buy: Decimal,
-    #[allow(dead_code)]
     min_sell: Decimal,
     live_mode: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MarketWithBook {
-    market: HarvestableMarket,
-    outcomes: Vec<OutcomeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +57,11 @@ struct HarvestRequest {
     token_id: String,
     label: String,
     market_question: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BookQuery {
+    idx: usize,
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -109,55 +109,21 @@ async fn main() -> Result<()> {
         harvester.end_date_window_days,
     );
 
-    // ── Step 1: Scan markets ────────────────────────────────────────────────
+    // ── Step 1: Scan markets (no book fetching) ──────────────────────────
 
     println!("Scanning Gamma API...");
-    let markets = scan_markets(gamma_url, harvester.end_date_window_days, harvester.max_display).await?;
+    // Dashboard shows ALL markets — no truncation.  Books fetched on demand.
+    let markets = scan_markets(gamma_url, harvester.end_date_window_days, usize::MAX).await?;
 
     if markets.is_empty() {
         bail!("No markets found matching criteria.");
     }
 
-    // ── Step 2: Fetch books for all markets ─────────────────────────────────
+    println!("  {} markets loaded (books fetched on demand)", markets.len());
+
+    // ── Step 2: Build API client ─────────────────────────────────────────
 
     let book_store = Arc::new(OrderBookStore::new());
-
-    println!("Fetching order books for {} markets...", markets.len());
-    let mut markets_with_books = Vec::new();
-
-    for market in &markets {
-        let mut outcomes = Vec::new();
-        for (i, token_id) in market.clob_token_ids.iter().enumerate() {
-            let label = market.outcomes.get(i).cloned().unwrap_or_else(|| format!("Outcome {}", i));
-            let book = book_store.fetch_rest_book(&clob_url, token_id).await;
-
-            let info = match book {
-                Some(ref b) => build_outcome_info(&label, token_id, b, max_buy, min_sell),
-                None => OutcomeInfo {
-                    label: label.clone(),
-                    token_id: token_id.clone(),
-                    best_ask: None,
-                    sweepable_shares: Decimal::ZERO,
-                    sweepable_cost: Decimal::ZERO,
-                    sweepable_profit: Decimal::ZERO,
-                    best_bid: None,
-                    sellable_shares: Decimal::ZERO,
-                    sellable_revenue: Decimal::ZERO,
-                },
-            };
-            outcomes.push(info);
-        }
-        markets_with_books.push(MarketWithBook {
-            market: market.clone(),
-            outcomes,
-        });
-    }
-
-    // Markets are already sorted by scan_markets() — soonest end date first,
-    // >24h-past pushed to bottom.  No need to re-sort here.
-    println!("  Books fetched for {} markets (soonest end date first).", markets_with_books.len());
-
-    // ── Step 3: Build API client ────────────────────────────────────────────
 
     let api = if live_mode {
         let creds = L2Credentials::from_config(
@@ -176,11 +142,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ── Step 4: Serve dashboard ─────────────────────────────────────────────
+    // ── Step 3: Serve dashboard ──────────────────────────────────────────
 
     let state = AppState {
-        markets: Arc::new(RwLock::new(markets_with_books)),
+        markets: Arc::new(RwLock::new(markets)),
         book_store,
+        clob_url,
         api,
         activity: Arc::new(RwLock::new(Vec::new())),
         max_buy,
@@ -191,6 +158,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(dashboard_html))
         .route("/api/markets", get(api_markets))
+        .route("/api/book", get(api_book))
         .route("/api/harvest", post(api_harvest))
         .route("/api/activity", get(api_activity))
         .with_state(state);
@@ -214,30 +182,84 @@ async fn api_activity(State(state): State<AppState>) -> impl IntoResponse {
     Json(activity.clone())
 }
 
+/// Fetch order book on demand for a specific market index.
+async fn api_book(
+    State(state): State<AppState>,
+    Query(q): Query<BookQuery>,
+) -> impl IntoResponse {
+    let markets = state.markets.read().await;
+    let market = match markets.get(q.idx) {
+        Some(m) => m.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid market index"})),
+            )
+                .into_response();
+        }
+    };
+    drop(markets);
+
+    let mut outcomes: Vec<OutcomeInfo> = Vec::new();
+    for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+        let label = market
+            .outcomes
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Outcome {}", i));
+        let book = state.book_store.fetch_rest_book(&state.clob_url, token_id).await;
+
+        let info = match book {
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            None => OutcomeInfo {
+                label: label.clone(),
+                token_id: token_id.clone(),
+                best_ask: None,
+                sweepable_shares: Decimal::ZERO,
+                sweepable_cost: Decimal::ZERO,
+                sweepable_profit: Decimal::ZERO,
+                best_bid: None,
+                sellable_shares: Decimal::ZERO,
+                sellable_revenue: Decimal::ZERO,
+            },
+        };
+        outcomes.push(info);
+    }
+
+    Json(serde_json::json!({
+        "idx": q.idx,
+        "question": market.question,
+        "outcomes": outcomes,
+    }))
+    .into_response()
+}
+
 async fn api_harvest(
     State(state): State<AppState>,
     Json(req): Json<HarvestRequest>,
 ) -> impl IntoResponse {
     let now = Utc::now().format("%H:%M:%S").to_string();
 
-    // Find outcome info
-    let markets = state.markets.read().await;
-    let outcome = markets
-        .iter()
-        .flat_map(|m| m.outcomes.iter())
-        .find(|o| o.token_id == req.token_id);
+    // Re-fetch the book to get fresh data
+    let book = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &req.token_id)
+        .await;
 
-    let (shares, cost, profit) = match outcome {
-        Some(o) => (o.sweepable_shares, o.sweepable_cost, o.sweepable_profit),
+    let info = match book {
+        Some(ref b) => build_outcome_info(&req.label, &req.token_id, b, state.max_buy, state.min_sell),
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Token not found"})),
+                Json(serde_json::json!({"error": "Could not fetch book for token"})),
             )
                 .into_response();
         }
     };
-    drop(markets);
+
+    let shares = info.sweepable_shares;
+    let cost = info.sweepable_cost;
+    let profit = info.sweepable_profit;
 
     if shares == Decimal::ZERO {
         return (
@@ -248,7 +270,6 @@ async fn api_harvest(
     }
 
     let status = if let Some(ref api) = state.api {
-        // Live mode: place order
         let resp = api
             .place_order(
                 &req.token_id,
@@ -277,11 +298,9 @@ async fn api_harvest(
             Err(e) => format!("ERR — {}", e),
         }
     } else {
-        // Paper mode
         "PAPER — no order placed".to_string()
     };
 
-    // Log activity
     let entry = ActivityEntry {
         time: now,
         market: req.market_question,
@@ -403,20 +422,15 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
     let activity = state.activity.read().await;
     let now = Utc::now();
 
-    // Build market rows
+    // Build market rows — collapsed by default, no book data yet
     let mut market_rows = String::new();
-    for (mi, mwb) in markets.iter().enumerate() {
-        let m = &mwb.market;
+    for (mi, m) in markets.iter().enumerate() {
         let end_str = match m.end_date {
             Some(ed) => {
                 let diff = ed - now;
                 let hours = diff.num_hours();
-                if hours < -24 {
-                    // >24h past — likely postponed
+                if hours < 0 {
                     format!("<span style=\"color:#e74c3c\">{}h ago</span>", -hours)
-                } else if hours < 0 {
-                    // Within last 24h — could be timezone mismatch, show as "ending"
-                    format!("<span style=\"color:#f39c12\">~{}h ago</span>", -hours)
                 } else if hours < 24 {
                     format!("<span style=\"color:#f39c12\">in {}h</span>", hours)
                 } else {
@@ -426,102 +440,8 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             None => "???".to_string(),
         };
 
-        // Outcome sub-rows
-        //
-        // For each outcome we show:
-        //   BUY side  — sweep asks (buy-winner strategy)
-        //   SELL side — hit bids (sell-loser via split strategy)
-        //
-        // When you "Select Winner" on outcome X:
-        //   1. Buy X tokens from asks (profit = shares - cost)
-        //   2. Split USDC to get loser tokens for every OTHER outcome,
-        //      sell those into their bids (revenue is pure profit,
-        //      since the split winner token redeems at $1).
-        let mut outcome_html = String::new();
-        let n_outcomes = mwb.outcomes.len();
-
-        for (oi, info) in mwb.outcomes.iter().enumerate() {
-            let ask_str = info
-                .best_ask
-                .map(|p| format!("${}", p))
-                .unwrap_or_else(|| "-".to_string());
-            let bid_str = info
-                .best_bid
-                .map(|p| format!("${}", p))
-                .unwrap_or_else(|| "-".to_string());
-            let buy_pct = if info.sweepable_cost > Decimal::ZERO {
-                let v = (info.sweepable_profit / info.sweepable_cost) * Decimal::from(100);
-                format!("{:.2}%", v)
-            } else {
-                "-".to_string()
-            };
-
-            // Calculate combined profit if THIS outcome is the winner:
-            //   buy_winner_profit + sum of sell revenue for ALL OTHER outcomes
-            let buy_profit = info.sweepable_profit;
-            let sell_losers_revenue: Decimal = mwb
-                .outcomes
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != oi)
-                .map(|(_, o)| o.sellable_revenue)
-                .sum();
-            let combined_profit = buy_profit + sell_losers_revenue;
-
-            let profit_color = if combined_profit > Decimal::ZERO {
-                "#2ecc71"
-            } else {
-                "#8b949e"
-            };
-
-            let has_opportunity = info.sweepable_shares > Decimal::ZERO || sell_losers_revenue > Decimal::ZERO;
-            let btn = if has_opportunity {
-                format!(
-                    r#"<button class="harvest-btn" onclick="harvest('{}','{}','{}')">Select Winner</button>"#,
-                    info.token_id,
-                    info.label.replace('\'', "\\'"),
-                    m.question.replace('\'', "\\'"),
-                )
-            } else {
-                String::new()
-            };
-
-            // Show sell-loser detail only when there's something
-            let sell_detail = if sell_losers_revenue > Decimal::ZERO && n_outcomes >= 2 {
-                format!(
-                    r#"<span style="color:#8b949e;font-size:0.8em"> + ${:.4} sell losers</span>"#,
-                    sell_losers_revenue,
-                )
-            } else {
-                String::new()
-            };
-
-            outcome_html.push_str(&format!(
-                r#"<div class="outcome-row">
-                    <span class="outcome-label">{label}</span>
-                    <span class="outcome-ask">ask {ask}</span>
-                    <span class="outcome-bid">bid {bid}</span>
-                    <span class="outcome-shares">{buy_shares} buy / {sell_shares} sell</span>
-                    <span class="outcome-cost">${buy_cost:.4}</span>
-                    <span class="outcome-profit" style="color:{profit_color}">${combined:.4} ({buy_pct}){sell_detail}</span>
-                    {btn}
-                </div>"#,
-                label = info.label,
-                ask = ask_str,
-                bid = bid_str,
-                buy_shares = info.sweepable_shares,
-                sell_shares = info.sellable_shares,
-                buy_cost = info.sweepable_cost,
-                profit_color = profit_color,
-                combined = combined_profit,
-                buy_pct = buy_pct,
-                sell_detail = sell_detail,
-                btn = btn,
-            ));
-        }
-
-        let q_display = if m.question.len() > 80 {
-            format!("{}...", &m.question[..77])
+        let q_display = if m.question.len() > 90 {
+            format!("{}...", &m.question[..87])
         } else {
             m.question.clone()
         };
@@ -531,23 +451,30 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             None => format!("https://polymarket.com/event/{}", m.condition_id),
         };
 
+        // Escape question for JS data attribute
+        let q_escaped = m.question.replace('"', "&quot;");
+
         market_rows.push_str(&format!(
-            r#"<div class="market-card">
-                <div class="market-header">
-                    <span class="market-num">#{}</span>
-                    <a href="{}" target="_blank" class="market-question">{}</a>
-                    <span class="market-meta">{} | {} outcomes | {}{}</span>
+            r#"<div class="market-card" data-question="{q_escaped}" data-idx="{idx}">
+                <div class="market-header" onclick="toggleMarket({idx})">
+                    <span class="market-num">#{num}</span>
+                    <a href="{poly_url}" target="_blank" class="market-question" onclick="event.stopPropagation()">{q_display}</a>
+                    <span class="market-meta">{end_str} | {n_out} outcomes | {cat}{neg}</span>
+                    <span class="expand-icon" id="icon-{idx}">▶</span>
                 </div>
-                <div class="outcomes">{}</div>
+                <div class="outcomes" id="outcomes-{idx}" style="display:none">
+                    <div class="loading" id="loading-{idx}">Loading order book...</div>
+                </div>
             </div>"#,
-            mi + 1,
-            poly_url,
-            q_display,
-            end_str,
-            m.outcomes.len(),
-            if m.category.len() > 15 { &m.category[..15] } else { &m.category },
-            if m.is_neg_risk { " | neg_risk" } else { "" },
-            outcome_html,
+            q_escaped = q_escaped,
+            idx = mi,
+            num = mi + 1,
+            poly_url = poly_url,
+            q_display = q_display,
+            end_str = end_str,
+            n_out = m.outcomes.len(),
+            cat = if m.category.len() > 15 { &m.category[..15] } else { &m.category },
+            neg = if m.is_neg_risk { " | neg_risk" } else { "" },
         ));
     }
 
@@ -590,22 +517,29 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   h1 {{ color: #58a6ff; margin-bottom: 5px; font-size: 1.4em; }}
   .subtitle {{ color: #8b949e; margin-bottom: 20px; font-size: 0.85em; }}
   h2 {{ color: #8b949e; margin: 20px 0 10px 0; font-size: 1.1em; border-bottom: 1px solid #21262d; padding-bottom: 5px; }}
-  .market-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }}
-  .market-header {{ display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }}
+  .search-box {{ width: 100%; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-family: inherit; font-size: 0.9em; margin-bottom: 12px; outline: none; }}
+  .search-box:focus {{ border-color: #58a6ff; }}
+  .market-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; overflow: hidden; }}
+  .market-card.hidden {{ display: none; }}
+  .market-header {{ display: flex; align-items: baseline; gap: 10px; padding: 10px 16px; cursor: pointer; flex-wrap: wrap; }}
+  .market-header:hover {{ background: #1c2128; }}
   .market-num {{ color: #8b949e; font-size: 0.8em; font-weight: bold; }}
-  a.market-question {{ color: #58a6ff; font-weight: bold; font-size: 0.95em; text-decoration: none; }}
+  a.market-question {{ color: #58a6ff; font-weight: bold; font-size: 0.9em; text-decoration: none; }}
   a.market-question:hover {{ text-decoration: underline; }}
-  .market-meta {{ color: #484f58; font-size: 0.75em; margin-left: auto; }}
-  .outcomes {{ display: flex; flex-direction: column; gap: 4px; }}
-  .outcome-row {{ display: flex; align-items: center; gap: 12px; padding: 4px 8px; background: #0d1117; border-radius: 4px; font-size: 0.85em; flex-wrap: wrap; }}
-  .outcome-label {{ min-width: 140px; font-weight: bold; color: #c9d1d9; }}
-  .outcome-ask {{ min-width: 80px; color: #8b949e; }}
-  .outcome-bid {{ min-width: 80px; color: #8b949e; }}
-  .outcome-shares {{ min-width: 120px; color: #8b949e; }}
-  .outcome-cost {{ min-width: 100px; color: #8b949e; }}
+  .market-meta {{ color: #484f58; font-size: 0.72em; margin-left: auto; white-space: nowrap; }}
+  .expand-icon {{ color: #484f58; font-size: 0.7em; transition: transform 0.15s; }}
+  .expand-icon.open {{ transform: rotate(90deg); }}
+  .outcomes {{ padding: 0 16px 12px 16px; }}
+  .outcome-row {{ display: flex; align-items: center; gap: 12px; padding: 4px 8px; background: #0d1117; border-radius: 4px; font-size: 0.82em; flex-wrap: wrap; margin-bottom: 3px; }}
+  .outcome-label {{ min-width: 130px; font-weight: bold; color: #c9d1d9; }}
+  .outcome-ask {{ min-width: 75px; color: #8b949e; }}
+  .outcome-bid {{ min-width: 75px; color: #8b949e; }}
+  .outcome-shares {{ min-width: 140px; color: #8b949e; }}
+  .outcome-cost {{ min-width: 90px; color: #8b949e; }}
   .outcome-profit {{ min-width: 140px; }}
   .harvest-btn {{ background: #238636; color: #fff; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; font-family: inherit; margin-left: auto; }}
   .harvest-btn:hover {{ background: #2ea043; }}
+  .loading {{ color: #484f58; font-size: 0.82em; padding: 8px; }}
   table {{ width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }}
   th {{ background: #21262d; color: #8b949e; text-align: left; padding: 8px 12px; font-size: 0.8em; text-transform: uppercase; }}
   td {{ padding: 6px 12px; border-top: 1px solid #21262d; font-size: 0.82em; }}
@@ -614,16 +548,25 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   .status-item {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; }}
   .status-item .slabel {{ color: #8b949e; font-size: 0.7em; text-transform: uppercase; }}
   .status-item .sval {{ font-size: 1.2em; font-weight: bold; margin-top: 2px; }}
+  .page-controls {{ display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }}
+  .page-btn {{ background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 0.82em; }}
+  .page-btn:hover {{ background: #30363d; }}
+  .page-btn:disabled {{ opacity: 0.4; cursor: default; }}
+  .page-info {{ color: #8b949e; font-size: 0.82em; }}
 </style>
 </head>
 <body>
 <h1>Harvester Dashboard</h1>
-<div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Polling: 30s</div>
+<div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Window: future only</div>
 
 <div class="status-bar">
   <div class="status-item">
     <div class="slabel">Markets</div>
     <div class="sval" style="color:#58a6ff">{market_count}</div>
+  </div>
+  <div class="status-item">
+    <div class="slabel">Showing</div>
+    <div class="sval" style="color:#58a6ff" id="showing-count">{market_count}</div>
   </div>
   <div class="status-item">
     <div class="slabel">Trades</div>
@@ -632,7 +575,24 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 </div>
 
 <h2>Markets</h2>
+<input type="text" class="search-box" id="search" placeholder="Search markets..." oninput="filterMarkets()">
+
+<div class="page-controls">
+  <button class="page-btn" id="prev-btn" onclick="changePage(-1)" disabled>← Prev</button>
+  <span class="page-info" id="page-info">Page 1</span>
+  <button class="page-btn" id="next-btn" onclick="changePage(1)">Next →</button>
+  <span class="page-info" style="margin-left:8px">Per page:</span>
+  <select class="page-btn" id="per-page" onchange="changePerPage()">
+    <option value="25">25</option>
+    <option value="50" selected>50</option>
+    <option value="100">100</option>
+    <option value="9999">All</option>
+  </select>
+</div>
+
+<div id="market-list">
 {market_rows}
+</div>
 
 <h2>Activity Log</h2>
 <table>
@@ -641,6 +601,168 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 </table>
 
 <script>
+// ── State ──────────────────────────────────────────────────────────────
+let openIdx = null;         // which market is expanded
+let cachedBooks = {{}};     // idx -> outcome data
+let currentPage = 0;
+let perPage = 50;
+
+// ── Search & Pagination ────────────────────────────────────────────────
+function getVisibleCards() {{
+  const q = document.getElementById('search').value.toLowerCase();
+  const cards = document.querySelectorAll('.market-card');
+  const visible = [];
+  cards.forEach(c => {{
+    const question = (c.dataset.question || '').toLowerCase();
+    if (!q || question.includes(q)) {{
+      visible.push(c);
+    }}
+  }});
+  return visible;
+}}
+
+function filterMarkets() {{
+  currentPage = 0;
+  renderPage();
+}}
+
+function changePage(delta) {{
+  currentPage += delta;
+  renderPage();
+}}
+
+function changePerPage() {{
+  perPage = parseInt(document.getElementById('per-page').value);
+  currentPage = 0;
+  renderPage();
+}}
+
+function renderPage() {{
+  const cards = document.querySelectorAll('.market-card');
+  const q = document.getElementById('search').value.toLowerCase();
+
+  // First hide all
+  cards.forEach(c => c.classList.add('hidden'));
+
+  // Get matching cards
+  const visible = [];
+  cards.forEach(c => {{
+    const question = (c.dataset.question || '').toLowerCase();
+    if (!q || question.includes(q)) {{
+      visible.push(c);
+    }}
+  }});
+
+  // Paginate
+  const totalPages = Math.max(1, Math.ceil(visible.length / perPage));
+  if (currentPage >= totalPages) currentPage = totalPages - 1;
+  if (currentPage < 0) currentPage = 0;
+
+  const start = currentPage * perPage;
+  const end = Math.min(start + perPage, visible.length);
+
+  for (let i = start; i < end; i++) {{
+    visible[i].classList.remove('hidden');
+  }}
+
+  // Update controls
+  document.getElementById('prev-btn').disabled = (currentPage === 0);
+  document.getElementById('next-btn').disabled = (currentPage >= totalPages - 1);
+  document.getElementById('page-info').textContent = `Page ${{currentPage + 1}} / ${{totalPages}}`;
+  document.getElementById('showing-count').textContent = visible.length;
+}}
+
+// ── Expand/Collapse ────────────────────────────────────────────────────
+async function toggleMarket(idx) {{
+  const outcomesEl = document.getElementById('outcomes-' + idx);
+  const iconEl = document.getElementById('icon-' + idx);
+
+  if (openIdx === idx) {{
+    // Collapse
+    outcomesEl.style.display = 'none';
+    iconEl.classList.remove('open');
+    openIdx = null;
+    return;
+  }}
+
+  // Collapse previous
+  if (openIdx !== null) {{
+    document.getElementById('outcomes-' + openIdx).style.display = 'none';
+    document.getElementById('icon-' + openIdx).classList.remove('open');
+  }}
+
+  // Expand this one
+  outcomesEl.style.display = 'block';
+  iconEl.classList.add('open');
+  openIdx = idx;
+
+  // Fetch book if not cached
+  if (!cachedBooks[idx]) {{
+    document.getElementById('loading-' + idx).style.display = 'block';
+    try {{
+      const resp = await fetch('/api/book?idx=' + idx);
+      const data = await resp.json();
+      if (data.error) {{
+        document.getElementById('loading-' + idx).textContent = 'Error: ' + data.error;
+        return;
+      }}
+      cachedBooks[idx] = data;
+      renderOutcomes(idx, data);
+    }} catch (e) {{
+      document.getElementById('loading-' + idx).textContent = 'Fetch failed: ' + e;
+    }}
+  }} else {{
+    renderOutcomes(idx, cachedBooks[idx]);
+  }}
+}}
+
+function renderOutcomes(idx, data) {{
+  const container = document.getElementById('outcomes-' + idx);
+  const outcomes = data.outcomes;
+  const n = outcomes.length;
+  let html = '';
+
+  for (let oi = 0; oi < n; oi++) {{
+    const info = outcomes[oi];
+    const askStr = info.best_ask ? ('$' + info.best_ask) : '-';
+    const bidStr = info.best_bid ? ('$' + info.best_bid) : '-';
+
+    const buyCost = parseFloat(info.sweepable_cost) || 0;
+    const buyProfit = parseFloat(info.sweepable_profit) || 0;
+    const buyShares = info.sweepable_shares;
+    const sellShares = info.sellable_shares;
+
+    const buyPct = buyCost > 0 ? ((buyProfit / buyCost) * 100).toFixed(2) + '%' : '-';
+
+    // Sell-losers revenue: sum of sellable_revenue for OTHER outcomes
+    let sellRev = 0;
+    for (let j = 0; j < n; j++) {{
+      if (j !== oi) sellRev += parseFloat(outcomes[j].sellable_revenue) || 0;
+    }}
+
+    const combined = buyProfit + sellRev;
+    const profitColor = combined > 0 ? '#2ecc71' : '#8b949e';
+    const sellDetail = sellRev > 0 ? ` <span style="color:#8b949e;font-size:0.8em">+ $${{sellRev.toFixed(4)}} sell losers</span>` : '';
+    const hasOpp = parseFloat(buyShares) > 0 || sellRev > 0;
+    const btn = hasOpp
+      ? `<button class="harvest-btn" onclick="harvest('${{info.token_id}}','${{info.label.replace(/'/g,"\\\\'")}}','${{data.question.replace(/'/g,"\\\\'")}}')">Select Winner</button>`
+      : '';
+
+    html += `<div class="outcome-row">
+      <span class="outcome-label">${{info.label}}</span>
+      <span class="outcome-ask">ask ${{askStr}}</span>
+      <span class="outcome-bid">bid ${{bidStr}}</span>
+      <span class="outcome-shares">${{buyShares}} buy / ${{sellShares}} sell</span>
+      <span class="outcome-cost">$${{buyCost.toFixed(4)}}</span>
+      <span class="outcome-profit" style="color:${{profitColor}}">$${{combined.toFixed(4)}} (${{buyPct}})${{sellDetail}}</span>
+      ${{btn}}
+    </div>`;
+  }}
+
+  container.innerHTML = html;
+}}
+
+// ── Harvest ────────────────────────────────────────────────────────────
 async function harvest(tokenId, label, question) {{
   if (!confirm(`Buy "${{label}}" as winner for "${{question}}"?`)) return;
   try {{
@@ -661,8 +783,8 @@ async function harvest(tokenId, label, question) {{
   }}
 }}
 
-// Auto-refresh every 30s
-setTimeout(() => location.reload(), 30000);
+// ── Init ───────────────────────────────────────────────────────────────
+renderPage();
 </script>
 </body>
 </html>"##,

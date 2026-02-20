@@ -94,7 +94,7 @@ pub async fn scan_markets(
     let http = reqwest::Client::new();
     let now = Utc::now();
 
-    let date_min = (now - Duration::hours(24)).format("%Y-%m-%d").to_string();
+    let date_min = now.format("%Y-%m-%d").to_string();
     let date_max = (now + Duration::days(end_date_window_days + 1))
         .format("%Y-%m-%d")
         .to_string();
@@ -204,19 +204,11 @@ pub async fn scan_markets(
         });
     }
 
-    // Sort: soonest end date first, >24h-past markets pushed to the bottom
-    // (likely postponed or delayed resolution, not useful for harvesting).
-    let stale_cutoff = Utc::now() - Duration::hours(24);
+    // Sort: soonest end date first
     results.sort_by(|a, b| {
         let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
         let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let a_stale = a_dt < stale_cutoff;
-        let b_stale = b_dt < stale_cutoff;
-        match (a_stale, b_stale) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => a_dt.cmp(&b_dt),
-        }
+        a_dt.cmp(&b_dt)
     });
 
     results.truncate(max_display);
