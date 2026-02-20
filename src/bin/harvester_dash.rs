@@ -446,11 +446,6 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             m.question.clone()
         };
 
-        let poly_url = match &m.slug {
-            Some(slug) => format!("https://polymarket.com/event/{}", slug),
-            None => format!("https://polymarket.com/event/{}", m.condition_id),
-        };
-
         // Escape question for JS data attribute
         let q_escaped = m.question.replace('"', "&quot;");
 
@@ -458,7 +453,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             r#"<div class="market-card" data-question="{q_escaped}" data-idx="{idx}">
                 <div class="market-header" onclick="toggleMarket({idx})">
                     <span class="market-num">#{num}</span>
-                    <a href="{poly_url}" target="_blank" class="market-question" onclick="event.stopPropagation()">{q_display}</a>
+                    <span class="market-question">{q_display}</span>
                     <span class="market-meta">{end_str} | {n_out} outcomes | {cat}{neg}</span>
                     <span class="expand-icon" id="icon-{idx}">▶</span>
                 </div>
@@ -469,7 +464,6 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             q_escaped = q_escaped,
             idx = mi,
             num = mi + 1,
-            poly_url = poly_url,
             q_display = q_display,
             end_str = end_str,
             n_out = m.outcomes.len(),
@@ -524,8 +518,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   .market-header {{ display: flex; align-items: baseline; gap: 10px; padding: 10px 16px; cursor: pointer; flex-wrap: wrap; }}
   .market-header:hover {{ background: #1c2128; }}
   .market-num {{ color: #8b949e; font-size: 0.8em; font-weight: bold; }}
-  a.market-question {{ color: #58a6ff; font-weight: bold; font-size: 0.9em; text-decoration: none; }}
-  a.market-question:hover {{ text-decoration: underline; }}
+  .market-question {{ color: #58a6ff; font-weight: bold; font-size: 0.9em; }}
   .market-meta {{ color: #484f58; font-size: 0.72em; margin-left: auto; white-space: nowrap; }}
   .expand-icon {{ color: #484f58; font-size: 0.7em; transition: transform 0.15s; }}
   .expand-icon.open {{ transform: rotate(90deg); }}
