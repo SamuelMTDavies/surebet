@@ -1,18 +1,30 @@
 //! Harvester Web Dashboard — shows markets near end date.  Click a market
 //! to fetch its order book on demand, then select a winning outcome to
-//! execute a buy + enter hoover mode.
+//! execute a buy + mint-and-sell-losers strategy.
 //!
 //! Usage:
 //!   cargo run --bin harvester_dash              # paper mode
 //!   cargo run --bin harvester_dash -- --live    # live execution
+//!
+//! Environment variables for live mint+sell:
+//!   POLYMARKET_PRIVATE_KEY  — wallet private key for CTF split (on-chain)
+//!   POLYGON_HTTP_URL        — Polygon HTTP RPC (default: https://polygon-rpc.com)
 
+use alloy::primitives::{B256, U256};
+use alloy::providers::ProviderBuilder;
+use alloy::signers::Signer as _;
+use alloy::signers::local::LocalSigner;
 use anyhow::{bail, Result};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use polymarket_client_sdk::ctf::types::SplitPositionRequest;
+use polymarket_client_sdk::types::address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -26,6 +38,51 @@ use surebet::harvester::{build_outcome_info, scan_markets, HarvestableMarket, Ou
 use surebet::orderbook::OrderBookStore;
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
+/// USDC on Polygon (USDC.e bridged)
+const USDC: alloy::primitives::Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+/// Polygon chain ID
+const POLYGON_CHAIN_ID: u64 = 137;
+
+// ─── CTF Split wrapper ──────────────────────────────────────────────────────
+
+/// Type-erased wrapper around `polymarket_client_sdk::ctf::Client` so we can
+/// store it in `AppState` without leaking the generic provider type.
+struct CtfSplitter {
+    inner: Box<dyn CtfSplitTrait + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+trait CtfSplitTrait: Send + Sync {
+    async fn split_position(
+        &self,
+        condition_id: B256,
+        amount_usdc_units: U256,
+    ) -> anyhow::Result<String>; // returns tx hash
+}
+
+struct CtfClientWrapper<P: alloy::providers::Provider + Clone + Send + Sync + 'static> {
+    client: polymarket_client_sdk::ctf::Client<P>,
+}
+
+#[async_trait::async_trait]
+impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrait
+    for CtfClientWrapper<P>
+{
+    async fn split_position(
+        &self,
+        condition_id: B256,
+        amount_usdc_units: U256,
+    ) -> anyhow::Result<String> {
+        let req = SplitPositionRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
+        let resp = self
+            .client
+            .split_position(&req)
+            .await
+            .map_err(|e| anyhow::anyhow!("CTF split failed: {}", e))?;
+        Ok(format!("{:?}", resp.transaction_hash))
+    }
+}
+
 // ─── State ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -34,6 +91,7 @@ struct AppState {
     book_store: Arc<OrderBookStore>,
     clob_url: String,
     api: Option<Arc<ClobApiClient>>,
+    ctf: Option<Arc<CtfSplitter>>,
     activity: Arc<RwLock<Vec<ActivityEntry>>>,
     max_buy: Decimal,
     min_sell: Decimal,
@@ -45,16 +103,19 @@ struct ActivityEntry {
     time: String,
     market: String,
     outcome: String,
-    action: String,
-    shares: String,
-    cost: String,
-    profit: String,
+    strategy: String,       // "BUY" | "MINT+SELL" | "HOOVER"
+    buy_shares: String,
+    buy_cost: String,
+    mint_cost: String,      // USDC spent minting complete sets
+    sell_revenue: String,   // revenue from selling loser tokens
+    net_profit: String,     // total profit accounting for all costs
     status: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct HarvestRequest {
-    token_id: String,
+    market_idx: usize,      // index into markets list
+    winner_idx: usize,      // which outcome is the winner
     label: String,
     market_question: String,
 }
@@ -142,6 +203,59 @@ async fn main() -> Result<()> {
         None
     };
 
+    // ── Step 2b: Build CTF client for mint+sell (on-chain) ────────────────
+
+    let ctf: Option<Arc<CtfSplitter>> = if live_mode {
+        match std::env::var("POLYMARKET_PRIVATE_KEY") {
+            Ok(pk) => {
+                let rpc_url = std::env::var("POLYGON_HTTP_URL")
+                    .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+                match LocalSigner::from_str(&pk) {
+                    Ok(signer) => {
+                        let signer = signer.with_chain_id(Some(POLYGON_CHAIN_ID));
+                        match ProviderBuilder::new()
+                            .wallet(signer)
+                            .connect(&rpc_url)
+                            .await
+                        {
+                            Ok(provider) => {
+                                match polymarket_client_sdk::ctf::Client::with_neg_risk(
+                                    provider,
+                                    POLYGON_CHAIN_ID,
+                                ) {
+                                    Ok(c) => {
+                                        println!("  CTF client ready (mint+sell enabled)");
+                                        Some(Arc::new(CtfSplitter {
+                                            inner: Box::new(CtfClientWrapper { client: c }),
+                                        }))
+                                    }
+                                    Err(e) => {
+                                        println!("WARNING: CTF client init failed: {e}, mint+sell disabled");
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("WARNING: Polygon RPC connect failed: {e}, mint+sell disabled");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("WARNING: invalid private key: {e}, mint+sell disabled");
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                println!("  No POLYMARKET_PRIVATE_KEY set, mint+sell disabled (buy-only)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Step 3: Serve dashboard ──────────────────────────────────────────
 
     let state = AppState {
@@ -149,6 +263,7 @@ async fn main() -> Result<()> {
         book_store,
         clob_url,
         api,
+        ctf,
         activity: Arc::new(RwLock::new(Vec::new())),
         max_buy,
         min_sell,
@@ -161,6 +276,7 @@ async fn main() -> Result<()> {
         .route("/api/book", get(api_book))
         .route("/api/harvest", post(api_harvest))
         .route("/api/activity", get(api_activity))
+        .route("/ws/book", get(ws_book_handler))
         .with_state(state);
 
     println!("Dashboard: http://{}", bind_addr);
@@ -240,82 +356,443 @@ async fn api_harvest(
 ) -> impl IntoResponse {
     let now = Utc::now().format("%H:%M:%S").to_string();
 
-    // Re-fetch the book to get fresh data
-    let book = state
-        .book_store
-        .fetch_rest_book(&state.clob_url, &req.token_id)
-        .await;
-
-    let info = match book {
-        Some(ref b) => build_outcome_info(&req.label, &req.token_id, b, state.max_buy, state.min_sell),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Could not fetch book for token"})),
-            )
-                .into_response();
+    // ── 1. Look up market and validate ──────────────────────────────────
+    let market = {
+        let markets = state.markets.read().await;
+        match markets.get(req.market_idx) {
+            Some(m) => m.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid market index"})),
+                )
+                    .into_response();
+            }
         }
     };
 
-    let shares = info.sweepable_shares;
-    let cost = info.sweepable_cost;
-    let profit = info.sweepable_profit;
-
-    if shares == Decimal::ZERO {
+    if req.winner_idx >= market.clob_token_ids.len() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "No sweepable shares available"})),
+            Json(serde_json::json!({"error": "Invalid winner outcome index"})),
         )
             .into_response();
     }
 
-    let status = if let Some(ref api) = state.api {
-        let resp = api
-            .place_order(
-                &req.token_id,
-                &state.max_buy.to_string(),
-                &shares.to_string(),
-                OrderSide::Buy,
-            )
+    let winner_token_id = &market.clob_token_ids[req.winner_idx];
+
+    // ── 2. Re-fetch ALL outcome books (fresh data) ──────────────────────
+    let mut outcomes: Vec<OutcomeInfo> = Vec::new();
+    for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+        let label = market
+            .outcomes
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Outcome {}", i));
+        let book = state
+            .book_store
+            .fetch_rest_book(&state.clob_url, token_id)
             .await;
+        let info = match book {
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            None => OutcomeInfo {
+                label: label.clone(),
+                token_id: token_id.clone(),
+                best_ask: None,
+                sweepable_shares: Decimal::ZERO,
+                sweepable_cost: Decimal::ZERO,
+                sweepable_profit: Decimal::ZERO,
+                best_bid: None,
+                sellable_shares: Decimal::ZERO,
+                sellable_revenue: Decimal::ZERO,
+            },
+        };
+        outcomes.push(info);
+    }
 
-        match resp {
-            Ok(r) if r.success => {
-                // Start hoover in background
-                let book_store = state.book_store.clone();
-                let token_id = req.token_id.clone();
-                let label = req.label.clone();
-                let max_buy = state.max_buy;
-                let api = api.clone();
-                let activity = state.activity.clone();
-                tokio::spawn(async move {
-                    hoover_task(&book_store, &token_id, &label, max_buy, &api, &activity).await;
-                });
+    let winner = &outcomes[req.winner_idx];
+    let buy_shares = winner.sweepable_shares;
+    let buy_cost = winner.sweepable_cost;
+    let buy_profit = winner.sweepable_profit;
 
-                format!("OK — order_id: {}", r.order_id)
+    // ── 3. Check loser sell-side (mint+sell opportunity) ─────────────────
+    // For each loser outcome, check fillable bids.  The mint amount is
+    // capped by the minimum sellable depth across ALL losers (bottleneck).
+    let mut min_loser_sellable = Decimal::MAX;
+    let mut total_sell_revenue = Decimal::ZERO;
+    let mut loser_sell_plans: Vec<(String, Decimal, Decimal)> = Vec::new(); // (token_id, shares, best_bid)
+    let mut has_loser_bids = true;
+
+    for (i, info) in outcomes.iter().enumerate() {
+        if i == req.winner_idx {
+            continue;
+        }
+        if info.sellable_shares == Decimal::ZERO || info.best_bid.is_none() {
+            has_loser_bids = false;
+            break;
+        }
+        min_loser_sellable = min_loser_sellable.min(info.sellable_shares);
+        total_sell_revenue += info.sellable_revenue;
+        loser_sell_plans.push((
+            info.token_id.clone(),
+            info.sellable_shares,
+            info.best_bid.unwrap(),
+        ));
+    }
+
+    // Mint+sell is viable if: all losers have bids AND selling them recovers
+    // more than the minting cost of those shares.
+    // mint_cost = mint_amount (1 USDC per complete set)
+    // net profit from mint+sell = sell_revenue - mint_amount + mint_amount
+    //   (the minted winner tokens are kept, each worth $1 at resolution)
+    //   So: mint profit = total_sell_revenue (revenue from selling losers,
+    //   since the winner tokens you keep are worth exactly what you minted)
+    let use_mint_sell = has_loser_bids
+        && !loser_sell_plans.is_empty()
+        && min_loser_sellable > Decimal::ZERO
+        && state.ctf.is_some();
+
+    let mint_amount = if use_mint_sell {
+        min_loser_sellable
+    } else {
+        Decimal::ZERO
+    };
+
+    // ── 4. Require at least some opportunity ────────────────────────────
+    if buy_shares == Decimal::ZERO && mint_amount == Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No opportunity — no asks below limit and no loser bids"})),
+        )
+            .into_response();
+    }
+
+    // ── 5. Execute strategy ─────────────────────────────────────────────
+    let mut status_parts: Vec<String> = Vec::new();
+    let mut strategy = "BUY".to_string();
+    let mut actual_mint_cost = Decimal::ZERO;
+    let mut actual_sell_revenue = Decimal::ZERO;
+
+    if let Some(ref api) = state.api {
+        // ── 5a. Mint+sell if viable ─────────────────────────────────────
+        if use_mint_sell && mint_amount > Decimal::ZERO {
+            strategy = "MINT+SELL".to_string();
+            actual_mint_cost = mint_amount; // 1 USDC per complete set
+
+            // On-chain CTF split
+            let ctf = state.ctf.as_ref().unwrap();
+            // Convert Decimal to USDC base units (6 decimals)
+            let usdc_units = (mint_amount * Decimal::from(1_000_000u64))
+                .to_string()
+                .parse::<u64>()
+                .unwrap_or(0);
+
+            if usdc_units == 0 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Mint amount too small"})),
+                )
+                    .into_response();
             }
-            Ok(r) => format!("FAIL — {}", r.error_msg),
-            Err(e) => format!("ERR — {}", e),
+
+            let condition_id = match B256::from_str(&market.condition_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Invalid condition_id: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+
+            match ctf
+                .inner
+                .split_position(condition_id, U256::from(usdc_units))
+                .await
+            {
+                Ok(tx_hash) => {
+                    status_parts.push(format!("MINT OK tx={tx_hash}"));
+
+                    // Sell each loser outcome's tokens via limit orders
+                    for (loser_token_id, sellable_shares, best_bid) in &loser_sell_plans {
+                        // Sell up to mint_amount shares (not more than we minted)
+                        let sell_size = (*sellable_shares).min(mint_amount);
+                        let resp = api
+                            .place_order(
+                                loser_token_id,
+                                &best_bid.to_string(),
+                                &sell_size.to_string(),
+                                OrderSide::Sell,
+                            )
+                            .await;
+                        match resp {
+                            Ok(r) if r.success => {
+                                actual_sell_revenue += *best_bid * sell_size;
+                                status_parts
+                                    .push(format!("SELL OK id={}", r.order_id));
+                            }
+                            Ok(r) => {
+                                status_parts.push(format!("SELL FAIL: {}", r.error_msg));
+                            }
+                            Err(e) => {
+                                status_parts.push(format!("SELL ERR: {}", e));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    status_parts.push(format!("MINT FAIL: {e}"));
+                    // Fall through — still try direct buy below
+                }
+            }
+        }
+
+        // ── 5b. Direct buy of winner tokens from asks ───────────────────
+        if buy_shares > Decimal::ZERO {
+            let resp = api
+                .place_order(
+                    winner_token_id,
+                    &state.max_buy.to_string(),
+                    &buy_shares.to_string(),
+                    OrderSide::Buy,
+                )
+                .await;
+
+            match resp {
+                Ok(r) if r.success => {
+                    if strategy == "BUY" {
+                        strategy = "BUY".to_string();
+                    } else {
+                        strategy = "MINT+SELL+BUY".to_string();
+                    }
+                    status_parts.push(format!("BUY OK id={}", r.order_id));
+
+                    // Start hoover in background for additional shares
+                    let book_store = state.book_store.clone();
+                    let token_id = winner_token_id.clone();
+                    let label = req.label.clone();
+                    let max_buy = state.max_buy;
+                    let api = api.clone();
+                    let activity = state.activity.clone();
+                    tokio::spawn(async move {
+                        hoover_task(&book_store, &token_id, &label, max_buy, &api, &activity)
+                            .await;
+                    });
+                }
+                Ok(r) => status_parts.push(format!("BUY FAIL: {}", r.error_msg)),
+                Err(e) => status_parts.push(format!("BUY ERR: {}", e)),
+            }
         }
     } else {
-        "PAPER — no order placed".to_string()
-    };
+        strategy = if use_mint_sell && mint_amount > Decimal::ZERO {
+            actual_mint_cost = mint_amount;
+            actual_sell_revenue = total_sell_revenue;
+            "PAPER MINT+SELL".to_string()
+        } else {
+            "PAPER BUY".to_string()
+        };
+        status_parts.push("PAPER — no orders placed".to_string());
+    }
+
+    // ── 6. Compute net profit and log ───────────────────────────────────
+    // net_profit = buy_profit + (sell_revenue - mint_cost + mint_amount_as_winner_value)
+    // Since minted winners are worth $1 each at resolution:
+    //   mint+sell profit = sell_revenue (losers) + mint_amount (winner value) - mint_amount (cost) = sell_revenue
+    // Plus direct buy profit from the ask sweep:
+    let net_profit = buy_profit + actual_sell_revenue;
 
     let entry = ActivityEntry {
         time: now,
         market: req.market_question,
-        outcome: req.label,
-        action: "BUY".to_string(),
-        shares: shares.to_string(),
-        cost: format!("{:.4}", cost),
-        profit: format!("{:.4}", profit),
-        status,
+        outcome: req.label.clone(),
+        strategy,
+        buy_shares: buy_shares.to_string(),
+        buy_cost: format!("{:.4}", buy_cost),
+        mint_cost: format!("{:.4}", actual_mint_cost),
+        sell_revenue: format!("{:.4}", actual_sell_revenue),
+        net_profit: format!("{:.4}", net_profit),
+        status: status_parts.join(" | "),
     };
 
     let mut activity = state.activity.write().await;
     activity.push(entry.clone());
 
     Json(serde_json::json!({"ok": true, "entry": entry})).into_response()
+}
+
+// ─── WebSocket book streaming ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct WsBookQuery {
+    idx: usize,
+}
+
+async fn ws_book_handler(
+    State(state): State<AppState>,
+    Query(q): Query<WsBookQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_book_stream(socket, state, q.idx))
+}
+
+async fn ws_book_stream(socket: WebSocket, state: AppState, idx: usize) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Look up the market
+    let market = {
+        let markets = state.markets.read().await;
+        markets.get(idx).cloned()
+    };
+    let market = match market {
+        Some(m) => m,
+        None => {
+            let _ = ws_tx
+                .send(Message::Text(
+                    serde_json::json!({"error": "Invalid market index"}).to_string().into(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let token_ids = market.clob_token_ids.clone();
+
+    // Send initial snapshot via REST fetch
+    let initial = build_book_payload(idx, &market, &state).await;
+    if ws_tx
+        .send(Message::Text(initial.into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // Start CLOB WS subscription for this market's tokens
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ClobEvent>();
+    if let Err(e) = start_clob_ws(
+        (*state.book_store).clone(),
+        event_tx,
+        token_ids.clone(),
+    ) {
+        let _ = ws_tx
+            .send(Message::Text(
+                serde_json::json!({"error": format!("WS start failed: {}", e)})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    }
+
+    // Forward CLOB book updates → browser WS
+    loop {
+        tokio::select! {
+            // CLOB event received — rebuild outcome info and send
+            event = event_rx.recv() => {
+                match event {
+                    Some(ClobEvent::BookSnapshot { asset_id, .. }) => {
+                        // Only send if this asset belongs to our market
+                        if !token_ids.contains(&asset_id) {
+                            continue;
+                        }
+                        let payload = build_book_payload_from_store(idx, &market, &state);
+                        if ws_tx.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ClobEvent::Disconnected) | None => break,
+                    _ => {}
+                }
+            }
+            // Browser closed the WS
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Build book payload using REST fetch (for initial load).
+async fn build_book_payload(
+    idx: usize,
+    market: &HarvestableMarket,
+    state: &AppState,
+) -> String {
+    let mut outcomes: Vec<OutcomeInfo> = Vec::new();
+    for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+        let label = market
+            .outcomes
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Outcome {}", i));
+        let book = state
+            .book_store
+            .fetch_rest_book(&state.clob_url, token_id)
+            .await;
+        let info = match book {
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            None => OutcomeInfo {
+                label: label.clone(),
+                token_id: token_id.clone(),
+                best_ask: None,
+                sweepable_shares: Decimal::ZERO,
+                sweepable_cost: Decimal::ZERO,
+                sweepable_profit: Decimal::ZERO,
+                best_bid: None,
+                sellable_shares: Decimal::ZERO,
+                sellable_revenue: Decimal::ZERO,
+            },
+        };
+        outcomes.push(info);
+    }
+    serde_json::json!({
+        "idx": idx,
+        "question": market.question,
+        "outcomes": outcomes,
+    })
+    .to_string()
+}
+
+/// Build book payload from the in-memory store (after WS updates).
+fn build_book_payload_from_store(
+    idx: usize,
+    market: &HarvestableMarket,
+    state: &AppState,
+) -> String {
+    let mut outcomes: Vec<OutcomeInfo> = Vec::new();
+    for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+        let label = market
+            .outcomes
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Outcome {}", i));
+        let book = state.book_store.get_book(token_id);
+        let info = match book {
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            None => OutcomeInfo {
+                label: label.clone(),
+                token_id: token_id.clone(),
+                best_ask: None,
+                sweepable_shares: Decimal::ZERO,
+                sweepable_cost: Decimal::ZERO,
+                sweepable_profit: Decimal::ZERO,
+                best_bid: None,
+                sellable_shares: Decimal::ZERO,
+                sellable_revenue: Decimal::ZERO,
+            },
+        };
+        outcomes.push(info);
+    }
+    serde_json::json!({
+        "idx": idx,
+        "question": market.question,
+        "outcomes": outcomes,
+    })
+    .to_string()
 }
 
 // ─── Hoover background task ─────────────────────────────────────────────────
@@ -399,10 +876,12 @@ async fn hoover_task(
                     time: Utc::now().format("%H:%M:%S").to_string(),
                     market: String::new(),
                     outcome: label.to_string(),
-                    action: "HOOVER".to_string(),
-                    shares: sweepable_shares.to_string(),
-                    cost: format!("{:.4}", sweepable_cost),
-                    profit: format!("{:.4}", profit),
+                    strategy: "HOOVER".to_string(),
+                    buy_shares: sweepable_shares.to_string(),
+                    buy_cost: format!("{:.4}", sweepable_cost),
+                    mint_cost: "0".to_string(),
+                    sell_revenue: "0".to_string(),
+                    net_profit: format!("{:.4}", profit),
                     status,
                 };
 
@@ -474,26 +953,35 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 
     // Activity log
     let activity_rows: String = if activity.is_empty() {
-        r#"<tr><td colspan="8" style="text-align:center;color:#666">No activity yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="9" style="text-align:center;color:#666">No activity yet</td></tr>"#.to_string()
     } else {
         activity.iter().rev().take(50).map(|a| {
-            let status_color = if a.status.starts_with("OK") || a.status.starts_with("HOOVER OK") {
+            let status_color = if a.status.contains("OK") {
                 "#2ecc71"
-            } else if a.status.starts_with("PAPER") {
+            } else if a.status.contains("PAPER") {
                 "#f39c12"
             } else {
                 "#e74c3c"
             };
+            let profit_val: f64 = a.net_profit.parse().unwrap_or(0.0);
+            let profit_color = if profit_val > 0.0 { "#2ecc71" } else { "#8b949e" };
             format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td style="color:{}">{}</td></tr>"#,
+                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td style="color:{}">{}</td><td style="color:{};max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{}">{}</td></tr>"#,
                 a.time,
-                if a.market.len() > 40 { &a.market[..40] } else { &a.market },
+                if a.market.len() > 35 { &a.market[..35] } else { &a.market },
                 a.outcome,
-                a.action,
-                a.shares,
-                a.cost,
-                a.profit,
+                a.strategy,
+                a.buy_shares,
+                a.buy_cost,
+                if a.sell_revenue != "0" && a.sell_revenue != "0.0000" {
+                    format!("${} sell / ${} mint", a.sell_revenue, a.mint_cost)
+                } else {
+                    "-".to_string()
+                },
+                profit_color,
+                a.net_profit,
                 status_color,
+                a.status,
                 a.status,
             )
         }).collect()
@@ -546,9 +1034,50 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   .page-btn:hover {{ background: #30363d; }}
   .page-btn:disabled {{ opacity: 0.4; cursor: default; }}
   .page-info {{ color: #8b949e; font-size: 0.82em; }}
+
+  /* ── Research side panel ─────────────────────────────────────── */
+  .dashboard-wrap {{ display: flex; gap: 0; min-height: calc(100vh - 40px); }}
+  .main-col {{ flex: 1; min-width: 0; }}
+  .research-panel {{
+    width: 0; overflow: hidden; transition: width 0.25s ease;
+    background: #161b22; border-left: 2px solid #30363d;
+    display: flex; flex-direction: column; position: sticky; top: 0;
+    height: 100vh;
+  }}
+  .research-panel.open {{ width: 45vw; min-width: 400px; }}
+  .research-bar {{
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    background: #21262d; border-bottom: 1px solid #30363d; flex-shrink: 0;
+  }}
+  .research-bar input {{
+    flex: 1; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 4px; color: #c9d1d9; font-family: inherit; font-size: 0.85em; outline: none;
+  }}
+  .research-bar input:focus {{ border-color: #58a6ff; }}
+  .research-bar button {{
+    background: #238636; color: #fff; border: none; padding: 6px 12px;
+    border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 0.82em;
+  }}
+  .research-bar button:hover {{ background: #2ea043; }}
+  .research-bar .close-btn {{
+    background: #da3633; padding: 6px 10px; font-weight: bold;
+  }}
+  .research-bar .close-btn:hover {{ background: #f85149; }}
+  .research-bar .engine-select {{
+    background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 4px; padding: 5px 6px; font-family: inherit; font-size: 0.82em;
+  }}
+  .research-iframe {{ flex: 1; border: none; background: #fff; }}
+  .research-title {{
+    color: #58a6ff; font-size: 0.78em; padding: 4px 12px;
+    background: #161b22; border-bottom: 1px solid #21262d;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0;
+  }}
 </style>
 </head>
 <body>
+<div class="dashboard-wrap">
+<div class="main-col">
 <h1>Harvester Dashboard</h1>
 <div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Window: future only</div>
 
@@ -589,9 +1118,27 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 
 <h2>Activity Log</h2>
 <table>
-  <tr><th>Time</th><th>Market</th><th>Outcome</th><th>Action</th><th>Shares</th><th>Cost</th><th>Profit</th><th>Status</th></tr>
+  <tr><th>Time</th><th>Market</th><th>Outcome</th><th>Strategy</th><th>Shares</th><th>Buy Cost</th><th>Sell/Mint</th><th>Net Profit</th><th>Status</th></tr>
   {activity_rows}
 </table>
+</div><!-- end main-col -->
+
+<div class="research-panel" id="research-panel">
+  <div class="research-bar">
+    <select class="engine-select" id="search-engine" onchange="reSearch()">
+      <option value="google">Google</option>
+      <option value="ddg">DuckDuckGo</option>
+      <option value="bing">Bing</option>
+    </select>
+    <input type="text" id="research-query" placeholder="Search..." onkeydown="if(event.key==='Enter')reSearch()">
+    <button onclick="reSearch()">Search</button>
+    <button onclick="openResearchExternal()" title="Open in new tab" style="background:#30363d">↗</button>
+    <button class="close-btn" onclick="closeResearch()">✕</button>
+  </div>
+  <div class="research-title" id="research-title">No market selected</div>
+  <iframe class="research-iframe" id="research-iframe" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
+</div>
+</div><!-- end dashboard-wrap -->
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────
@@ -665,16 +1212,61 @@ function renderPage() {{
   document.getElementById('showing-count').textContent = visible.length;
 }}
 
+// ── WebSocket book streaming ──────────────────────────────────────────
+let bookWs = null;
+let wsUpdateCount = 0;
+
+function closeBookWs() {{
+  if (bookWs) {{
+    bookWs.close();
+    bookWs = null;
+  }}
+  wsUpdateCount = 0;
+}}
+
+function openBookWs(idx) {{
+  closeBookWs();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${{proto}}//${{location.host}}/ws/book?idx=${{idx}}`;
+  bookWs = new WebSocket(url);
+
+  bookWs.onmessage = (evt) => {{
+    try {{
+      const data = JSON.parse(evt.data);
+      if (data.error) {{
+        const loadingEl = document.getElementById('loading-' + idx);
+        if (loadingEl) loadingEl.textContent = 'Error: ' + data.error;
+        return;
+      }}
+      wsUpdateCount++;
+      cachedBooks[idx] = data;
+      if (openIdx === idx) renderOutcomes(idx, data);
+    }} catch (e) {{
+      console.error('WS parse error:', e);
+    }}
+  }};
+
+  bookWs.onclose = () => {{
+    bookWs = null;
+  }};
+
+  bookWs.onerror = (err) => {{
+    console.error('Book WS error:', err);
+  }};
+}}
+
 // ── Expand/Collapse ────────────────────────────────────────────────────
-async function toggleMarket(idx) {{
+function toggleMarket(idx) {{
   const outcomesEl = document.getElementById('outcomes-' + idx);
   const iconEl = document.getElementById('icon-' + idx);
 
   if (openIdx === idx) {{
-    // Collapse
+    // Collapse — close WS and research panel
     outcomesEl.style.display = 'none';
     iconEl.classList.remove('open');
     openIdx = null;
+    closeBookWs();
+    closeResearch();
     return;
   }}
 
@@ -689,24 +1281,14 @@ async function toggleMarket(idx) {{
   iconEl.classList.add('open');
   openIdx = idx;
 
-  // Fetch book if not cached
-  if (!cachedBooks[idx]) {{
-    document.getElementById('loading-' + idx).style.display = 'block';
-    try {{
-      const resp = await fetch('/api/book?idx=' + idx);
-      const data = await resp.json();
-      if (data.error) {{
-        document.getElementById('loading-' + idx).textContent = 'Error: ' + data.error;
-        return;
-      }}
-      cachedBooks[idx] = data;
-      renderOutcomes(idx, data);
-    }} catch (e) {{
-      document.getElementById('loading-' + idx).textContent = 'Fetch failed: ' + e;
-    }}
-  }} else {{
-    renderOutcomes(idx, cachedBooks[idx]);
-  }}
+  // Open research panel with market question
+  const card = document.querySelector(`.market-card[data-idx="${{idx}}"]`);
+  if (card) openResearch(card.dataset.question);
+
+  // Show loading and open WS stream
+  const loadingEl = document.getElementById('loading-' + idx);
+  if (loadingEl) loadingEl.style.display = 'block';
+  openBookWs(idx);
 }}
 
 function renderOutcomes(idx, data) {{
@@ -714,6 +1296,16 @@ function renderOutcomes(idx, data) {{
   const outcomes = data.outcomes;
   const n = outcomes.length;
   let html = '';
+
+  const refreshTime = new Date().toLocaleTimeString();
+  const wsStatus = bookWs && bookWs.readyState === WebSocket.OPEN
+    ? `<span style="color:#2ecc71">● LIVE</span>`
+    : `<span style="color:#f39c12">● connecting...</span>`;
+  html += `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:0.78em;color:#8b949e">
+    ${{wsStatus}}
+    <span>Updated: ${{refreshTime}}</span>
+    <span style="color:#484f58">${{wsUpdateCount}} updates</span>
+  </div>`;
 
   for (let oi = 0; oi < n; oi++) {{
     const info = outcomes[oi];
@@ -737,8 +1329,9 @@ function renderOutcomes(idx, data) {{
     const profitColor = combined > 0 ? '#2ecc71' : '#8b949e';
     const sellDetail = sellRev > 0 ? ` <span style="color:#8b949e;font-size:0.8em">+ $${{sellRev.toFixed(4)}} sell losers</span>` : '';
     const hasOpp = parseFloat(buyShares) > 0 || sellRev > 0;
+    // Use data attributes to avoid quote-escaping issues in onclick
     const btn = hasOpp
-      ? `<button class="harvest-btn" onclick="harvest('${{info.token_id}}','${{info.label.replace(/'/g,"\\\\'")}}','${{data.question.replace(/'/g,"\\\\'")}}')">Select Winner</button>`
+      ? `<button class="harvest-btn" data-token="${{info.token_id}}" data-oi="${{oi}}" data-idx="${{idx}}">Select Winner</button>`
       : '';
 
     html += `<div class="outcome-row">
@@ -753,27 +1346,95 @@ function renderOutcomes(idx, data) {{
   }}
 
   container.innerHTML = html;
+
+  // Attach click handlers via delegation (avoids quote-escaping bugs)
+  container.querySelectorAll('.harvest-btn').forEach(btn => {{
+    btn.addEventListener('click', () => {{
+      const bookIdx = parseInt(btn.dataset.idx);
+      const oi = parseInt(btn.dataset.oi);
+      const cached = cachedBooks[bookIdx];
+      if (!cached) return;
+      const label = cached.outcomes[oi].label;
+      const question = cached.question;
+      harvest(bookIdx, oi, label, question);
+    }});
+  }});
 }}
 
 // ── Harvest ────────────────────────────────────────────────────────────
-async function harvest(tokenId, label, question) {{
-  if (!confirm(`Buy "${{label}}" as winner for "${{question}}"?`)) return;
+async function harvest(marketIdx, winnerIdx, label, question) {{
+  if (!confirm('Select "' + label + '" as winner for "' + question + '"?\n\nWill mint+sell losers if bids available, otherwise buy directly.')) return;
   try {{
     const resp = await fetch('/api/harvest', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ token_id: tokenId, label: label, market_question: question }}),
+      body: JSON.stringify({{ market_idx: marketIdx, winner_idx: winnerIdx, label: label, market_question: question }}),
     }});
     const data = await resp.json();
     if (data.ok) {{
-      alert(`Order submitted: ${{data.entry.status}}`);
+      const e = data.entry;
+      let msg = `Strategy: ${{e.strategy}}\n`;
+      if (e.mint_cost !== '0' && e.mint_cost !== '0.0000') {{
+        msg += `Minted: $${{e.mint_cost}} | Sell rev: $${{e.sell_revenue}}\n`;
+      }}
+      if (e.buy_cost !== '0.0000') {{
+        msg += `Buy: ${{e.buy_shares}} shares @ $${{e.buy_cost}}\n`;
+      }}
+      msg += `Net profit: $${{e.net_profit}}\n\n${{e.status}}`;
+      alert(msg);
       location.reload();
     }} else {{
-      alert(`Error: ${{data.error || 'Unknown error'}}`);
+      alert('Error: ' + (data.error || 'Unknown error'));
     }}
   }} catch (e) {{
-    alert(`Request failed: ${{e}}`);
+    alert('Request failed: ' + e);
   }}
+}}
+
+// ── Research Panel ─────────────────────────────────────────────────────
+function getSearchUrl(query) {{
+  const engine = document.getElementById('search-engine').value;
+  const q = encodeURIComponent(query);
+  switch (engine) {{
+    case 'google': return `https://www.google.com/search?igu=1&q=${{q}}`;
+    case 'ddg':    return `https://duckduckgo.com/?q=${{q}}`;
+    case 'bing':   return `https://www.bing.com/search?q=${{q}}`;
+    default:       return `https://www.google.com/search?igu=1&q=${{q}}`;
+  }}
+}}
+
+function openResearch(question) {{
+  const panel = document.getElementById('research-panel');
+  const input = document.getElementById('research-query');
+  const title = document.getElementById('research-title');
+  const iframe = document.getElementById('research-iframe');
+
+  panel.classList.add('open');
+  input.value = question;
+  title.textContent = question;
+  iframe.src = getSearchUrl(question);
+}}
+
+function reSearch() {{
+  const query = document.getElementById('research-query').value.trim();
+  if (!query) return;
+  const iframe = document.getElementById('research-iframe');
+  const title = document.getElementById('research-title');
+  title.textContent = query;
+  iframe.src = getSearchUrl(query);
+}}
+
+function openResearchExternal() {{
+  const query = document.getElementById('research-query').value.trim();
+  if (!query) return;
+  window.open(getSearchUrl(query), '_blank');
+}}
+
+function closeResearch() {{
+  const panel = document.getElementById('research-panel');
+  const iframe = document.getElementById('research-iframe');
+  panel.classList.remove('open');
+  iframe.src = 'about:blank';
 }}
 
 // ── Init ───────────────────────────────────────────────────────────────

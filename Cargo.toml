@@ -44,6 +44,7 @@ anyhow = "1"
 # Misc
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
 
 # Polymarket SDK (official)
 polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob", "ws", "rtds", "data", "tracing", "ctf"] }
@@ -56,7 +57,7 @@ rustls = { version = "0.23", features = ["ring"] }
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 
 # Dashboard HTTP server
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
 
 # On-chain event monitoring (Polygon/EVM)
