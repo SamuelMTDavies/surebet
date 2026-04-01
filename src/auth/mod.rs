@@ -278,6 +278,25 @@ impl ClobApiClient {
     pub async fn send_heartbeat(&self) -> Result<serde_json::Value, AuthError> {
         self.get("/heartbeat").await
     }
+
+    /// Query available USDC balance from the CLOB API.
+    /// Returns the collateral balance as a Decimal, or 0 on failure.
+    pub async fn get_balance_usdc(&self) -> rust_decimal::Decimal {
+        // The CLOB API's /balance-allowance endpoint returns
+        // { "balance": "123.45", ... } for collateral.
+        match self.get("/balance-allowance?asset_type=COLLATERAL").await {
+            Ok(val) => {
+                val.get("balance")
+                    .and_then(|b| b.as_str())
+                    .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                debug!("balance query failed: {}", e);
+                rust_decimal::Decimal::ZERO
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -40,8 +40,19 @@ use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
 /// USDC on Polygon (USDC.e bridged)
 const USDC: alloy::primitives::Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+/// CTF contract on Polygon (needs USDC approval for splits)
+const CTF_CONTRACT: alloy::primitives::Address =
+    address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
+
+// Minimal ERC20 ABI for allowance checks
+alloy::sol! {
+    #[sol(rpc)]
+    interface IERC20 {
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
+}
 
 // ─── CTF Split wrapper ──────────────────────────────────────────────────────
 
@@ -95,6 +106,10 @@ struct AppState {
     activity: Arc<RwLock<Vec<ActivityEntry>>>,
     max_buy: Decimal,
     min_sell: Decimal,
+    max_trade: Decimal,
+    max_daily: Decimal,
+    /// Rolling spend tracker: (timestamp, amount) pairs for daily limit.
+    daily_spend: Arc<RwLock<Vec<(chrono::DateTime<Utc>, Decimal)>>>,
     live_mode: bool,
 }
 
@@ -155,6 +170,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| Decimal::from_str("0.995").unwrap());
     let min_sell = Decimal::from_str(&format!("{}", harvester.min_sell_price))
         .unwrap_or_else(|_| Decimal::from_str("0.005").unwrap());
+    let max_trade = Decimal::from_str(&format!("{}", harvester.max_trade_usd))
+        .unwrap_or_else(|_| Decimal::from_str("25").unwrap());
+    let max_daily = Decimal::from_str(&format!("{}", harvester.max_daily_usd))
+        .unwrap_or_else(|_| Decimal::from_str("100").unwrap());
 
     let bind_addr = config
         .harvester
@@ -212,6 +231,7 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
                 match LocalSigner::from_str(&pk) {
                     Ok(signer) => {
+                        let wallet_addr = signer.address();
                         let signer = signer.with_chain_id(Some(POLYGON_CHAIN_ID));
                         match ProviderBuilder::new()
                             .wallet(signer)
@@ -219,18 +239,45 @@ async fn main() -> Result<()> {
                             .await
                         {
                             Ok(provider) => {
-                                match polymarket_client_sdk::ctf::Client::with_neg_risk(
-                                    provider,
-                                    POLYGON_CHAIN_ID,
-                                ) {
-                                    Ok(c) => {
-                                        println!("  CTF client ready (mint+sell enabled)");
-                                        Some(Arc::new(CtfSplitter {
-                                            inner: Box::new(CtfClientWrapper { client: c }),
-                                        }))
+                                // Check USDC approval for CTF contract
+                                let usdc_contract = IERC20::new(USDC, provider.clone());
+                                match usdc_contract
+                                    .allowance(wallet_addr, CTF_CONTRACT)
+                                    .call()
+                                    .await
+                                {
+                                    Ok(allowance) => {
+                                        if allowance.is_zero() {
+                                            println!("WARNING: USDC not approved for CTF contract!");
+                                            println!("  Run the approvals example first:");
+                                            println!("  cd polymarket-client-sdk-patch && cargo run --example approvals --features ctf");
+                                            println!("  Mint+sell DISABLED until approved.");
+                                            None
+                                        } else {
+                                            let allowance_usdc = allowance / U256::from(1_000_000u64);
+                                            println!("  USDC allowance for CTF: ${allowance_usdc}");
+                                            match polymarket_client_sdk::ctf::Client::with_neg_risk(
+                                                provider,
+                                                POLYGON_CHAIN_ID,
+                                            ) {
+                                                Ok(c) => {
+                                                    println!("  CTF client ready (mint+sell enabled)");
+                                                    Some(Arc::new(CtfSplitter {
+                                                        inner: Box::new(CtfClientWrapper {
+                                                            client: c,
+                                                        }),
+                                                    }))
+                                                }
+                                                Err(e) => {
+                                                    println!("WARNING: CTF client init failed: {e}, mint+sell disabled");
+                                                    None
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
-                                        println!("WARNING: CTF client init failed: {e}, mint+sell disabled");
+                                        println!("WARNING: could not check USDC allowance: {e}");
+                                        println!("  Proceeding without mint+sell.");
                                         None
                                     }
                                 }
@@ -258,6 +305,11 @@ async fn main() -> Result<()> {
 
     // ── Step 3: Serve dashboard ──────────────────────────────────────────
 
+    println!(
+        "  Limits: ${} per trade, ${} daily",
+        max_trade, max_daily,
+    );
+
     let state = AppState {
         markets: Arc::new(RwLock::new(markets)),
         book_store,
@@ -267,6 +319,9 @@ async fn main() -> Result<()> {
         activity: Arc::new(RwLock::new(Vec::new())),
         max_buy,
         min_sell,
+        max_trade,
+        max_daily,
+        daily_spend: Arc::new(RwLock::new(Vec::new())),
         live_mode,
     };
 
@@ -413,7 +468,6 @@ async fn api_harvest(
     let winner = &outcomes[req.winner_idx];
     let buy_shares = winner.sweepable_shares;
     let buy_cost = winner.sweepable_cost;
-    let buy_profit = winner.sweepable_profit;
 
     // ── 3. Check loser sell-side (mint+sell opportunity) ─────────────────
     // For each loser outcome, check fillable bids.  The mint amount is
@@ -452,11 +506,111 @@ async fn api_harvest(
         && min_loser_sellable > Decimal::ZERO
         && state.ctf.is_some();
 
-    let mint_amount = if use_mint_sell {
+    let mut mint_amount = if use_mint_sell {
         min_loser_sellable
     } else {
         Decimal::ZERO
     };
+
+    // ── 3b. SAFETY: enforce spending limits ─────────────────────────────
+    // Total cost of this trade = buy_cost + mint_amount
+    let mut capped_buy_cost = buy_cost;
+    let mut capped_buy_shares = buy_shares;
+
+    // Cap per-trade spend
+    let total_raw_cost = capped_buy_cost + mint_amount;
+    if total_raw_cost > state.max_trade {
+        // Scale down proportionally to fit within max_trade
+        if mint_amount > Decimal::ZERO && capped_buy_cost > Decimal::ZERO {
+            // Both strategies active — prioritise mint (higher margin), then buy with remainder
+            mint_amount = mint_amount.min(state.max_trade);
+            let remainder = state.max_trade - mint_amount;
+            if remainder > Decimal::ZERO && capped_buy_cost > remainder {
+                // Scale buy shares proportionally to capped cost
+                let scale = remainder / capped_buy_cost;
+                capped_buy_shares = (capped_buy_shares * scale).round_dp(2);
+                capped_buy_cost = remainder;
+            } else if remainder == Decimal::ZERO {
+                capped_buy_shares = Decimal::ZERO;
+                capped_buy_cost = Decimal::ZERO;
+            }
+        } else if mint_amount > Decimal::ZERO {
+            mint_amount = mint_amount.min(state.max_trade);
+        } else {
+            // Buy only — cap cost directly
+            let scale = state.max_trade / capped_buy_cost;
+            capped_buy_shares = (capped_buy_shares * scale).round_dp(2);
+            capped_buy_cost = state.max_trade;
+        }
+    }
+
+    // Check rolling 24h daily limit
+    let now_utc = Utc::now();
+    let cutoff = now_utc - chrono::Duration::hours(24);
+    {
+        let mut spend_log = state.daily_spend.write().await;
+        // Prune old entries
+        spend_log.retain(|(ts, _)| *ts > cutoff);
+        let spent_today: Decimal = spend_log.iter().map(|(_, amt)| amt).sum();
+        let remaining_daily = state.max_daily - spent_today;
+
+        if remaining_daily <= Decimal::ZERO {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Daily limit reached (${:.2} spent of ${:.2} max in last 24h)",
+                        spent_today, state.max_daily
+                    )
+                })),
+            )
+                .into_response();
+        }
+
+        // Cap total cost to remaining daily budget
+        let total_capped = capped_buy_cost + mint_amount;
+        if total_capped > remaining_daily {
+            let scale = remaining_daily / total_capped;
+            capped_buy_shares = (capped_buy_shares * scale).round_dp(2);
+            capped_buy_cost = (capped_buy_cost * scale).round_dp(4);
+            mint_amount = (mint_amount * scale).round_dp(4);
+        }
+    }
+
+    // Recalculate buy profit after capping
+    let buy_profit = capped_buy_shares - capped_buy_cost;
+    let buy_shares = capped_buy_shares;
+    let buy_cost = capped_buy_cost;
+
+    // Check USDC balance (live mode only)
+    if state.live_mode {
+        if let Some(ref api) = state.api {
+            let balance = api.get_balance_usdc().await;
+            let needed = buy_cost + mint_amount;
+            if needed > balance {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Insufficient USDC: need ${:.4} but balance is ${:.4}",
+                            needed, balance
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Also re-check that sell-side bids still have enough depth for capped mint
+    if use_mint_sell && mint_amount > Decimal::ZERO {
+        // Recalculate total_sell_revenue for the capped mint_amount
+        total_sell_revenue = Decimal::ZERO;
+        for (_, sellable, best_bid) in &loser_sell_plans {
+            let sell_size = (*sellable).min(mint_amount);
+            total_sell_revenue += *best_bid * sell_size;
+        }
+    }
 
     // ── 4. Require at least some opportunity ────────────────────────────
     if buy_shares == Decimal::ZERO && mint_amount == Decimal::ZERO {
@@ -614,6 +768,25 @@ async fn api_harvest(
         net_profit: format!("{:.4}", net_profit),
         status: status_parts.join(" | "),
     };
+
+    // Record spend in daily tracker
+    let total_spent = buy_cost + actual_mint_cost;
+    if total_spent > Decimal::ZERO {
+        let mut spend_log = state.daily_spend.write().await;
+        spend_log.push((Utc::now(), total_spent));
+    }
+
+    // Persist to trade log file (append, one JSON line per trade)
+    if let Ok(mut f) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("harvester_trades.jsonl")
+        .await
+    {
+        use tokio::io::AsyncWriteExt;
+        let line = serde_json::to_string(&entry).unwrap_or_default();
+        let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
+    }
 
     let mut activity = state.activity.write().await;
     activity.push(entry.clone());
@@ -885,6 +1058,18 @@ async fn hoover_task(
                     status,
                 };
 
+                // Persist hoover trade to file
+                if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("harvester_trades.jsonl")
+                    .await
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let line = serde_json::to_string(&entry).unwrap_or_default();
+                    let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
+                }
+
                 let mut log = activity.write().await;
                 log.push(entry);
             }
@@ -900,6 +1085,18 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
     let markets = state.markets.read().await;
     let activity = state.activity.read().await;
     let now = Utc::now();
+
+    // Compute 24h spend for display
+    let spent_today_str = {
+        let cutoff = now - chrono::Duration::hours(24);
+        let spend_log = state.daily_spend.read().await;
+        let total: Decimal = spend_log
+            .iter()
+            .filter(|(ts, _)| *ts > cutoff)
+            .map(|(_, amt)| amt)
+            .sum();
+        format!("{:.2}", total)
+    };
 
     // Build market rows — collapsed by default, no book data yet
     let mut market_rows = String::new();
@@ -1093,6 +1290,18 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   <div class="status-item">
     <div class="slabel">Trades</div>
     <div class="sval" style="color:#2ecc71">{trade_count}</div>
+  </div>
+  <div class="status-item">
+    <div class="slabel">Max Trade</div>
+    <div class="sval" style="color:#f39c12">${max_trade}</div>
+  </div>
+  <div class="status-item">
+    <div class="slabel">Daily Limit</div>
+    <div class="sval" style="color:#f39c12">${max_daily}</div>
+  </div>
+  <div class="status-item">
+    <div class="slabel">Spent (24h)</div>
+    <div class="sval" style="color:#e74c3c">${spent_today}</div>
   </div>
 </div>
 
@@ -1445,6 +1654,9 @@ renderPage();
         mode = if state.live_mode { "LIVE" } else { "PAPER" },
         mode_color = if state.live_mode { "#e74c3c" } else { "#f39c12" },
         max_buy = state.max_buy,
+        max_trade = state.max_trade,
+        max_daily = state.max_daily,
+        spent_today = spent_today_str,
         market_count = markets.len(),
         trade_count = activity.len(),
         market_rows = market_rows,

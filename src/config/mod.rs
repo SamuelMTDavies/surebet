@@ -236,6 +236,12 @@ pub struct HarvesterConfig {
     /// Bind address for the harvester dashboard (harvester_dash binary).
     #[serde(default)]
     pub dash_bind: Option<String>,
+    /// Maximum USDC to spend on a single harvest action (buy + mint combined).
+    #[serde(default = "default_harvester_max_trade")]
+    pub max_trade_usd: f64,
+    /// Maximum USDC to spend in a rolling 24-hour window across all trades.
+    #[serde(default = "default_harvester_max_daily")]
+    pub max_daily_usd: f64,
 }
 
 // --- Default functions ---
@@ -340,6 +346,12 @@ fn default_harvester_end_date_window() -> i64 {
 }
 fn default_harvester_max_display() -> usize {
     50
+}
+fn default_harvester_max_trade() -> f64 {
+    25.0
+}
+fn default_harvester_max_daily() -> f64 {
+    100.0
 }
 fn default_ctf_address() -> String {
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
@@ -473,6 +485,8 @@ impl Default for HarvesterConfig {
             end_date_window_days: default_harvester_end_date_window(),
             max_display: default_harvester_max_display(),
             dash_bind: None,
+            max_trade_usd: default_harvester_max_trade(),
+            max_daily_usd: default_harvester_max_daily(),
         }
     }
 }
