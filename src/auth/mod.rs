@@ -7,7 +7,7 @@
 //! This module implements L2. Credentials (api_key, secret, passphrase)
 //! must be derived externally using py-clob-client or rs-clob-client.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE as BASE64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -17,6 +17,7 @@ use tracing::debug;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const HEADER_ADDRESS: &str = "POLY_ADDRESS";
 const HEADER_API_KEY: &str = "POLY_API_KEY";
 const HEADER_SIGNATURE: &str = "POLY_SIGNATURE";
 const HEADER_TIMESTAMP: &str = "POLY_TIMESTAMP";
@@ -36,17 +37,19 @@ pub enum AuthError {
 
 #[derive(Debug, Clone)]
 pub struct L2Credentials {
+    pub address: String,
     pub api_key: String,
     pub secret: String,
     pub passphrase: String,
 }
 
 impl L2Credentials {
-    pub fn from_config(api_key: &str, secret: &str, passphrase: &str) -> Option<Self> {
+    pub fn from_config(address: &str, api_key: &str, secret: &str, passphrase: &str) -> Option<Self> {
         if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
             return None;
         }
         Some(Self {
+            address: address.to_lowercase(),
             api_key: api_key.to_string(),
             secret: secret.to_string(),
             passphrase: passphrase.to_string(),
@@ -56,8 +59,11 @@ impl L2Credentials {
 
 /// Build L2 auth headers for a CLOB API request.
 ///
-/// The signature is HMAC-SHA256(secret, timestamp + method + path + body)
-/// encoded as base64.
+/// The signature is HMAC-SHA256(url_safe_b64_decode(secret),
+///   timestamp + METHOD + path_only + body), URL-safe base64 encoded.
+///
+/// IMPORTANT: `path` for signing must be the URL path WITHOUT the query string
+/// (matches the upstream SDK and Polymarket's HMAC verifier).
 pub fn build_l2_headers(
     creds: &L2Credentials,
     method: &str,
@@ -66,7 +72,16 @@ pub fn build_l2_headers(
 ) -> Result<HeaderMap, AuthError> {
     let timestamp = chrono::Utc::now().timestamp().to_string();
 
-    let message = format!("{}{}{}{}", timestamp, method.to_uppercase(), path, body);
+    // Strip query string from path if present — signature only covers the path
+    let path_for_sig = path.split('?').next().unwrap_or(path);
+
+    let message = format!(
+        "{}{}{}{}",
+        timestamp,
+        method.to_uppercase(),
+        path_for_sig,
+        body
+    );
 
     let secret_bytes = BASE64
         .decode(&creds.secret)
@@ -85,6 +100,10 @@ pub fn build_l2_headers(
     );
 
     let mut headers = HeaderMap::new();
+    headers.insert(
+        HEADER_ADDRESS,
+        HeaderValue::from_str(&creds.address).unwrap(),
+    );
     headers.insert(
         HEADER_API_KEY,
         HeaderValue::from_str(&creds.api_key).unwrap(),
@@ -281,10 +300,16 @@ impl ClobApiClient {
 
     /// Query available USDC balance from the CLOB API.
     /// Returns the collateral balance as a Decimal, or 0 on failure.
+    ///
+    /// signature_type=0 (EOA) is required — this client uses a direct EOA
+    /// wallet, not a Polymarket proxy/Safe.
     pub async fn get_balance_usdc(&self) -> rust_decimal::Decimal {
         // The CLOB API's /balance-allowance endpoint returns
-        // { "balance": "123.45", ... } for collateral.
-        match self.get("/balance-allowance?asset_type=COLLATERAL").await {
+        // { "balance": "123450000", ... } where balance is in 6-decimal USDC units.
+        match self
+            .get("/balance-allowance?asset_type=COLLATERAL&signature_type=0")
+            .await
+        {
             Ok(val) => {
                 val.get("balance")
                     .and_then(|b| b.as_str())

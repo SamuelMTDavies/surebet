@@ -127,6 +127,20 @@ end_date_window_days = 2
 max_display = 50
 # Dashboard bind address (harvester_dash binary)
 dash_bind = "127.0.0.1:3031"
+# SAFETY LIMITS
+max_trade_usd = 10.0
+max_daily_usd = 30.0
+# Gas price ceiling — refuse to mint when current Polygon gas price exceeds
+# this many Gwei. Typical baseline is 150-300 Gwei; spikes can hit 1000+.
+# This protects against the kind of $0.165 gas-on-a-$2-trade outlier we saw.
+max_gas_gwei = 600.0
+# Minimum expected NET profit (sell_revenue - estimated_gas_cost in USDC) for
+# a mint+sell trade to proceed. Anything less than this is dust — refuses the
+# trade before submission.
+min_profit_usdc = 0.005
+# Approximate MATIC → USD price for gas cost estimation. Update manually as
+# the price moves; only affects the profit estimator, not actual transactions.
+matic_usd_price = 0.40
 
 [logging]
 level = "info"

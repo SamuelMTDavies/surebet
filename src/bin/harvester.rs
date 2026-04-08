@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
     // Build API client once (live mode)
     let api = if live_mode {
         let creds = L2Credentials::from_config(
+            &config.polymarket.api_address,
             &config.polymarket.api_key,
             &config.polymarket.api_secret,
             &config.polymarket.api_passphrase,

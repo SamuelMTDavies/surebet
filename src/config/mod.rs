@@ -47,6 +47,9 @@ pub struct PolymarketConfig {
     /// Gamma API URL (market discovery)
     #[serde(default = "default_gamma_url")]
     pub gamma_url: String,
+    /// Polygon address for API auth - loaded from env POLY_ADDRESS
+    #[serde(default)]
+    pub api_address: String,
     /// API key (L2 auth) - loaded from env POLY_API_KEY
     #[serde(default)]
     pub api_key: String,
@@ -242,6 +245,18 @@ pub struct HarvesterConfig {
     /// Maximum USDC to spend in a rolling 24-hour window across all trades.
     #[serde(default = "default_harvester_max_daily")]
     pub max_daily_usd: f64,
+    /// Refuse to mint when current Polygon gas price (Gwei) exceeds this.
+    /// Protects against gas spikes that make small trades unprofitable.
+    #[serde(default = "default_harvester_max_gas_gwei")]
+    pub max_gas_gwei: f64,
+    /// Minimum NET profit (sell_revenue - estimated_gas_cost in USDC) for a
+    /// mint+sell trade to proceed. Trades projected below this are refused.
+    #[serde(default = "default_harvester_min_profit")]
+    pub min_profit_usdc: f64,
+    /// Approximate MATIC → USD price used for converting gas cost estimates
+    /// into USDC for the min_profit_usdc check. Update manually.
+    #[serde(default = "default_harvester_matic_usd")]
+    pub matic_usd_price: f64,
 }
 
 // --- Default functions ---
@@ -352,6 +367,15 @@ fn default_harvester_max_trade() -> f64 {
 }
 fn default_harvester_max_daily() -> f64 {
     100.0
+}
+fn default_harvester_max_gas_gwei() -> f64 {
+    600.0
+}
+fn default_harvester_min_profit() -> f64 {
+    0.005
+}
+fn default_harvester_matic_usd() -> f64 {
+    0.40
 }
 fn default_ctf_address() -> String {
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
@@ -487,6 +511,9 @@ impl Default for HarvesterConfig {
             dash_bind: None,
             max_trade_usd: default_harvester_max_trade(),
             max_daily_usd: default_harvester_max_daily(),
+            max_gas_gwei: default_harvester_max_gas_gwei(),
+            min_profit_usdc: default_harvester_min_profit(),
+            matic_usd_price: default_harvester_matic_usd(),
         }
     }
 }
@@ -498,6 +525,9 @@ impl Config {
         let mut config: Config = toml::from_str(&contents)?;
 
         // Override secrets from environment variables (never store in config file)
+        if let Ok(addr) = std::env::var("POLY_ADDRESS") {
+            config.polymarket.api_address = addr;
+        }
         if let Ok(key) = std::env::var("POLY_API_KEY") {
             config.polymarket.api_key = key;
         }
@@ -534,6 +564,7 @@ impl Config {
                     .unwrap_or_else(|_| default_rtds_ws_url()),
                 gamma_url: std::env::var("POLY_GAMMA_URL")
                     .unwrap_or_else(|_| default_gamma_url()),
+                api_address: std::env::var("POLY_ADDRESS").unwrap_or_default(),
                 api_key: std::env::var("POLY_API_KEY").unwrap_or_default(),
                 api_secret: std::env::var("POLY_API_SECRET").unwrap_or_default(),
                 api_passphrase: std::env::var("POLY_API_PASSPHRASE").unwrap_or_default(),

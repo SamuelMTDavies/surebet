@@ -75,3 +75,7 @@ path = "src/bin/harvester.rs"
 [[bin]]
 name = "harvester_dash"
 path = "src/bin/harvester_dash.rs"
+
+[[bin]]
+name = "ctf_admin"
+path = "src/bin/ctf_admin.rs"

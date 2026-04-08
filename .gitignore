@@ -10,3 +10,13 @@
 
 # Environment secrets
 .env
+
+# Runtime state — personal trading activity / on-chain checkpoints
+harvester_trades.jsonl
+onchain_checkpoint.txt
+report.txt
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.claude/

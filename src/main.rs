@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- L2 Auth Setup ---
     let creds = L2Credentials::from_config(
+        &config.polymarket.api_address,
         &config.polymarket.api_key,
         &config.polymarket.api_secret,
         &config.polymarket.api_passphrase,
@@ -101,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     if creds.is_none() {
         warn!(
             "no API credentials configured - running in read-only mode \
-             (set POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE for trading)"
+             (set POLY_ADDRESS, POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE for trading)"
         );
     }
 
