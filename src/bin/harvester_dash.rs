@@ -44,7 +44,7 @@ use tracing::info;
 
 use surebet::auth::{ClobApiClient, L2Credentials, OrderSide};
 use surebet::config::Config;
-use surebet::harvester::{build_outcome_info, scan_markets, HarvestableMarket, OutcomeInfo};
+use surebet::harvester::{build_outcome_info, scan_markets, HarvestableMarket, OutcomeInfo, ScanMode};
 use surebet::orderbook::OrderBookStore;
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
@@ -513,6 +513,7 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let live_mode = args.iter().any(|a| a == "--live");
+    let closed_mode = args.iter().any(|a| a == "--closed");
 
     let config = match Config::load(std::path::Path::new("surebet.toml")) {
         Ok(c) => c,
@@ -544,19 +545,36 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| "127.0.0.1:3031".to_string());
 
+    let scan_mode = if closed_mode {
+        ScanMode::RecentlyClosed
+    } else {
+        ScanMode::NearExpiry
+    };
+
     println!("=== Harvester Dashboard ===");
     println!(
-        "Mode: {}  |  Buy limit: ${}  |  Window: {}d",
+        "Mode: {}  |  Scan: {}  |  Buy limit: ${}",
         if live_mode { "LIVE" } else { "PAPER" },
+        match scan_mode {
+            ScanMode::NearExpiry => format!("near-expiry ({}d window)", harvester.end_date_window_days),
+            ScanMode::RecentlyClosed => format!("recently-closed ({}d lookback)", harvester.closed_lookback_days),
+        },
         max_buy,
-        harvester.end_date_window_days,
     );
 
     // ── Step 1: Scan markets (no book fetching) ──────────────────────────
 
     println!("Scanning Gamma API...");
     // Dashboard shows ALL markets — no truncation.  Books fetched on demand.
-    let markets = scan_markets(gamma_url, harvester.end_date_window_days, usize::MAX).await?;
+    let markets = scan_markets(
+        gamma_url,
+        scan_mode,
+        harvester.end_date_window_days,
+        harvester.closed_lookback_days,
+        usize::MAX,
+        harvester.min_volume_usd,
+        harvester.min_depth_usd,
+    ).await?;
 
     if markets.is_empty() {
         bail!("No markets found matching criteria.");

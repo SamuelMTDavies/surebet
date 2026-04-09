@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use surebet::auth::{ClobApiClient, L2Credentials, OrderSide};
 use surebet::config::Config;
-use surebet::harvester::{build_outcome_info, scan_markets, OutcomeInfo};
+use surebet::harvester::{build_outcome_info, scan_markets, OutcomeInfo, ScanMode};
 use surebet::orderbook::OrderBookStore;
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let live_mode = args.iter().any(|a| a == "--live");
+    let closed_mode = args.iter().any(|a| a == "--closed");
 
     let config = match Config::load(std::path::Path::new("surebet.toml")) {
         Ok(c) => c,
@@ -88,20 +89,47 @@ async fn main() -> Result<()> {
         None
     };
 
+    let scan_mode = if closed_mode {
+        ScanMode::RecentlyClosed
+    } else {
+        ScanMode::NearExpiry
+    };
+
     println!("=== Stale Order Harvester ===");
     println!(
-        "Mode: {}  |  Buy limit: ${}  |  Window: {}d",
+        "Mode: {}  |  Scan: {}  |  Buy limit: ${}",
         if api.is_some() { "LIVE" } else { "PAPER" },
+        match scan_mode {
+            ScanMode::NearExpiry => format!("near-expiry ({}d window)", harvester.end_date_window_days),
+            ScanMode::RecentlyClosed => format!("recently-closed ({}d lookback)", harvester.closed_lookback_days),
+        },
         max_buy,
-        harvester.end_date_window_days,
     );
+    if harvester.min_volume_usd > 0.0 || harvester.min_depth_usd > 0.0 {
+        println!(
+            "  Filters: vol ≥ ${:.0}  depth ≥ ${:.0}",
+            harvester.min_volume_usd, harvester.min_depth_usd,
+        );
+    }
     println!("  Type 'b' to go back, 'q' to quit at any prompt.");
     println!();
 
     // ── Step 1: Scan Gamma API ──────────────────────────────────────────────
 
-    println!("Scanning Gamma API for markets near end date...");
-    let markets = scan_markets(gamma_url, harvester.end_date_window_days, harvester.max_display).await?;
+    let scan_label = match scan_mode {
+        ScanMode::NearExpiry => "markets near end date",
+        ScanMode::RecentlyClosed => "recently-closed markets",
+    };
+    println!("Scanning Gamma API for {}...", scan_label);
+    let markets = scan_markets(
+        gamma_url,
+        scan_mode,
+        harvester.end_date_window_days,
+        harvester.closed_lookback_days,
+        harvester.max_display,
+        harvester.min_volume_usd,
+        harvester.min_depth_usd,
+    ).await?;
 
     if markets.is_empty() {
         println!("No markets found matching criteria.");
@@ -367,14 +395,21 @@ fn display_markets(markets: &[surebet::harvester::HarvestableMarket]) {
     let now = Utc::now();
     println!();
     println!(
-        " {:<3} | {:<12} | {:<3} | {:<8} | {:<12} | Question",
-        "#", "End Date", "Out", "NegRisk", "Category"
+        " {:<3} | {:<12} | {:<3} | {:<6} | {:<10} | {:<12} | Question",
+        "#", "End Date", "Out", "Orders", "Vol 24h$", "Category"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(100));
 
     for (i, m) in markets.iter().enumerate() {
         let end_str = match m.end_date {
-            Some(ed) if ed < now => "PAST".to_string(),
+            Some(ed) if ed < now => {
+                let ago = now - ed;
+                if ago.num_hours() < 24 {
+                    format!("{}h ago", ago.num_hours())
+                } else {
+                    format!("{}d ago", ago.num_days())
+                }
+            }
             Some(ed) => {
                 let diff = ed - now;
                 if diff.num_hours() < 24 {
@@ -386,6 +421,18 @@ fn display_markets(markets: &[surebet::harvester::HarvestableMarket]) {
             None => "???".to_string(),
         };
 
+        let orders_str = if m.accepting_orders { "open" } else { "CLOSED" };
+
+        let vol_str = if m.volume_24hr >= 1_000_000.0 {
+            format!("{:.1}M", m.volume_24hr / 1_000_000.0)
+        } else if m.volume_24hr >= 1_000.0 {
+            format!("{:.1}K", m.volume_24hr / 1_000.0)
+        } else if m.volume_24hr > 0.0 {
+            format!("{:.0}", m.volume_24hr)
+        } else {
+            "-".to_string()
+        };
+
         let question_trunc = if m.question.len() > 50 {
             format!("{}...", &m.question[..47])
         } else {
@@ -393,11 +440,12 @@ fn display_markets(markets: &[surebet::harvester::HarvestableMarket]) {
         };
 
         println!(
-            " {:<3} | {:<12} | {:<3} | {:<8} | {:<12} | {}",
+            " {:<3} | {:<12} | {:<3} | {:<6} | {:<10} | {:<12} | {}",
             i + 1,
             end_str,
             m.outcomes.len(),
-            if m.is_neg_risk { "yes" } else { "no" },
+            orders_str,
+            vol_str,
             if m.category.len() > 12 {
                 &m.category[..12]
             } else {

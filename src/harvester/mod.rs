@@ -8,6 +8,19 @@ use serde::Serialize;
 
 use crate::orderbook::OrderBook;
 
+// ─── Scan mode ───────────────────────────────────────────────────────────────
+
+/// Which set of markets to target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Markets whose end date falls within the next N days (original behaviour).
+    NearExpiry,
+    /// Markets Gamma has already marked `closed=true`, whose end date falls
+    /// within the past N days.  These have stopped trading but may not yet be
+    /// redeemed on-chain — stale or residual CLOB orders can still exist.
+    RecentlyClosed,
+}
+
 // ─── Gamma API response type ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -45,6 +58,15 @@ pub struct GammaMarket {
     pub category: Option<String>,
     #[serde(default)]
     pub slug: Option<String>,
+    /// 24-hour trading volume in USDC (JSON field: "volume24hr").
+    #[serde(default)]
+    pub volume_24hr: Option<f64>,
+    /// Current liquidity depth in USDC — used as a proxy for book depth.
+    #[serde(default)]
+    pub liquidity: Option<f64>,
+    /// ISO-8601 timestamp of when the market was closed, if available.
+    #[serde(default)]
+    pub closed_time: Option<String>,
 }
 
 /// Parsed market ready for display.
@@ -59,6 +81,14 @@ pub struct HarvestableMarket {
     pub is_neg_risk: bool,
     pub category: String,
     pub slug: Option<String>,
+    /// Whether the CLOB is currently accepting new orders.
+    /// False for `RecentlyClosed` markets — orders cannot be placed, but tokens
+    /// may still be redeemable on-chain.
+    pub accepting_orders: bool,
+    /// 24-hour trading volume in USDC at scan time (0.0 if unavailable).
+    pub volume_24hr: f64,
+    /// Gamma liquidity depth proxy in USDC at scan time (0.0 if unavailable).
+    pub liquidity: f64,
 }
 
 /// Per-outcome book info.
@@ -86,28 +116,60 @@ pub struct OutcomeInfo {
 
 // ─── Gamma API scan ─────────────────────────────────────────────────────────
 
+/// Fetch harvestable markets from the Gamma API.
+///
+/// - `mode` controls which markets to target (see [`ScanMode`]).
+/// - `end_date_window_days`: for `NearExpiry`, how many days ahead to look.
+/// - `closed_lookback_days`: for `RecentlyClosed`, how many days back to look.
+/// - `max_display`: truncate the result list to this many entries.
+/// - `min_volume_usd`: skip markets with 24 h volume below this (0 = no filter).
+/// - `min_depth_usd`: skip markets with Gamma liquidity below this (0 = no filter).
 pub async fn scan_markets(
     gamma_url: &str,
+    mode: ScanMode,
     end_date_window_days: i64,
+    closed_lookback_days: i64,
     max_display: usize,
+    min_volume_usd: f64,
+    min_depth_usd: f64,
 ) -> Result<Vec<HarvestableMarket>> {
     let http = reqwest::Client::new();
     let now = Utc::now();
 
-    let date_min = now.format("%Y-%m-%d").to_string();
-    let date_max = (now + Duration::days(end_date_window_days + 1))
-        .format("%Y-%m-%d")
-        .to_string();
+    // Build the query URL depending on mode.
+    let (query_base, date_range_label) = match mode {
+        ScanMode::NearExpiry => {
+            let date_min = now.format("%Y-%m-%d").to_string();
+            let date_max = (now + Duration::days(end_date_window_days + 1))
+                .format("%Y-%m-%d")
+                .to_string();
+            let base = format!(
+                "{}/markets?active=true&closed=false&end_date_min={}&end_date_max={}",
+                gamma_url, date_min, date_max,
+            );
+            let label = format!("{} → {}", date_min, date_max);
+            (base, label)
+        }
+        ScanMode::RecentlyClosed => {
+            let date_min = (now - Duration::days(closed_lookback_days))
+                .format("%Y-%m-%d")
+                .to_string();
+            let date_max = now.format("%Y-%m-%d").to_string();
+            let base = format!(
+                "{}/markets?closed=true&end_date_min={}&end_date_max={}",
+                gamma_url, date_min, date_max,
+            );
+            let label = format!("{} → {}", date_min, date_max);
+            (base, label)
+        }
+    };
 
     let mut all_raw: Vec<GammaMarket> = Vec::new();
     let mut offset = 0usize;
-    let limit = 100;
+    let limit = 100usize;
 
     loop {
-        let url = format!(
-            "{}/markets?active=true&closed=false&end_date_min={}&end_date_max={}&limit={}&offset={}",
-            gamma_url, date_min, date_max, limit, offset,
-        );
+        let url = format!("{}&limit={}&offset={}", query_base, limit, offset);
         let resp = http
             .get(&url)
             .send()
@@ -137,17 +199,18 @@ pub async fn scan_markets(
 
     let pages = if offset == 0 { 0 } else { (offset + limit - 1) / limit };
     println!(
-        "  Fetched {} markets ending {} → {} ({} pages)",
+        "  Fetched {} markets ({}) ({} pages)",
         all_raw.len(),
-        date_min,
-        date_max,
+        date_range_label,
         pages,
     );
 
     let mut results: Vec<HarvestableMarket> = Vec::new();
 
     for raw in &all_raw {
-        if raw.accepting_orders != Some(true) {
+        // For NearExpiry: must be actively accepting orders.
+        // For RecentlyClosed: accepting_orders is expected to be false — skip this gate.
+        if mode == ScanMode::NearExpiry && raw.accepting_orders != Some(true) {
             continue;
         }
 
@@ -178,6 +241,16 @@ pub async fn scan_markets(
             continue;
         }
 
+        // Liquidity gates (use Gamma's fields as proxies; skip if fields absent).
+        let vol = raw.volume_24hr.unwrap_or(0.0);
+        let liq = raw.liquidity.unwrap_or(0.0);
+        if min_volume_usd > 0.0 && vol < min_volume_usd {
+            continue;
+        }
+        if min_depth_usd > 0.0 && liq < min_depth_usd {
+            continue;
+        }
+
         let end_date = raw
             .end_date
             .as_ref()
@@ -201,21 +274,40 @@ pub async fn scan_markets(
             is_neg_risk: raw.neg_risk.unwrap_or(false),
             category: raw.category.clone().unwrap_or_default(),
             slug: raw.slug.clone(),
+            accepting_orders: raw.accepting_orders.unwrap_or(false),
+            volume_24hr: vol,
+            liquidity: liq,
         });
     }
 
-    // Sort: soonest end date first
-    results.sort_by(|a, b| {
-        let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-        a_dt.cmp(&b_dt)
-    });
+    // NearExpiry: soonest end date first (most urgent).
+    // RecentlyClosed: most recently closed first (freshest stale orders).
+    match mode {
+        ScanMode::NearExpiry => {
+            results.sort_by(|a, b| {
+                let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
+                let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
+                a_dt.cmp(&b_dt)
+            });
+        }
+        ScanMode::RecentlyClosed => {
+            results.sort_by(|a, b| {
+                let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MIN_UTC);
+                let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MIN_UTC);
+                b_dt.cmp(&a_dt) // descending: most recently closed first
+            });
+        }
+    }
 
     results.truncate(max_display);
 
     println!(
-        "  After filtering: {} markets within end-date window",
-        results.len()
+        "  After filtering: {} {} markets",
+        results.len(),
+        match mode {
+            ScanMode::NearExpiry => "near-expiry",
+            ScanMode::RecentlyClosed => "recently-closed",
+        },
     );
 
     Ok(results)

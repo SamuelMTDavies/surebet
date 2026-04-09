@@ -257,6 +257,19 @@ pub struct HarvesterConfig {
     /// into USDC for the min_profit_usdc check. Update manually.
     #[serde(default = "default_harvester_matic_usd")]
     pub matic_usd_price: f64,
+    /// Minimum 24 h trading volume (USDC) for a market to be included.
+    /// Applies to both NearExpiry and RecentlyClosed scan modes.
+    /// 0.0 disables the filter (default).
+    #[serde(default)]
+    pub min_volume_usd: f64,
+    /// Minimum Gamma liquidity (USDC) for a market to be included.
+    /// Used as a proxy for order-book depth.  0.0 disables the filter (default).
+    #[serde(default)]
+    pub min_depth_usd: f64,
+    /// How many days back to look when scanning for recently-closed markets
+    /// (`--closed` flag).  Default: 3 days.
+    #[serde(default = "default_harvester_closed_lookback")]
+    pub closed_lookback_days: i64,
 }
 
 // --- Default functions ---
@@ -376,6 +389,9 @@ fn default_harvester_min_profit() -> f64 {
 }
 fn default_harvester_matic_usd() -> f64 {
     0.40
+}
+fn default_harvester_closed_lookback() -> i64 {
+    3
 }
 fn default_ctf_address() -> String {
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
@@ -514,6 +530,9 @@ impl Default for HarvesterConfig {
             max_gas_gwei: default_harvester_max_gas_gwei(),
             min_profit_usdc: default_harvester_min_profit(),
             matic_usd_price: default_harvester_matic_usd(),
+            min_volume_usd: 0.0,
+            min_depth_usd: 0.0,
+            closed_lookback_days: default_harvester_closed_lookback(),
         }
     }
 }
