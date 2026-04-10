@@ -2603,8 +2603,9 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             None => "???".to_string(),
         };
 
-        let q_display = if m.question.len() > 90 {
-            format!("{}...", &m.question[..87])
+        let q_display = if m.question.chars().count() > 90 {
+            let end = m.question.char_indices().nth(87).map(|(i, _)| i).unwrap_or(m.question.len());
+            format!("{}...", &m.question[..end])
         } else {
             m.question.clone()
         };
@@ -2630,7 +2631,10 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
             q_display = q_display,
             end_str = end_str,
             n_out = m.outcomes.len(),
-            cat = if m.category.len() > 15 { &m.category[..15] } else { &m.category },
+            cat = {
+                let end = m.category.char_indices().nth(15).map(|(i, _)| i).unwrap_or(m.category.len());
+                &m.category[..end]
+            },
             neg = if m.is_neg_risk { " | neg_risk" } else { "" },
         ));
     }

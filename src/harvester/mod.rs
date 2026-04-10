@@ -299,8 +299,9 @@ pub async fn filter_with_resting_orders(
             }
         }
 
-        let q = if market.question.len() > 60 {
-            format!("{}...", &market.question[..57])
+        let q = if market.question.chars().count() > 60 {
+            let end = market.question.char_indices().nth(57).map(|(i, _)| i).unwrap_or(market.question.len());
+            format!("{}...", &market.question[..end])
         } else {
             market.question.clone()
         };
