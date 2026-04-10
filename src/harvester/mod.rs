@@ -105,7 +105,7 @@ pub async fn scan_markets(
                 .format("%Y-%m-%d")
                 .to_string();
             let base = format!(
-                "{}/markets?active=true&closed=false&end_date_min={}&end_date_max={}",
+                "{}/markets?end_date_min={}&end_date_max={}",
                 gamma_url, date_min, date_max,
             );
             let label = format!("{} → {}", date_min, date_max);
