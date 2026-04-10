@@ -31,6 +31,26 @@ pub struct Config {
     pub onchain: OnChainConfig,
     #[serde(default)]
     pub harvester: HarvesterConfig,
+    #[serde(default)]
+    pub weather: WeatherConfig,
+}
+
+/// Configuration for the weather bracket early-entry strategy.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeatherConfig {
+    /// Enable the weather bracket strategy.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum edge (forecast_prob − ask_price) to emit a buy signal.
+    #[serde(default = "default_weather_min_edge")]
+    pub min_edge_threshold: f64,
+    /// Maximum USD to allocate per bracket outcome.
+    #[serde(default = "default_weather_max_position")]
+    pub max_position_usd: f64,
+    /// Skip brackets where the forecast mean is within this many degrees of a
+    /// bracket boundary (edge is unreliable near boundaries).
+    #[serde(default = "default_weather_boundary_buffer")]
+    pub boundary_buffer_degrees: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,6 +294,16 @@ pub struct HarvesterConfig {
     /// (`--closed` flag).  Default: 3 (catches markets about to close).
     #[serde(default = "default_resolution_ahead_hours")]
     pub resolution_window_ahead_hours: i64,
+}
+
+fn default_weather_min_edge() -> f64 {
+    0.15
+}
+fn default_weather_max_position() -> f64 {
+    50.0
+}
+fn default_weather_boundary_buffer() -> f64 {
+    0.5
 }
 
 // --- Default functions ---
@@ -524,6 +554,17 @@ impl Default for OnChainConfig {
     }
 }
 
+impl Default for WeatherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_edge_threshold: default_weather_min_edge(),
+            max_position_usd: default_weather_max_position(),
+            boundary_buffer_degrees: default_weather_boundary_buffer(),
+        }
+    }
+}
+
 impl Default for HarvesterConfig {
     fn default() -> Self {
         Self {
@@ -623,6 +664,7 @@ impl Config {
                     ..OnChainConfig::default()
                 }
             },
+            weather: WeatherConfig::default(),
         }
     }
 

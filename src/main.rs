@@ -8,6 +8,7 @@ mod onchain;
 mod orderbook;
 mod sniper;
 mod store;
+mod weather;
 mod ws;
 
 use crate::crossbook::{CrossbookEvent, CrossbookScanner};
