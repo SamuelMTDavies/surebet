@@ -53,6 +53,10 @@ const USDC: alloy::primitives::Address = address!("0x2791Bca1f2de4661ED88A30C99A
 /// CTF contract on Polygon (needs USDC approval for splits)
 const CTF_CONTRACT: alloy::primitives::Address =
     address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
+/// NegRiskAdapter on Polygon — neg_risk markets must route split/merge through
+/// this contract so the minted tokens are CLOB-tradeable (wrapped ERC-1155).
+const NEG_RISK_ADAPTER: alloy::primitives::Address =
+    address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
 
@@ -61,6 +65,31 @@ alloy::sol! {
     #[sol(rpc)]
     interface IERC20 {
         function allowance(address owner, address spender) external view returns (uint256);
+    }
+}
+
+// NegRiskAdapter split/merge interface. For neg_risk markets the CLOB trades
+// wrapped tokens; calling splitPosition/mergePositions on the raw CTF contract
+// produces tokens the CLOB can't see. The NegRiskAdapter provides compatible
+// overloads that produce CLOB-tradeable wrapped ERC-1155 tokens.
+alloy::sol! {
+    #[sol(rpc)]
+    interface INegRiskAdapterSplit {
+        function splitPosition(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata partition,
+            uint256 amount
+        ) external;
+
+        function mergePositions(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata partition,
+            uint256 amount
+        ) external;
     }
 }
 
@@ -104,12 +133,14 @@ trait CtfSplitTrait: Send + Sync {
         &self,
         condition_id: B256,
         amount_usdc_units: U256,
+        is_neg_risk: bool,
     ) -> anyhow::Result<OnchainTxResult>;
 
     async fn merge_position(
         &self,
         condition_id: B256,
         amount_usdc_units: U256,
+        is_neg_risk: bool,
     ) -> anyhow::Result<OnchainTxResult>;
 
     async fn redeem_position(&self, condition_id: B256) -> anyhow::Result<OnchainTxResult>;
@@ -213,28 +244,72 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
         &self,
         condition_id: B256,
         amount_usdc_units: U256,
+        is_neg_risk: bool,
     ) -> anyhow::Result<OnchainTxResult> {
-        let req = SplitPositionRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
-        let resp = self
-            .client
-            .split_position(&req)
-            .await
-            .map_err(|e| anyhow::anyhow!("CTF split failed: {}", e))?;
-        Ok(self.gas_for(resp.transaction_hash).await)
+        if is_neg_risk {
+            // Route through NegRiskAdapter so the minted tokens are wrapped
+            // ERC-1155s that the CLOB exchange can recognise.
+            let adapter = INegRiskAdapterSplit::new(
+                NEG_RISK_ADAPTER,
+                self.client.provider().clone(),
+            );
+            let partition = vec![U256::from(1u64), U256::from(2u64)];
+            let pending_tx = adapter
+                .splitPosition(USDC, B256::ZERO, condition_id, partition, amount_usdc_units)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("NegRisk split failed: {e}"))?;
+            let tx_hash = *pending_tx.tx_hash();
+            let _receipt = pending_tx
+                .get_receipt()
+                .await
+                .map_err(|e| anyhow::anyhow!("NegRisk split receipt failed: {e}"))?;
+            Ok(self.gas_for(tx_hash).await)
+        } else {
+            let req =
+                SplitPositionRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
+            let resp = self
+                .client
+                .split_position(&req)
+                .await
+                .map_err(|e| anyhow::anyhow!("CTF split failed: {}", e))?;
+            Ok(self.gas_for(resp.transaction_hash).await)
+        }
     }
 
     async fn merge_position(
         &self,
         condition_id: B256,
         amount_usdc_units: U256,
+        is_neg_risk: bool,
     ) -> anyhow::Result<OnchainTxResult> {
-        let req = MergePositionsRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
-        let resp = self
-            .client
-            .merge_positions(&req)
-            .await
-            .map_err(|e| anyhow::anyhow!("CTF merge failed: {}", e))?;
-        Ok(self.gas_for(resp.transaction_hash).await)
+        if is_neg_risk {
+            let adapter = INegRiskAdapterSplit::new(
+                NEG_RISK_ADAPTER,
+                self.client.provider().clone(),
+            );
+            let partition = vec![U256::from(1u64), U256::from(2u64)];
+            let pending_tx = adapter
+                .mergePositions(USDC, B256::ZERO, condition_id, partition, amount_usdc_units)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("NegRisk merge failed: {e}"))?;
+            let tx_hash = *pending_tx.tx_hash();
+            let _receipt = pending_tx
+                .get_receipt()
+                .await
+                .map_err(|e| anyhow::anyhow!("NegRisk merge receipt failed: {e}"))?;
+            Ok(self.gas_for(tx_hash).await)
+        } else {
+            let req =
+                MergePositionsRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
+            let resp = self
+                .client
+                .merge_positions(&req)
+                .await
+                .map_err(|e| anyhow::anyhow!("CTF merge failed: {}", e))?;
+            Ok(self.gas_for(resp.transaction_hash).await)
+        }
     }
 
     async fn redeem_position(&self, condition_id: B256) -> anyhow::Result<OnchainTxResult> {
@@ -450,6 +525,9 @@ struct AppState {
     /// stranding more tokens). User can clear it via /api/clear-geoblock after
     /// enabling a VPN.
     geoblocked: Arc<AtomicBool>,
+    /// True while the background market scan is in progress. The dashboard
+    /// shows a loading banner until this clears.
+    scanning: Arc<AtomicBool>,
     /// Current scan mode — switchable at runtime via POST /api/rescan.
     scan_mode: Arc<RwLock<ScanMode>>,
     /// Gamma API base URL, stored for runtime rescans.
@@ -576,33 +654,7 @@ async fn main() -> Result<()> {
         max_buy,
     );
 
-    // ── Step 1: Scan markets (no book fetching) ──────────────────────────
-
-    println!("Scanning Gamma API...");
-    // Dashboard shows ALL markets — no truncation.  Books fetched on demand.
-    let markets = scan_markets(
-        &gamma_url,
-        scan_mode,
-        harvester.end_date_window_days,
-        harvester.resolution_window_behind_hours,
-        harvester.resolution_window_ahead_hours,
-        usize::MAX,
-        harvester.min_volume_usd,
-        harvester.min_depth_usd,
-    ).await?;
-
-    // For the resolution window: drop markets with no resting orders on the CLOB.
-    let markets = if scan_mode == ScanMode::ResolutionWindow {
-        filter_with_resting_orders(&clob_url, markets).await
-    } else {
-        markets
-    };
-
-    if markets.is_empty() {
-        bail!("No markets found matching criteria.");
-    }
-
-    println!("  {} markets loaded (books fetched on demand)", markets.len());
+    // ── Step 1 (deferred): market scan runs in background after server starts ──
 
     // ── Step 2: Build API client ─────────────────────────────────────────
 
@@ -674,7 +726,7 @@ async fn main() -> Result<()> {
                             .await
                         {
                             Ok(provider) => {
-                                // Check USDC approval for CTF contract
+                                // Check USDC approval for CTF contract + NegRiskAdapter
                                 let usdc_contract = IERC20::new(USDC, provider.clone());
                                 match usdc_contract
                                     .allowance(wallet_addr, CTF_CONTRACT)
@@ -691,6 +743,26 @@ async fn main() -> Result<()> {
                                         } else {
                                             let allowance_usdc = allowance / U256::from(1_000_000u64);
                                             println!("  USDC allowance for CTF: ${allowance_usdc}");
+
+                                            // Also check NegRiskAdapter allowance
+                                            match usdc_contract
+                                                .allowance(wallet_addr, NEG_RISK_ADAPTER)
+                                                .call()
+                                                .await
+                                            {
+                                                Ok(nr_allowance) => {
+                                                    if nr_allowance.is_zero() {
+                                                        println!("  WARNING: USDC not approved for NegRiskAdapter — neg_risk mints will fail!");
+                                                        println!("  Approve 0x{:x} to spend USDC.", NEG_RISK_ADAPTER);
+                                                    } else {
+                                                        let nr_usdc = nr_allowance / U256::from(1_000_000u64);
+                                                        println!("  USDC allowance for NegRiskAdapter: ${nr_usdc}");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!("  WARNING: could not check NegRiskAdapter allowance: {e}");
+                                                }
+                                            }
                                             match polymarket_client_sdk::ctf::Client::with_neg_risk(
                                                 provider,
                                                 POLYGON_CHAIN_ID,
@@ -755,7 +827,7 @@ async fn main() -> Result<()> {
     );
 
     let state = AppState {
-        markets: Arc::new(RwLock::new(markets)),
+        markets: Arc::new(RwLock::new(Vec::new())),
         book_store,
         clob_url,
         api,
@@ -772,6 +844,7 @@ async fn main() -> Result<()> {
         daily_spend: Arc::new(RwLock::new(Vec::new())),
         live_mode,
         geoblocked: Arc::new(AtomicBool::new(false)),
+        scanning: Arc::new(AtomicBool::new(true)),
         scan_mode: Arc::new(RwLock::new(scan_mode)),
         gamma_url,
         end_date_window_days: harvester.end_date_window_days,
@@ -795,10 +868,44 @@ async fn main() -> Result<()> {
         .route("/api/status", get(api_status))
         .route("/api/positions", get(api_positions))
         .route("/ws/book", get(ws_book_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
-    println!("Dashboard: http://{}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    println!("Dashboard: http://{}", bind_addr);
+    println!("  Scanning markets in background — dashboard available immediately");
+
+    // Spawn the initial market scan so the HTTP server starts right away.
+    {
+        let markets_ref = state.markets.clone();
+        let scanning_ref = state.scanning.clone();
+        let scan_mode_ref = state.scan_mode.clone();
+        let g_url = state.gamma_url.clone();
+        let c_url = state.clob_url.clone();
+        let edw = state.end_date_window_days;
+        let rbh = state.resolution_window_behind_hours;
+        let rah = state.resolution_window_ahead_hours;
+        let min_vol = state.min_volume_usd;
+        let min_dep = state.min_depth_usd;
+        tokio::spawn(async move {
+            let mode = *scan_mode_ref.read().await;
+            match scan_markets(&g_url, mode, edw, rbh, rah, usize::MAX, min_vol, min_dep).await {
+                Ok(raw) => {
+                    let markets = if mode == ScanMode::ResolutionWindow {
+                        filter_with_resting_orders(&c_url, raw).await
+                    } else {
+                        raw
+                    };
+                    println!("  Background scan complete: {} markets loaded", markets.len());
+                    *markets_ref.write().await = markets;
+                }
+                Err(e) => {
+                    println!("  Background scan failed: {e}");
+                }
+            }
+            scanning_ref.store(false, Ordering::Relaxed);
+        });
+    }
+
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -820,6 +927,7 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "live_mode": state.live_mode,
         "geoblocked": state.geoblocked.load(Ordering::Relaxed),
+        "scanning": state.scanning.load(Ordering::Relaxed),
         "ctf_enabled": state.ctf.is_some(),
         "max_trade": state.max_trade.to_string(),
         "max_daily": state.max_daily.to_string(),
@@ -896,6 +1004,9 @@ struct CtfActionRequest {
     /// Optional human-readable label of the original market (for the activity log)
     #[serde(default)]
     market: Option<String>,
+    /// Whether this is a neg_risk market (routes through NegRiskAdapter).
+    #[serde(default)]
+    is_neg_risk: bool,
 }
 
 async fn api_merge(
@@ -993,9 +1104,13 @@ async fn api_merge(
         }
     }
 
+    // Use the explicit is_neg_risk flag from the request. Defaults to false
+    // (raw CTF merge) which is correct for positions minted before the
+    // NegRiskAdapter routing was added. Future mints through the adapter will
+    // need to set is_neg_risk=true when merging.
     let result = ctf
         .inner
-        .merge_position(condition_id, U256::from(usdc_units))
+        .merge_position(condition_id, U256::from(usdc_units), req.is_neg_risk)
         .await;
 
     let (status_text, ok, gas_matic_str) = match result {
@@ -1764,7 +1879,7 @@ async fn api_harvest(
 
             match ctf
                 .inner
-                .split_position(condition_id, U256::from(usdc_units))
+                .split_position(condition_id, U256::from(usdc_units), market.is_neg_risk)
                 .await
             {
                 Ok(tx) => {
@@ -1778,36 +1893,74 @@ async fn api_harvest(
                     // Orders are built + EIP-712 signed through the SDK-backed
                     // `order_client` — the bare HMAC `api.place_order` path
                     // was rejected by Polymarket with "Invalid order payload".
+                    //
+                    // The CLOB exchange indexes on-chain balances asynchronously,
+                    // so we wait briefly for it to recognise the freshly-minted
+                    // tokens before placing sell orders.
                     if let Some(order_client) = state.order_client.as_ref() {
+                        // Wait for the CLOB balance indexer to catch up.
+                        // Initial 2s pause, then retry sells up to 4 more times
+                        // with 2s backoff — covers the typical 2-8s CLOB lag.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
                         for (loser_token_id, sellable_shares, best_bid) in &loser_sell_plans {
-                            // Sell up to mint_amount shares (not more than we minted)
                             let sell_size = (*sellable_shares).min(mint_amount);
-                            let resp = order_client
-                                .place_limit(
-                                    loser_token_id,
-                                    *best_bid,
-                                    sell_size,
-                                    OrderSide::Sell,
-                                )
-                                .await;
-                            match resp {
-                                Ok(r) if r.success => {
-                                    actual_sell_revenue += *best_bid * sell_size;
-                                    status_parts
-                                        .push(format!("SELL OK id={}", r.order_id));
+
+                            let mut last_err: Option<String> = None;
+                            let mut sold = false;
+                            for attempt in 0u32..5 {
+                                if attempt > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 }
-                                Ok(r) => {
-                                    status_parts
-                                        .push(format!("SELL FAIL: {}", r.error_msg));
-                                }
-                                Err(e) => {
-                                    let msg = format!("{e}");
-                                    if msg.contains("403")
-                                        || msg.contains("restricted in your region")
-                                    {
-                                        state.geoblocked.store(true, Ordering::Relaxed);
+                                let resp = order_client
+                                    .place_limit(
+                                        loser_token_id,
+                                        *best_bid,
+                                        sell_size,
+                                        OrderSide::Sell,
+                                    )
+                                    .await;
+                                match resp {
+                                    Ok(r) if r.success => {
+                                        actual_sell_revenue += *best_bid * sell_size;
+                                        if attempt > 0 {
+                                            status_parts.push(format!(
+                                                "SELL OK id={} (retry {})", r.order_id, attempt
+                                            ));
+                                        } else {
+                                            status_parts
+                                                .push(format!("SELL OK id={}", r.order_id));
+                                        }
+                                        sold = true;
+                                        break;
                                     }
-                                    status_parts.push(format!("SELL ERR: {}", msg));
+                                    Ok(r) => {
+                                        last_err = Some(format!("SELL FAIL: {}", r.error_msg));
+                                        // Not a balance lag issue — don't retry
+                                        if !r.error_msg.contains("not enough balance") {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("{e}");
+                                        if msg.contains("403")
+                                            || msg.contains("restricted in your region")
+                                        {
+                                            state.geoblocked.store(true, Ordering::Relaxed);
+                                            last_err = Some(format!("SELL ERR: {}", msg));
+                                            break;
+                                        }
+                                        last_err = Some(format!("SELL ERR: {}", msg));
+                                        // Retry on balance/allowance errors from post_order
+                                        if !msg.contains("not enough balance") {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if !sold {
+                                if let Some(err) = last_err {
+                                    status_parts.push(err);
                                 }
                             }
                         }
@@ -2639,10 +2792,16 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
         ));
     }
 
-    // Activity log moved to /trades — only the geoblock banner is rendered here.
+    // Activity log moved to /trades — only banners are rendered here.
     let geoblocked = state.geoblocked.load(Ordering::Relaxed);
+    let is_scanning = state.scanning.load(Ordering::Relaxed);
     let geoblock_banner = if geoblocked {
         r#"<div class="geo-banner">⚠ CLOB API geoblock detected — minting is disabled. Enable a VPN, then click <button class="action-btn" style="background:#2ecc71" onclick="clearGeoblock()">Clear after VPN</button></div>"#.to_string()
+    } else {
+        String::new()
+    };
+    let scanning_banner = if is_scanning {
+        r#"<div id="scanning-banner" class="scanning-banner">Scanning markets... <span id="scan-spinner">⟳</span></div>"#.to_string()
     } else {
         String::new()
     };
@@ -2662,6 +2821,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   .search-box {{ width: 100%; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-family: inherit; font-size: 0.9em; margin-bottom: 12px; outline: none; }}
   .search-box:focus {{ border-color: #58a6ff; }}
   .geo-banner {{ background: #4a1818; border: 1px solid #e74c3c; border-radius: 6px; padding: 12px 16px; margin: 12px 0; color: #f5b7b1; font-size: 0.9em; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }}
+  .scanning-banner {{ background: #1a2a3a; border: 1px solid #388bfd; border-radius: 6px; padding: 10px 16px; margin: 8px 0; color: #79c0ff; font-size: 0.88em; }}
   .recover-panel {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }}
   .nav {{ display: flex; gap: 8px; margin-bottom: 12px; }}
   .nav a {{ color: #8b949e; text-decoration: none; padding: 6px 14px; border-radius: 6px; font-size: 0.9em; border: 1px solid #21262d; }}
@@ -2785,6 +2945,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   </div>
 </div>
 
+{scanning_banner}
 {geoblock_banner}
 
 <h2>Markets</h2>
@@ -3210,6 +3371,22 @@ async function rescan() {{
 
 // ── Init ───────────────────────────────────────────────────────────────
 renderPage();
+
+// Poll /api/status while scanning banner is visible; reload when done.
+(function() {{
+  const banner = document.getElementById('scanning-banner');
+  if (!banner) return;
+  const interval = setInterval(async () => {{
+    try {{
+      const r = await fetch('/api/status');
+      const d = await r.json();
+      if (!d.scanning) {{
+        clearInterval(interval);
+        location.reload();
+      }}
+    }} catch (_) {{}}
+  }}, 2000);
+}})();
 </script>
 </body>
 </html>"##,
@@ -3223,6 +3400,7 @@ renderPage();
         trade_count = activity.len(),
         market_rows = market_rows,
         geoblock_banner = geoblock_banner,
+        scanning_banner = scanning_banner,
         scan_label = match current_mode {
             ScanMode::NearExpiry => "near-expiry",
             ScanMode::ResolutionWindow => "resolution-window",
