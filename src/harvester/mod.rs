@@ -307,10 +307,7 @@ pub async fn filter_with_resting_orders(
         };
 
         if has_orders {
-            println!("  [{}/{}] OK   {}", i + 1, total, q);
             kept.push(market);
-        } else {
-            println!("  [{}/{}] --   {} (empty)", i + 1, total, q);
         }
     }
 
