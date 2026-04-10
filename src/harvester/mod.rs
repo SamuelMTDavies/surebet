@@ -4,9 +4,12 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
-use crate::orderbook::OrderBook;
+use polymarket_client_sdk::gamma::types::response::Market as SdkMarket;
+
+use crate::orderbook::{OrderBook, OrderBookStore};
 
 // ─── Scan mode ───────────────────────────────────────────────────────────────
 
@@ -19,54 +22,6 @@ pub enum ScanMode {
     /// within the past N days.  These have stopped trading but may not yet be
     /// redeemed on-chain — stale or residual CLOB orders can still exist.
     RecentlyClosed,
-}
-
-// ─── Gamma API response type ────────────────────────────────────────────────
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GammaMarket {
-    #[serde(default)]
-    pub id: serde_json::Value,
-    #[serde(default)]
-    pub condition_id: Option<String>,
-    #[serde(default)]
-    pub question: Option<String>,
-    #[serde(default)]
-    pub outcomes: Option<String>,
-    #[serde(default)]
-    pub clob_token_ids: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub end_date_iso: Option<String>,
-    #[serde(default)]
-    pub end_date: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub active: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub closed: Option<bool>,
-    #[serde(default)]
-    pub accepting_orders: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub fees_enabled: Option<bool>,
-    #[serde(default)]
-    pub neg_risk: Option<bool>,
-    #[serde(default)]
-    pub category: Option<String>,
-    #[serde(default)]
-    pub slug: Option<String>,
-    /// 24-hour trading volume in USDC (JSON field: "volume24hr").
-    #[serde(default)]
-    pub volume_24hr: Option<f64>,
-    /// Current liquidity depth in USDC — used as a proxy for book depth.
-    #[serde(default)]
-    pub liquidity: Option<f64>,
-    /// ISO-8601 timestamp of when the market was closed, if available.
-    #[serde(default)]
-    pub closed_time: Option<String>,
 }
 
 /// Parsed market ready for display.
@@ -137,6 +92,7 @@ pub async fn scan_markets(
     let now = Utc::now();
 
     // Build the query URL depending on mode.
+    // Use YYYY-MM-DD date strings — the Gamma API rejects full ISO-8601 timestamps.
     let (query_base, date_range_label) = match mode {
         ScanMode::NearExpiry => {
             let date_min = now.format("%Y-%m-%d").to_string();
@@ -164,7 +120,9 @@ pub async fn scan_markets(
         }
     };
 
-    let mut all_raw: Vec<GammaMarket> = Vec::new();
+    // Paginate manually, deserialising into the SDK's Market type which
+    // correctly handles Gamma's inconsistent string-vs-number encoding.
+    let mut all_raw: Vec<SdkMarket> = Vec::new();
     let mut offset = 0usize;
     let limit = 100usize;
 
@@ -184,7 +142,7 @@ pub async fn scan_markets(
             );
         }
 
-        let page: Vec<GammaMarket> = resp.json().await.context("Failed to parse Gamma response")?;
+        let page: Vec<SdkMarket> = resp.json().await.context("Failed to parse Gamma response")?;
         let count = page.len();
         if count == 0 {
             break;
@@ -205,6 +163,9 @@ pub async fn scan_markets(
         pages,
     );
 
+    let min_volume = Decimal::try_from(min_volume_usd).unwrap_or_default();
+    let min_depth = Decimal::try_from(min_depth_usd).unwrap_or_default();
+
     let mut results: Vec<HarvestableMarket> = Vec::new();
 
     for raw in &all_raw {
@@ -215,54 +176,32 @@ pub async fn scan_markets(
         }
 
         let condition_id = match &raw.condition_id {
-            Some(c) if !c.is_empty() => c.clone(),
+            Some(c) => format!("{c}"),
             _ => continue,
         };
 
-        let token_ids_str = match &raw.clob_token_ids {
-            Some(s) if !s.is_empty() && s != "[]" => s.clone(),
+        let clob_token_ids: Vec<String> = match &raw.clob_token_ids {
+            Some(ids) if !ids.is_empty() => ids.iter().map(|id| format!("{id}")).collect(),
             _ => continue,
         };
 
-        let clob_token_ids: Vec<String> = match serde_json::from_str(&token_ids_str) {
-            Ok(ids) => ids,
-            Err(_) => continue,
+        let outcomes: Vec<String> = match &raw.outcomes {
+            Some(o) if !o.is_empty() => o.clone(),
+            _ => continue,
         };
-        if clob_token_ids.is_empty() {
-            continue;
-        }
-
-        let outcomes: Vec<String> = raw
-            .outcomes
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        if outcomes.is_empty() {
-            continue;
-        }
 
         // Liquidity gates (use Gamma's fields as proxies; skip if fields absent).
-        let vol = raw.volume_24hr.unwrap_or(0.0);
-        let liq = raw.liquidity.unwrap_or(0.0);
-        if min_volume_usd > 0.0 && vol < min_volume_usd {
+        let vol = raw.volume_24hr.unwrap_or_default();
+        let liq = raw.liquidity.unwrap_or_default();
+        if min_volume_usd > 0.0 && vol < min_volume {
             continue;
         }
-        if min_depth_usd > 0.0 && liq < min_depth_usd {
+        if min_depth_usd > 0.0 && liq < min_depth {
             continue;
         }
-
-        let end_date = raw
-            .end_date
-            .as_ref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
 
         let question = raw.question.clone().unwrap_or_else(|| "???".to_string());
-        let market_id = match &raw.id {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            _ => "?".to_string(),
-        };
+        let market_id = raw.id.clone();
 
         results.push(HarvestableMarket {
             market_id,
@@ -270,13 +209,13 @@ pub async fn scan_markets(
             question,
             outcomes,
             clob_token_ids,
-            end_date,
+            end_date: raw.end_date,
             is_neg_risk: raw.neg_risk.unwrap_or(false),
             category: raw.category.clone().unwrap_or_default(),
             slug: raw.slug.clone(),
             accepting_orders: raw.accepting_orders.unwrap_or(false),
-            volume_24hr: vol,
-            liquidity: liq,
+            volume_24hr: vol.to_f64().unwrap_or(0.0),
+            liquidity: liq.to_f64().unwrap_or(0.0),
         });
     }
 
@@ -311,6 +250,63 @@ pub async fn scan_markets(
     );
 
     Ok(results)
+}
+
+// ─── Resting-order filter ────────────────────────────────────────────────────
+
+/// Drop every market in `candidates` whose CLOB books are completely empty
+/// (no resting bids or asks on any outcome token).
+///
+/// Used after `scan_markets(RecentlyClosed)` to surface only markets where
+/// there is actually something to trade against.  Makes one REST request per
+/// outcome token; prints a progress line per market.
+pub async fn filter_with_resting_orders(
+    clob_url: &str,
+    candidates: Vec<HarvestableMarket>,
+) -> Vec<HarvestableMarket> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let total = candidates.len();
+    println!("  Checking order books for {} closed markets...", total);
+
+    let store = OrderBookStore::new();
+    let mut kept = Vec::new();
+
+    for (i, market) in candidates.into_iter().enumerate() {
+        let mut has_orders = false;
+
+        for token_id in &market.clob_token_ids {
+            if let Some(book) = store.fetch_rest_book(clob_url, token_id).await {
+                if !book.bids.levels.is_empty() || !book.asks.levels.is_empty() {
+                    has_orders = true;
+                    break;
+                }
+            }
+        }
+
+        let q = if market.question.len() > 60 {
+            format!("{}...", &market.question[..57])
+        } else {
+            market.question.clone()
+        };
+
+        if has_orders {
+            println!("  [{}/{}] OK   {}", i + 1, total, q);
+            kept.push(market);
+        } else {
+            println!("  [{}/{}] --   {} (empty)", i + 1, total, q);
+        }
+    }
+
+    println!(
+        "  {} of {} closed markets have resting orders",
+        kept.len(),
+        total,
+    );
+
+    kept
 }
 
 // ─── Book analysis ──────────────────────────────────────────────────────────

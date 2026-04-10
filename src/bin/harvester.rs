@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use surebet::auth::{ClobApiClient, L2Credentials, OrderSide};
 use surebet::config::Config;
-use surebet::harvester::{build_outcome_info, scan_markets, OutcomeInfo, ScanMode};
+use surebet::harvester::{build_outcome_info, filter_with_resting_orders, scan_markets, OutcomeInfo, ScanMode};
 use surebet::orderbook::OrderBookStore;
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
@@ -130,6 +130,13 @@ async fn main() -> Result<()> {
         harvester.min_volume_usd,
         harvester.min_depth_usd,
     ).await?;
+
+    // For closed markets: drop any that have no resting orders on the CLOB.
+    let markets = if scan_mode == ScanMode::RecentlyClosed {
+        filter_with_resting_orders(clob_url, markets).await
+    } else {
+        markets
+    };
 
     if markets.is_empty() {
         println!("No markets found matching criteria.");
