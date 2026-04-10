@@ -450,6 +450,16 @@ struct AppState {
     /// stranding more tokens). User can clear it via /api/clear-geoblock after
     /// enabling a VPN.
     geoblocked: Arc<AtomicBool>,
+    /// Current scan mode — switchable at runtime via POST /api/rescan.
+    scan_mode: Arc<RwLock<ScanMode>>,
+    /// Gamma API base URL, stored for runtime rescans.
+    gamma_url: String,
+    /// Harvester config values needed to re-run scan_markets() on demand.
+    end_date_window_days: i64,
+    resolution_window_behind_hours: i64,
+    resolution_window_ahead_hours: i64,
+    min_volume_usd: f64,
+    min_depth_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,7 +530,7 @@ async fn main() -> Result<()> {
         Err(_) => Config::from_env(),
     };
 
-    let gamma_url = &config.polymarket.gamma_url;
+    let gamma_url = config.polymarket.gamma_url.clone();
     let clob_url = config.polymarket.clob_url.clone();
     let harvester = &config.harvester;
 
@@ -571,7 +581,7 @@ async fn main() -> Result<()> {
     println!("Scanning Gamma API...");
     // Dashboard shows ALL markets — no truncation.  Books fetched on demand.
     let markets = scan_markets(
-        gamma_url,
+        &gamma_url,
         scan_mode,
         harvester.end_date_window_days,
         harvester.resolution_window_behind_hours,
@@ -762,6 +772,13 @@ async fn main() -> Result<()> {
         daily_spend: Arc::new(RwLock::new(Vec::new())),
         live_mode,
         geoblocked: Arc::new(AtomicBool::new(false)),
+        scan_mode: Arc::new(RwLock::new(scan_mode)),
+        gamma_url,
+        end_date_window_days: harvester.end_date_window_days,
+        resolution_window_behind_hours: harvester.resolution_window_behind_hours,
+        resolution_window_ahead_hours: harvester.resolution_window_ahead_hours,
+        min_volume_usd: harvester.min_volume_usd,
+        min_depth_usd: harvester.min_depth_usd,
     };
 
     let app = Router::new()
@@ -774,6 +791,7 @@ async fn main() -> Result<()> {
         .route("/api/merge", post(api_merge))
         .route("/api/redeem", post(api_redeem))
         .route("/api/clear-geoblock", post(api_clear_geoblock))
+        .route("/api/rescan", post(api_rescan))
         .route("/api/status", get(api_status))
         .route("/api/positions", get(api_positions))
         .route("/ws/book", get(ws_book_handler))
@@ -811,6 +829,61 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
 async fn api_clear_geoblock(State(state): State<AppState>) -> impl IntoResponse {
     state.geoblocked.store(false, Ordering::Relaxed);
     Json(serde_json::json!({"ok": true, "geoblocked": false}))
+}
+
+#[derive(Debug, Deserialize)]
+struct RescanRequest {
+    /// "near_expiry" or "resolution_window"
+    mode: String,
+}
+
+async fn api_rescan(
+    State(state): State<AppState>,
+    Json(req): Json<RescanRequest>,
+) -> impl IntoResponse {
+    let mode = match req.mode.as_str() {
+        "resolution_window" => ScanMode::ResolutionWindow,
+        _ => ScanMode::NearExpiry,
+    };
+
+    // Update the stored scan mode before scanning so the dashboard reflects it
+    // immediately even if the scan is slow.
+    *state.scan_mode.write().await = mode;
+
+    let result = scan_markets(
+        &state.gamma_url,
+        mode,
+        state.end_date_window_days,
+        state.resolution_window_behind_hours,
+        state.resolution_window_ahead_hours,
+        usize::MAX,
+        state.min_volume_usd,
+        state.min_depth_usd,
+    )
+    .await;
+
+    match result {
+        Ok(raw_markets) => {
+            let markets = if mode == ScanMode::ResolutionWindow {
+                filter_with_resting_orders(&state.clob_url, raw_markets).await
+            } else {
+                raw_markets
+            };
+            let count = markets.len();
+            *state.markets.write().await = markets;
+            Json(serde_json::json!({
+                "ok": true,
+                "count": count,
+                "mode": req.mode,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2492,6 +2565,7 @@ async function clearGeoblock() {{
 async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
     let markets = state.markets.read().await;
     let activity = state.activity.read().await;
+    let current_mode = *state.scan_mode.read().await;
     let now = Utc::now();
 
     // Compute 24h spend for display
@@ -2667,6 +2741,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
     background: #161b22; border-bottom: 1px solid #21262d;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0;
   }}
+  .rescan-bar {{ display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }}
 </style>
 </head>
 <body>
@@ -2677,7 +2752,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   <a href="/" class="active">Markets</a>
   <a href="/trades">Trades</a>
 </div>
-<div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Window: future only</div>
+<div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Scan: <b style="color:{scan_color}">{scan_label}</b></div>
 
 <div class="status-bar">
   <div class="status-item">
@@ -2709,6 +2784,14 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 {geoblock_banner}
 
 <h2>Markets</h2>
+<div class="rescan-bar">
+  <select id="scan-mode-select" class="page-btn">
+    <option value="near_expiry"{ne_sel}>Near Expiry</option>
+    <option value="resolution_window"{rw_sel}>Resolution Window (±hours)</option>
+  </select>
+  <button id="rescan-btn" class="action-btn" onclick="rescan()" style="background:#1f6feb;border-color:#388bfd;color:#fff">Rescan</button>
+  <span id="rescan-status" style="font-size:0.8em;color:#8b949e"></span>
+</div>
 <input type="text" class="search-box" id="search" placeholder="Search markets..." oninput="filterMarkets()">
 
 <div class="page-controls">
@@ -3091,6 +3174,36 @@ function closeResearch() {{
   iframe.src = 'about:blank';
 }}
 
+// ── Rescan ─────────────────────────────────────────────────────────────
+async function rescan() {{
+  const btn = document.getElementById('rescan-btn');
+  const status = document.getElementById('rescan-status');
+  const mode = document.getElementById('scan-mode-select').value;
+  btn.textContent = 'Scanning...';
+  btn.disabled = true;
+  status.textContent = '';
+  try {{
+    const resp = await fetch('/api/rescan', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{mode: mode}}),
+    }});
+    const data = await resp.json();
+    if (data.ok) {{
+      status.textContent = `Found ${{data.count}} markets`;
+      location.reload();
+    }} else {{
+      status.textContent = 'Error: ' + (data.error || 'unknown');
+      btn.textContent = 'Rescan';
+      btn.disabled = false;
+    }}
+  }} catch (e) {{
+    status.textContent = 'Request failed: ' + e;
+    btn.textContent = 'Rescan';
+    btn.disabled = false;
+  }}
+}}
+
 // ── Init ───────────────────────────────────────────────────────────────
 renderPage();
 </script>
@@ -3106,6 +3219,16 @@ renderPage();
         trade_count = activity.len(),
         market_rows = market_rows,
         geoblock_banner = geoblock_banner,
+        scan_label = match current_mode {
+            ScanMode::NearExpiry => "near-expiry",
+            ScanMode::ResolutionWindow => "resolution-window",
+        },
+        scan_color = match current_mode {
+            ScanMode::NearExpiry => "#8b949e",
+            ScanMode::ResolutionWindow => "#58a6ff",
+        },
+        ne_sel = if current_mode == ScanMode::NearExpiry { " selected" } else { "" },
+        rw_sel = if current_mode == ScanMode::ResolutionWindow { " selected" } else { "" },
     );
 
     Html(html)
