@@ -258,7 +258,7 @@ pub struct HarvesterConfig {
     #[serde(default = "default_harvester_matic_usd")]
     pub matic_usd_price: f64,
     /// Minimum 24 h trading volume (USDC) for a market to be included.
-    /// Applies to both NearExpiry and RecentlyClosed scan modes.
+    /// Applies to both NearExpiry and ResolutionWindow scan modes.
     /// 0.0 disables the filter (default).
     #[serde(default)]
     pub min_volume_usd: f64,
@@ -266,10 +266,14 @@ pub struct HarvesterConfig {
     /// Used as a proxy for order-book depth.  0.0 disables the filter (default).
     #[serde(default)]
     pub min_depth_usd: f64,
-    /// How many days back to look when scanning for recently-closed markets
-    /// (`--closed` flag).  Default: 3 days.
-    #[serde(default = "default_harvester_closed_lookback")]
-    pub closed_lookback_days: i64,
+    /// How many hours before now to include in the resolution window scan
+    /// (`--closed` flag).  Default: 1 (catches markets that just closed).
+    #[serde(default = "default_resolution_behind_hours")]
+    pub resolution_window_behind_hours: i64,
+    /// How many hours ahead of now to include in the resolution window scan
+    /// (`--closed` flag).  Default: 3 (catches markets about to close).
+    #[serde(default = "default_resolution_ahead_hours")]
+    pub resolution_window_ahead_hours: i64,
 }
 
 // --- Default functions ---
@@ -390,7 +394,10 @@ fn default_harvester_min_profit() -> f64 {
 fn default_harvester_matic_usd() -> f64 {
     0.40
 }
-fn default_harvester_closed_lookback() -> i64 {
+fn default_resolution_behind_hours() -> i64 {
+    1
+}
+fn default_resolution_ahead_hours() -> i64 {
     3
 }
 fn default_ctf_address() -> String {
@@ -532,7 +539,8 @@ impl Default for HarvesterConfig {
             matic_usd_price: default_harvester_matic_usd(),
             min_volume_usd: 0.0,
             min_depth_usd: 0.0,
-            closed_lookback_days: default_harvester_closed_lookback(),
+            resolution_window_behind_hours: default_resolution_behind_hours(),
+            resolution_window_ahead_hours: default_resolution_ahead_hours(),
         }
     }
 }

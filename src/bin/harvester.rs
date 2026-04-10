@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     };
 
     let scan_mode = if closed_mode {
-        ScanMode::RecentlyClosed
+        ScanMode::ResolutionWindow
     } else {
         ScanMode::NearExpiry
     };
@@ -101,7 +101,11 @@ async fn main() -> Result<()> {
         if api.is_some() { "LIVE" } else { "PAPER" },
         match scan_mode {
             ScanMode::NearExpiry => format!("near-expiry ({}d window)", harvester.end_date_window_days),
-            ScanMode::RecentlyClosed => format!("recently-closed ({}d lookback)", harvester.closed_lookback_days),
+            ScanMode::ResolutionWindow => format!(
+                "resolution window ({}h ago → +{}h)",
+                harvester.resolution_window_behind_hours,
+                harvester.resolution_window_ahead_hours,
+            ),
         },
         max_buy,
     );
@@ -118,21 +122,22 @@ async fn main() -> Result<()> {
 
     let scan_label = match scan_mode {
         ScanMode::NearExpiry => "markets near end date",
-        ScanMode::RecentlyClosed => "recently-closed markets",
+        ScanMode::ResolutionWindow => "markets in resolution window",
     };
     println!("Scanning Gamma API for {}...", scan_label);
     let markets = scan_markets(
         gamma_url,
         scan_mode,
         harvester.end_date_window_days,
-        harvester.closed_lookback_days,
+        harvester.resolution_window_behind_hours,
+        harvester.resolution_window_ahead_hours,
         harvester.max_display,
         harvester.min_volume_usd,
         harvester.min_depth_usd,
     ).await?;
 
-    // For closed markets: drop any that have no resting orders on the CLOB.
-    let markets = if scan_mode == ScanMode::RecentlyClosed {
+    // For the resolution window: drop markets with no resting orders on the CLOB.
+    let markets = if scan_mode == ScanMode::ResolutionWindow {
         filter_with_resting_orders(clob_url, markets).await
     } else {
         markets

@@ -18,10 +18,12 @@ use crate::orderbook::{OrderBook, OrderBookStore};
 pub enum ScanMode {
     /// Markets whose end date falls within the next N days (original behaviour).
     NearExpiry,
-    /// Markets Gamma has already marked `closed=true`, whose end date falls
-    /// within the past N days.  These have stopped trading but may not yet be
-    /// redeemed on-chain — stale or residual CLOB orders can still exist.
-    RecentlyClosed,
+    /// Markets whose end date falls within a tight window around now:
+    /// `[now - behind_hours, now + ahead_hours]`.  Ignores Gamma's closed/active
+    /// status — queries by end date only, then filters by exact datetime and
+    /// checks CLOB books for resting orders.  Catches stale orders on markets
+    /// that just closed or are minutes from closing.
+    ResolutionWindow,
 }
 
 /// Parsed market ready for display.
@@ -37,7 +39,7 @@ pub struct HarvestableMarket {
     pub category: String,
     pub slug: Option<String>,
     /// Whether the CLOB is currently accepting new orders.
-    /// False for `RecentlyClosed` markets — orders cannot be placed, but tokens
+    /// False for markets that just closed — orders cannot be placed, but tokens
     /// may still be redeemable on-chain.
     pub accepting_orders: bool,
     /// 24-hour trading volume in USDC at scan time (0.0 if unavailable).
@@ -75,7 +77,8 @@ pub struct OutcomeInfo {
 ///
 /// - `mode` controls which markets to target (see [`ScanMode`]).
 /// - `end_date_window_days`: for `NearExpiry`, how many days ahead to look.
-/// - `closed_lookback_days`: for `RecentlyClosed`, how many days back to look.
+/// - `behind_hours`: for `ResolutionWindow`, how many hours before now.
+/// - `ahead_hours`: for `ResolutionWindow`, how many hours ahead of now.
 /// - `max_display`: truncate the result list to this many entries.
 /// - `min_volume_usd`: skip markets with 24 h volume below this (0 = no filter).
 /// - `min_depth_usd`: skip markets with Gamma liquidity below this (0 = no filter).
@@ -83,7 +86,8 @@ pub async fn scan_markets(
     gamma_url: &str,
     mode: ScanMode,
     end_date_window_days: i64,
-    closed_lookback_days: i64,
+    behind_hours: i64,
+    ahead_hours: i64,
     max_display: usize,
     min_volume_usd: f64,
     min_depth_usd: f64,
@@ -93,7 +97,8 @@ pub async fn scan_markets(
 
     // Build the query URL depending on mode.
     // Use YYYY-MM-DD date strings — the Gamma API rejects full ISO-8601 timestamps.
-    let (query_base, date_range_label) = match mode {
+    // For ResolutionWindow we widen to day granularity then trim to exact hours in code.
+    let (query_base, date_range_label, window) = match mode {
         ScanMode::NearExpiry => {
             let date_min = now.format("%Y-%m-%d").to_string();
             let date_max = (now + Duration::days(end_date_window_days + 1))
@@ -104,19 +109,28 @@ pub async fn scan_markets(
                 gamma_url, date_min, date_max,
             );
             let label = format!("{} → {}", date_min, date_max);
-            (base, label)
+            (base, label, None)
         }
-        ScanMode::RecentlyClosed => {
-            let date_min = (now - Duration::days(closed_lookback_days))
+        ScanMode::ResolutionWindow => {
+            let window_start = now - Duration::hours(behind_hours);
+            let window_end = now + Duration::hours(ahead_hours);
+            // Widen to day boundaries so the Gamma date filter is sure to include
+            // every market whose end_date falls in the window.
+            let date_min = (window_start - Duration::days(1))
                 .format("%Y-%m-%d")
                 .to_string();
-            let date_max = now.format("%Y-%m-%d").to_string();
+            let date_max = (window_end + Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string();
             let base = format!(
-                "{}/markets?closed=true&end_date_min={}&end_date_max={}",
+                "{}/markets?end_date_min={}&end_date_max={}",
                 gamma_url, date_min, date_max,
             );
-            let label = format!("{} → {}", date_min, date_max);
-            (base, label)
+            let label = format!(
+                "{}h ago → +{}h",
+                behind_hours, ahead_hours,
+            );
+            (base, label, Some((window_start, window_end)))
         }
     };
 
@@ -169,8 +183,8 @@ pub async fn scan_markets(
     let mut results: Vec<HarvestableMarket> = Vec::new();
 
     for raw in &all_raw {
-        // For NearExpiry: must be actively accepting orders.
-        // For RecentlyClosed: accepting_orders is expected to be false — skip this gate.
+        // NearExpiry: must be actively accepting orders.
+        // ResolutionWindow: no status gate — we want open and just-closed markets.
         if mode == ScanMode::NearExpiry && raw.accepting_orders != Some(true) {
             continue;
         }
@@ -219,24 +233,23 @@ pub async fn scan_markets(
         });
     }
 
-    // NearExpiry: soonest end date first (most urgent).
-    // RecentlyClosed: most recently closed first (freshest stale orders).
-    match mode {
-        ScanMode::NearExpiry => {
-            results.sort_by(|a, b| {
-                let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-                let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
-                a_dt.cmp(&b_dt)
-            });
-        }
-        ScanMode::RecentlyClosed => {
-            results.sort_by(|a, b| {
-                let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MIN_UTC);
-                let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MIN_UTC);
-                b_dt.cmp(&a_dt) // descending: most recently closed first
-            });
-        }
+    // For ResolutionWindow: trim to exact datetime window using the full-precision
+    // end_date on each market (the Gamma query used day-level dates, so it may
+    // have returned markets slightly outside the target window).
+    if let Some((win_start, win_end)) = window {
+        results.retain(|m| match m.end_date {
+            Some(ed) => ed >= win_start && ed <= win_end,
+            None => false,
+        });
     }
+
+    // NearExpiry: soonest end date first (most urgent).
+    // ResolutionWindow: closest to now first (expired/expiring soonest).
+    results.sort_by(|a, b| {
+        let a_dt = a.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let b_dt = b.end_date.unwrap_or(DateTime::<Utc>::MAX_UTC);
+        a_dt.cmp(&b_dt)
+    });
 
     results.truncate(max_display);
 
@@ -245,7 +258,7 @@ pub async fn scan_markets(
         results.len(),
         match mode {
             ScanMode::NearExpiry => "near-expiry",
-            ScanMode::RecentlyClosed => "recently-closed",
+            ScanMode::ResolutionWindow => "in resolution window",
         },
     );
 
@@ -257,7 +270,7 @@ pub async fn scan_markets(
 /// Drop every market in `candidates` whose CLOB books are completely empty
 /// (no resting bids or asks on any outcome token).
 ///
-/// Used after `scan_markets(RecentlyClosed)` to surface only markets where
+/// Used after `scan_markets(ResolutionWindow)` to surface only markets where
 /// there is actually something to trade against.  Makes one REST request per
 /// outcome token; prints a progress line per market.
 pub async fn filter_with_resting_orders(
