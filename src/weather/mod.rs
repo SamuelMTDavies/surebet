@@ -5,7 +5,9 @@
 //! This module parses those markets and wires them to a forecast-backed edge calculator.
 
 pub mod forecast;
+pub mod metar;
 pub mod strategy;
+pub mod wunderground;
 
 use chrono::NaiveDate;
 use tracing::debug;
@@ -170,23 +172,29 @@ pub fn is_temperature_bracket_market(question: &str, outcomes: &[String]) -> boo
     has_temp_keyword || has_bracket
 }
 
-/// Parse a bracket label into (lower_bound, upper_bound).
+/// Parse a bracket label into (lower_bound, upper_bound) of the underlying
+/// continuous temperature reading.
+///
+/// Polymarket resolves to the **floor** of the actual reading (16.9°C → 16),
+/// so each integer label `N` covers the half-open interval `[N, N+1)`.
 ///
 /// Handles patterns like:
-/// - "14°C or below"   → (None, Some(14.0))
-/// - "15-16°C"         → (Some(15.0), Some(16.0))
-/// - "19°C or above"   → (Some(19.0), None)
-/// - "-5°C or below"   → (None, Some(-5.0))
+/// - "14°C or below"   → (None, Some(15.0))      // floor ≤ 14 ⇔ x < 15
+/// - "15-16°C"         → (Some(15.0), Some(17.0)) // floor ∈ {15,16} ⇔ 15 ≤ x < 17
+/// - "16°C"            → (Some(16.0), Some(17.0)) // floor = 16 ⇔ 16 ≤ x < 17
+/// - "19°C or above"   → (Some(19.0), None)      // floor ≥ 19 ⇔ x ≥ 19
+/// - "-5°C or below"   → (None, Some(-4.0))      // floor ≤ -5 ⇔ x < -4
 pub fn parse_bracket_label(label: &str) -> Option<(Option<f64>, Option<f64>)> {
     let l = label.to_lowercase();
 
-    // "X or below / or less / and below" → upper-bounded
+    // "X or below / or less / and below" → upper-bounded; floor ≤ X ⇔ x < X+1
     if l.contains("or below") || l.contains("or less") || l.contains("and below") {
         let val = extract_first_number(label)?;
-        return Some((None, Some(val)));
+        return Some((None, Some(val + 1.0)));
     }
 
-    // "X or above / or more / or higher / and above" → lower-bounded
+    // "X or above / or more / or higher / and above" → lower-bounded;
+    // floor ≥ X ⇔ x ≥ X (no adjustment needed)
     if l.contains("or above")
         || l.contains("or more")
         || l.contains("or higher")
@@ -196,11 +204,12 @@ pub fn parse_bracket_label(label: &str) -> Option<(Option<f64>, Option<f64>)> {
         return Some((Some(val), None));
     }
 
-    // Range: "X-Y°C" or "X to Y"
+    // Range: "X-Y°C" → floor ∈ [X, Y] ⇔ X ≤ x < Y+1
+    // Singleton: "X°C" → floor = X ⇔ X ≤ x < X+1
     let numbers = extract_all_numbers(label);
     match numbers.len() {
-        2.. => Some((Some(numbers[0]), Some(numbers[1]))),
-        1 => Some((Some(numbers[0]), Some(numbers[0]))), // exact value → tight bracket
+        2.. => Some((Some(numbers[0]), Some(numbers[1] + 1.0))),
+        1 => Some((Some(numbers[0]), Some(numbers[0] + 1.0))),
         _ => None,
     }
 }
@@ -503,15 +512,19 @@ fn extract_all_numbers(s: &str) -> Vec<f64> {
 mod tests {
     use super::*;
 
+    // Bracket bounds use floor semantics: each integer label N covers [N, N+1).
+
     #[test]
     fn test_parse_bracket_label_upper_bounded() {
+        // "14°C or below" → floor ≤ 14 ⇔ x < 15
         let (lower, upper) = parse_bracket_label("14°C or below").unwrap();
         assert_eq!(lower, None);
-        assert_eq!(upper, Some(14.0));
+        assert_eq!(upper, Some(15.0));
     }
 
     #[test]
     fn test_parse_bracket_label_lower_bounded() {
+        // "19°C or above" → floor ≥ 19 ⇔ x ≥ 19 (lower bound unchanged)
         let (lower, upper) = parse_bracket_label("19°C or above").unwrap();
         assert_eq!(lower, Some(19.0));
         assert_eq!(upper, None);
@@ -519,16 +532,26 @@ mod tests {
 
     #[test]
     fn test_parse_bracket_label_range() {
+        // "15-16°C" → floor ∈ {15, 16} ⇔ 15 ≤ x < 17
         let (lower, upper) = parse_bracket_label("15-16°C").unwrap();
         assert_eq!(lower, Some(15.0));
-        assert_eq!(upper, Some(16.0));
+        assert_eq!(upper, Some(17.0));
+    }
+
+    #[test]
+    fn test_parse_bracket_label_singleton() {
+        // "16°C" → floor = 16 ⇔ 16 ≤ x < 17
+        let (lower, upper) = parse_bracket_label("16°C").unwrap();
+        assert_eq!(lower, Some(16.0));
+        assert_eq!(upper, Some(17.0));
     }
 
     #[test]
     fn test_parse_bracket_label_negative() {
+        // "-5°C or below" → floor ≤ -5 ⇔ x < -4
         let (lower, upper) = parse_bracket_label("-5°C or below").unwrap();
         assert_eq!(lower, None);
-        assert_eq!(upper, Some(-5.0));
+        assert_eq!(upper, Some(-4.0));
     }
 
     #[test]

@@ -46,6 +46,12 @@ use surebet::auth::{ClobApiClient, L2Credentials, OrderSide};
 use surebet::config::Config;
 use surebet::harvester::{build_outcome_info, filter_with_resting_orders, scan_markets, HarvestableMarket, OutcomeInfo, ScanMode};
 use surebet::orderbook::OrderBookStore;
+use surebet::weather::forecast::{fetch_forecast, fetch_observations};
+use surebet::weather::strategy::{
+    bracket_probability, bracket_probability_high_observed, bracket_probability_low_observed,
+    sigma_scale_high, sigma_scale_low,
+};
+use surebet::weather::{lookup_station, parse_bracket_label, TemperatureMeasure};
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
 /// USDC on Polygon (USDC.e bridged)
@@ -59,6 +65,12 @@ const NEG_RISK_ADAPTER: alloy::primitives::Address =
     address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
+
+/// Browser User-Agent for outgoing HTTP requests so external sites
+/// (Wunderground, etc.) don't block us as a bot. Recent Chrome on macOS.
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                          AppleWebKit/537.36 (KHTML, like Gecko) \
+                          Chrome/124.0.0.0 Safari/537.36";
 
 // Minimal ERC20 ABI for allowance checks
 alloy::sol! {
@@ -867,6 +879,14 @@ async fn main() -> Result<()> {
         .route("/api/rescan", post(api_rescan))
         .route("/api/status", get(api_status))
         .route("/api/positions", get(api_positions))
+        .route("/weather", get(weather_html))
+        .route("/api/weather", get(api_weather))
+        .route("/observations", get(observations_html))
+        .route("/api/observations", get(api_observations))
+        .route("/paper-trades", get(paper_trades_html))
+        .route("/api/paper-trade", post(api_save_paper_trade))
+        .route("/api/paper-trades", get(api_paper_trades))
+        .route("/api/paper-trade/close", post(api_close_paper_trade))
         .route("/ws/book", get(ws_book_handler))
         .with_state(state.clone());
 
@@ -2392,6 +2412,2631 @@ async fn hoover_task(
     }
 }
 
+// ─── Weather page ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct WeatherBracketJson {
+    label: String,
+    token_id: String,
+    lower: Option<f64>,
+    upper: Option<f64>,
+    ask_price: Option<f64>,
+    forecast_prob: Option<f64>,
+    edge: Option<f64>,
+    is_signal: bool,
+}
+
+#[derive(Serialize)]
+struct ColdFrontCheckJson {
+    /// Forecasted minimum temp across remaining hours of today (local).
+    min_temp: f64,
+    /// Local hour when that min is forecasted (e.g., "23:00").
+    min_hour: String,
+    /// Number of hourly samples that contributed.
+    sample_count: usize,
+    /// "normal" if forecast_min >= observed.min_so_far (morning trough holds),
+    /// or "cold_front" if forecast_min < observed.min_so_far (evening drops below morning).
+    scenario: String,
+}
+
+#[derive(Serialize)]
+struct WeatherForecastJson {
+    /// Effective mean used in bracket-probability math. For intra-day markets
+    /// this is the station's current observed temperature; for future-date
+    /// markets it's the Open-Meteo forecast mean.
+    mean: f64,
+    /// Effective σ used in bracket-probability math. For intra-day markets
+    /// this is a baseline × peak-aware scale; for future-date it's the
+    /// forecast's own σ (no scaling — the day hasn't started).
+    std_dev: f64,
+    /// Human-readable source identifier (e.g. "intra-day (METAR)" or "Open-Meteo").
+    source: String,
+}
+
+#[derive(Serialize)]
+struct WeatherMarketJson {
+    condition_id: String,
+    question: String,
+    location: String,
+    date: Option<String>,
+    measure: String,
+    unit: String,
+    end_date: Option<String>,
+    created_at: Option<String>,
+    days_ahead: Option<i64>,
+    forecast: Option<WeatherForecastJson>,
+    /// "intra-day" or "future" — determines which data pipeline was used.
+    /// Intra-day is sensor-only (METAR/Wunderground); future is Open-Meteo.
+    regime: String,
+    /// Running observed max/min/current for the resolution day. When present,
+    /// bracket probabilities condition on this (dead brackets collapse to 0,
+    /// remaining brackets absorb the redistributed mass — tighter edges).
+    observed: Option<ObservationsBlock>,
+    /// For LOW intra-day markets only: Open-Meteo hourly forecast for the
+    /// remaining hours of today. If `min_temp < observed.min_so_far` it
+    /// signals a "cold-front" scenario and the model mean shifts to `min_temp`.
+    cold_front_check: Option<ColdFrontCheckJson>,
+    brackets: Vec<WeatherBracketJson>,
+    /// Best K-bracket coverage bets ("buy N likely outcomes, one wins"), if any
+    /// positive-EV subsets exist. Sorted by the metric named in the struct.
+    coverage: Vec<CoverageComboJson>,
+    /// How far our model's expected value drifts from the market-implied one.
+    /// When the gap is large, this market is almost certainly a forecast error
+    /// on our side — signals should be ignored even if they look profitable.
+    divergence: Option<DivergenceJson>,
+}
+
+#[derive(Serialize)]
+struct DivergenceJson {
+    /// Expected resolution value under our observation-aware model, in market unit.
+    model_mean: f64,
+    /// Expected resolution value under the market's normalized asks, in market unit.
+    market_mean: f64,
+    /// Signed gap: market_mean − model_mean. Positive = market expects warmer
+    /// (for HIGH markets) or less cold (for LOW markets) than our forecast.
+    delta: f64,
+    /// Gap normalized by our effective σ. Values ≥ 2 indicate the two
+    /// distributions barely overlap; one of them is almost certainly wrong.
+    delta_sigmas: f64,
+    /// "aligned" / "moderate" / "high" — calibrate UI warnings from this.
+    alert: String,
+}
+
+#[derive(Serialize)]
+struct CoverageComboJson {
+    /// How this combo was selected: "max_ev" or "max_win_prob".
+    strategy: String,
+    /// 2 or 3 (how many YES tokens would be bought).
+    size: usize,
+    /// Bracket labels in the combo, e.g. ["17°C", "18°C"].
+    labels: Vec<String>,
+    /// YES token IDs to buy.
+    token_ids: Vec<String>,
+    /// Sum of YES asks (USD cost per share-set).
+    cost: f64,
+    /// Model probability that at least one bracket wins.
+    win_prob: f64,
+    /// Expected profit per share-set: `win_prob − cost`.
+    ev: f64,
+}
+
+#[derive(Serialize)]
+struct WeatherApiResponse {
+    markets: Vec<WeatherMarketJson>,
+    fetched_at: String,
+    error: Option<String>,
+}
+
+/// GET /api/weather — fetch active weather bracket events from Gamma, enrich with
+/// NWS/Open-Meteo forecasts, and return edge calculations as JSON.
+///
+/// Polymarket weather brackets are exposed as Gamma `/events` rows with `tag_slug=weather`.
+/// Each event ("Highest temperature in <City> on <Date>?") groups many binary Y/N child
+/// markets, one per bracket. Each child's `groupItemTitle` is the bracket label
+/// (e.g. "11°C", "10°C or below"). `bestAsk` is included in the response so no separate
+/// CLOB book fetch is needed.
+async fn api_weather(State(state): State<AppState>) -> impl IntoResponse {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+
+    let url = format!(
+        "{}/events?tag_slug=weather&active=true&closed=false&limit=200",
+        state.gamma_url
+    );
+
+    let raw_events: Vec<serde_json::Value> = match http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        Ok(resp) => {
+            let status = resp.status();
+            return Json(WeatherApiResponse {
+                markets: vec![],
+                fetched_at: now.to_rfc3339(),
+                error: Some(format!("Gamma /events returned {status}")),
+            });
+        }
+        Err(e) => {
+            return Json(WeatherApiResponse {
+                markets: vec![],
+                fetched_at: now.to_rfc3339(),
+                error: Some(format!("Gamma /events failed: {e}")),
+            });
+        }
+    };
+
+    let per_event_futures = raw_events.into_iter().map(|event| {
+        let http = http.clone();
+        async move { process_weather_market(&http, event, now).await }
+    });
+    let collected: Vec<Option<WeatherMarketJson>> = futures_util::stream::iter(per_event_futures)
+        .buffer_unordered(20)
+        .collect()
+        .await;
+    let mut results: Vec<WeatherMarketJson> = collected.into_iter().flatten().collect();
+
+    results.sort_by(|a, b| a.end_date.cmp(&b.end_date));
+
+    Json(WeatherApiResponse {
+        markets: results,
+        fetched_at: now.to_rfc3339(),
+        error: None,
+    })
+}
+
+/// Which regime a weather market falls into, determined from the station's
+/// local time vs. the event's target date.
+enum MarketRegime {
+    /// Target date is today in the station's local timezone. Use only METAR
+    /// (and Wunderground scrape) — the resolution-grade sensor data. No
+    /// forecasting from gridded models.
+    IntraDay { local_hour: f64 },
+    /// Target date is in the future. No observations exist yet; use Open-Meteo
+    /// forecast. This is where the "hoover new markets cheap, sell later when
+    /// prices move" strategy lives.
+    FutureDate,
+    /// Market already resolved. Skip.
+    Past,
+}
+
+/// The (mean, σ) pair the bracket-probability math actually uses, plus the
+/// human-readable source string. Unified across regimes.
+struct EffectiveModel {
+    mean: f64,
+    sigma: f64,
+    source: String,
+}
+
+/// Process one weather event for the `/weather` tab: fetch the forecast, fetch
+/// the day's running observations (when not a future-dated market), compute
+/// observation-aware bracket probabilities, and assemble the JSON row.
+async fn process_weather_market(
+    http: &reqwest::Client,
+    event: serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<WeatherMarketJson> {
+    let title = event.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let (measure, city) = parse_weather_event_title(title)?;
+
+    let end_date_utc = event
+        .get("endDate")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let target_date = end_date_utc.map(|d| d.date_naive());
+
+    let (station_id, lat, lon) = match lookup_station(&city) {
+        Some((sid, lat, lon)) => {
+            let sid_opt = if sid.is_empty() { None } else { Some(sid.to_string()) };
+            (sid_opt, Some(lat), Some(lon))
+        }
+        None => (None, None, None),
+    };
+
+    let unit = event
+        .get("markets")
+        .and_then(|v| v.as_array())
+        .and_then(|markets| {
+            markets.iter().find_map(|m| {
+                let label = m
+                    .get("groupItemTitle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if label.contains("°F") {
+                    Some(surebet::weather::TemperatureUnit::Fahrenheit)
+                } else if label.contains("°C") {
+                    Some(surebet::weather::TemperatureUnit::Celsius)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(surebet::weather::TemperatureUnit::Celsius);
+
+    let resolution_url = event
+        .get("resolutionSource")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let icao = surebet::weather::wunderground::icao_from_resolution_url(&resolution_url);
+
+    // Determine regime: intra-day vs future-date vs past.
+    // Intra-day uses ONLY METAR/Wunderground (the resolution sensor);
+    // future-date uses Open-Meteo forecast (no observations exist yet).
+    // Past markets are skipped — they've already resolved.
+    let regime: MarketRegime = match (target_date, icao.as_deref()) {
+        (Some(date), Some(icao_code)) => {
+            let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+            let local_now = now + chrono::Duration::seconds(tz);
+            let local_today = local_now.date_naive();
+            if date == local_today {
+                use chrono::Timelike;
+                let t = local_now.time();
+                let h = t.hour() as f64
+                    + t.minute() as f64 / 60.0
+                    + t.second() as f64 / 3600.0;
+                MarketRegime::IntraDay { local_hour: h }
+            } else if date > local_today {
+                MarketRegime::FutureDate
+            } else {
+                MarketRegime::Past
+            }
+        }
+        (Some(_), None) => MarketRegime::FutureDate, // no tz info; treat as future to use forecast
+        _ => MarketRegime::FutureDate,
+    };
+    if matches!(regime, MarketRegime::Past) {
+        return None;
+    }
+
+    // Dispatch data sources by regime. Intra-day = sensor-only (METAR +
+    // Wunderground scrape); future-date = Open-Meteo forecast.
+    let (forecast, observed) = match regime {
+        MarketRegime::IntraDay { .. } => {
+            let obs = fetch_sensor_observations(http, &resolution_url, target_date, unit).await;
+            (None, obs)
+        }
+        MarketRegime::FutureDate => {
+            let fcst = if let (Some(lat), Some(lon), Some(date)) = (lat, lon, target_date) {
+                fetch_forecast(http, station_id.as_deref(), lat, lon, date, measure, unit)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            (fcst, None)
+        }
+        MarketRegime::Past => unreachable!(),
+    };
+
+    // For LOW intra-day markets, also fetch Open-Meteo's hourly forecast for
+    // the remaining hours of today — lets us detect "late-evening cooling may
+    // produce a new daily min below the morning trough" scenarios.
+    // This is the ONE place Open-Meteo enters intra-day calculations, per the
+    // user's "cold-front sense check" directive.
+    let cold_front_check: Option<surebet::weather::forecast::RemainingDayForecast> =
+        match (&regime, measure, observed.as_ref(), lat, lon, target_date) {
+            (
+                MarketRegime::IntraDay { local_hour },
+                TemperatureMeasure::Low,
+                Some(_),
+                Some(lat),
+                Some(lon),
+                Some(date),
+            ) => surebet::weather::forecast::fetch_remaining_day_forecast(
+                http, lat, lon, date, *local_hour, unit,
+            )
+            .await
+            .ok(),
+            _ => None,
+        };
+
+    // Build the model (mean, σ, source) the bracket-probability math will use.
+    // - Intra-day HIGH: mean = observed.max_so_far, σ = baseline × peak-aware scale.
+    // - Intra-day LOW:  mean anchors to the running morning-trough in normal
+    //                   conditions, or shifts to the forecast's evening min if
+    //                   a cold-front pushes below the morning trough.
+    // - Future-date:    mean = forecast mean; σ = forecast.std_dev (day hasn't started).
+    const INTRADAY_BASELINE_SIGMA: f64 = 3.0;
+    let model: Option<EffectiveModel> = match (&regime, observed.as_ref(), forecast.as_ref()) {
+        (MarketRegime::IntraDay { local_hour }, Some(o), _) => {
+            let scale = match measure {
+                TemperatureMeasure::High => sigma_scale_high(*local_hour),
+                TemperatureMeasure::Low => sigma_scale_low(*local_hour),
+            };
+            let (mean, source_suffix) = match measure {
+                TemperatureMeasure::High => {
+                    // HIGH: running max so far — peak may still rise pre-3 PM.
+                    (o.max_so_far, String::from("obs.max"))
+                }
+                TemperatureMeasure::Low => {
+                    // LOW: check for cold-front scenario.
+                    match &cold_front_check {
+                        Some(f) if f.min_temp < o.min_so_far => {
+                            // Evening cooling dips below the morning trough.
+                            // Anchor mean to the forecasted evening min.
+                            (
+                                f.min_temp,
+                                format!("cold-front → min at {}", f.min_hour),
+                            )
+                        }
+                        _ => {
+                            // Normal case: morning trough holds. Use observed.current
+                            // so the distribution mass concentrates on the bracket
+                            // containing observed.min_so_far.
+                            (o.current, String::from("obs.current"))
+                        }
+                    }
+                }
+            };
+            Some(EffectiveModel {
+                mean,
+                sigma: INTRADAY_BASELINE_SIGMA * scale,
+                source: format!("intra-day ({}, {})", o.source, source_suffix),
+            })
+        }
+        (MarketRegime::FutureDate, _, Some(f)) => Some(EffectiveModel {
+            mean: f.mean,
+            sigma: f.std_dev,
+            source: f.source.to_string(),
+        }),
+        _ => None,
+    };
+
+    let mut brackets: Vec<WeatherBracketJson> = Vec::new();
+    if let Some(child_markets) = event.get("markets").and_then(|v| v.as_array()) {
+        for m in child_markets {
+            let label = m
+                .get("groupItemTitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if label.is_empty() {
+                continue;
+            }
+            let Some((lower, upper)) = parse_bracket_label(&label) else {
+                continue;
+            };
+
+            let token_id = m
+                .get("clobTokenIds")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .and_then(|arr| arr.into_iter().next())
+                .unwrap_or_default();
+            if token_id.is_empty() {
+                continue;
+            }
+
+            let ask = m
+                .get("bestAsk")
+                .and_then(|v| v.as_f64())
+                .filter(|p| *p > 0.0);
+
+            // Probability math — by regime:
+            // - Intra-day: observation-aware, mean = observed current, σ =
+            //   baseline × peak-aware scale. No forecast input.
+            // - Future-date: plain forecast CDF; no observation to condition on.
+            let fp = model.as_ref().map(|mdl| match (&regime, observed.as_ref()) {
+                (MarketRegime::IntraDay { .. }, Some(o)) => match measure {
+                    TemperatureMeasure::High => bracket_probability_high_observed(
+                        lower, upper, o.max_so_far, mdl.mean, mdl.sigma,
+                    ),
+                    TemperatureMeasure::Low => bracket_probability_low_observed(
+                        lower, upper, o.min_so_far, mdl.mean, mdl.sigma,
+                    ),
+                },
+                _ => bracket_probability(lower, upper, mdl.mean, mdl.sigma),
+            });
+
+            let edge = match (fp, ask) {
+                (Some(p), Some(a)) => Some(p - a),
+                _ => None,
+            };
+            let is_signal = edge.map(|e| e >= 0.10).unwrap_or(false);
+
+            brackets.push(WeatherBracketJson {
+                label,
+                token_id,
+                lower,
+                upper,
+                ask_price: ask,
+                forecast_prob: fp,
+                edge,
+                is_signal,
+            });
+        }
+    }
+
+    if brackets.is_empty() {
+        return None;
+    }
+
+    let created_at = event
+        .get("createdAt")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let days_ahead: Option<i64> = match (created_at, end_date_utc) {
+        (Some(ca), Some(ed)) => Some(ed.signed_duration_since(ca).num_days()),
+        _ => end_date_utc.map(|ed| ed.signed_duration_since(now).num_days()),
+    };
+
+    let condition_id = event
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| event.get("id").map(|v| v.to_string()))
+        .unwrap_or_default();
+
+    let coverage = compute_coverage_combos(&brackets);
+
+    let divergence = model
+        .as_ref()
+        .and_then(|mdl| compute_divergence(&brackets, mdl.sigma));
+
+    let regime_str = match regime {
+        MarketRegime::IntraDay { .. } => "intra-day".to_string(),
+        MarketRegime::FutureDate => "future".to_string(),
+        MarketRegime::Past => unreachable!(),
+    };
+
+    Some(WeatherMarketJson {
+        condition_id,
+        question: title.to_string(),
+        location: city,
+        date: target_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        measure: match measure {
+            TemperatureMeasure::High => "High".to_string(),
+            TemperatureMeasure::Low => "Low".to_string(),
+        },
+        unit: match unit {
+            surebet::weather::TemperatureUnit::Celsius => "°C".to_string(),
+            surebet::weather::TemperatureUnit::Fahrenheit => "°F".to_string(),
+        },
+        end_date: end_date_utc.map(|d| d.to_rfc3339()),
+        created_at: created_at.map(|d| d.to_rfc3339()),
+        days_ahead,
+        forecast: model.map(|mdl| WeatherForecastJson {
+            mean: mdl.mean,
+            std_dev: mdl.sigma,
+            source: mdl.source,
+        }),
+        regime: regime_str,
+        observed: observed.clone(),
+        cold_front_check: cold_front_check.map(|f| ColdFrontCheckJson {
+            scenario: if let Some(o) = observed.as_ref() {
+                if f.min_temp < o.min_so_far {
+                    "cold_front".to_string()
+                } else {
+                    "normal".to_string()
+                }
+            } else {
+                "normal".to_string()
+            },
+            min_temp: f.min_temp,
+            min_hour: f.min_hour,
+            sample_count: f.sample_count,
+        }),
+        brackets,
+        coverage,
+        divergence,
+    })
+}
+
+/// METAR → Wunderground fallback. Open-Meteo is intentionally excluded —
+/// intra-day calculations use only the resolution-grade sensor at the
+/// station, not gridded-model interpolations.
+async fn fetch_sensor_observations(
+    http: &reqwest::Client,
+    resolution_url: &str,
+    target_date: Option<chrono::NaiveDate>,
+    unit: surebet::weather::TemperatureUnit,
+) -> Option<ObservationsBlock> {
+    let icao = surebet::weather::wunderground::icao_from_resolution_url(resolution_url)?;
+    let c_to_market_unit = |c: f64| match unit {
+        surebet::weather::TemperatureUnit::Celsius => c,
+        surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
+    };
+
+    // 1. METAR — native integer °C at the airport station.
+    if let Some(date) = target_date {
+        if let Ok(reports) =
+            surebet::weather::metar::fetch_metar_reports(http, &icao, 36).await
+        {
+            let tz = surebet::weather::metar::tz_offset_for_icao(&icao);
+            if let Some(agg) =
+                surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)
+            {
+                return Some(ObservationsBlock {
+                    max_so_far: c_to_market_unit(agg.max_c),
+                    min_so_far: c_to_market_unit(agg.min_c),
+                    current: c_to_market_unit(agg.current_c),
+                    last_observation_at: agg.latest_obs_utc.to_rfc3339(),
+                    timezone: format!("UTC{:+}", tz / 3600),
+                    source: format!("METAR ({} reports)", agg.report_count),
+                    station: Some(agg.icao),
+                    resolution_url: Some(resolution_url.to_string()),
+                });
+            }
+        }
+    }
+
+    // 2. Wunderground scrape — same underlying data as METAR, reformatted.
+    // Used when METAR is momentarily unavailable or the ICAO is archived.
+    if let Ok(wu) = surebet::weather::wunderground::fetch_wunderground(http, &icao).await {
+        let f_to_unit = |f: f64| match unit {
+            surebet::weather::TemperatureUnit::Celsius => (f - 32.0) * 5.0 / 9.0,
+            surebet::weather::TemperatureUnit::Fahrenheit => f,
+        };
+        return Some(ObservationsBlock {
+            max_so_far: f_to_unit(wu.max_since_7am_f),
+            min_so_far: f_to_unit(wu.min_24h_f),
+            current: f_to_unit(wu.current_f),
+            last_observation_at: wu.observation_time_utc.to_rfc3339(),
+            timezone: String::new(),
+            source: "Wunderground (scrape)".to_string(),
+            station: Some(wu.icao),
+            resolution_url: Some(resolution_url.to_string()),
+        });
+    }
+
+    None
+}
+
+/// Compare our model's expected resolution value against the market's
+/// implied expected value (from normalized YES asks). When they differ by
+/// ≥2σ the two distributions barely overlap — usually a forecast error on
+/// our side (markets aggregate better data than a single gridded forecast).
+///
+/// Returns `None` when there aren't enough priced brackets with computable
+/// midpoints to get a meaningful market-implied mean.
+fn compute_divergence(
+    brackets: &[WeatherBracketJson],
+    effective_sigma: f64,
+) -> Option<DivergenceJson> {
+    // Midpoint of each bracket. For unbounded brackets we approximate ±1
+    // beyond the edge (matches our bucket-width convention).
+    fn midpoint(b: &WeatherBracketJson) -> Option<f64> {
+        match (b.lower, b.upper) {
+            (Some(l), Some(u)) => Some((l + u) / 2.0),
+            (Some(l), None) => Some(l + 1.0), // "X or above"
+            (None, Some(u)) => Some(u - 1.0), // "X or below" (our upper = N+1)
+            (None, None) => None,
+        }
+    }
+
+    let priced: Vec<(&WeatherBracketJson, f64)> = brackets
+        .iter()
+        .filter_map(|b| b.ask_price.filter(|a| *a > 0.0).map(|a| (b, a)))
+        .collect();
+    if priced.len() < 3 {
+        return None;
+    }
+    let ask_total: f64 = priced.iter().map(|(_, a)| a).sum();
+    if ask_total <= 0.0 {
+        return None;
+    }
+
+    let mut market_num = 0.0_f64;
+    let mut market_w = 0.0_f64;
+    for (b, a) in &priced {
+        if let Some(m) = midpoint(b) {
+            let w = a / ask_total;
+            market_num += w * m;
+            market_w += w;
+        }
+    }
+    if market_w < 0.5 {
+        return None;
+    }
+    let market_mean = market_num / market_w;
+
+    let mut model_num = 0.0_f64;
+    let mut model_w = 0.0_f64;
+    for b in brackets {
+        if let (Some(p), Some(m)) = (b.forecast_prob, midpoint(b)) {
+            model_num += p * m;
+            model_w += p;
+        }
+    }
+    if model_w < 0.5 {
+        return None;
+    }
+    let model_mean = model_num / model_w;
+
+    let delta = market_mean - model_mean;
+    let delta_sigmas = if effective_sigma > 0.0 {
+        delta.abs() / effective_sigma
+    } else {
+        0.0
+    };
+
+    let alert = if delta_sigmas >= 2.0 {
+        "high"
+    } else if delta_sigmas >= 1.0 {
+        "moderate"
+    } else {
+        "aligned"
+    }
+    .to_string();
+
+    Some(DivergenceJson {
+        model_mean,
+        market_mean,
+        delta,
+        delta_sigmas,
+        alert,
+    })
+}
+
+/// Enumerate **adjacent** 2- and 3-bracket coverage combos for a market.
+///
+/// Two constraints, both for sanity:
+/// 1. **Adjacency** — combo brackets must be consecutive after sorting by lower
+///    bound. "16°C + 17°C" is fine; "9°C or below + 16°C" is not — physical
+///    daily temperatures don't skip entire ranges, so such combos mix a live
+///    bet with a lottery ticket.
+/// 2. **Meaningful probability** — each bracket must contribute ≥1% win
+///    probability under our model. Dead or near-dead brackets are excluded.
+///
+/// For each combo size (2, 3) we return up to two flavors: the combo with the
+/// highest EV ("best profit") and the combo with the highest win probability
+/// ("safest"). Dedup when both flavors pick the same window.
+///
+/// Combos are only returned if `cost < $1` (upside capacity) and EV > 0.
+fn compute_coverage_combos(brackets: &[WeatherBracketJson]) -> Vec<CoverageComboJson> {
+    #[derive(Clone)]
+    struct Cand {
+        idx_in_market: usize,
+        lower: f64, // used for sorting — +∞-sentinel for "or below" type bounds
+        label: String,
+        token_id: String,
+        prob: f64,
+        ask: f64,
+    }
+
+    // Collect candidates, assigning each a sortable "lower" anchor:
+    // - `Some(l)` → l                      (normal and "X or above" brackets)
+    // - `None` upper-bound → use `upper − 1` as an anchor below the smallest l
+    //   so "X or below" sorts to the far left.
+    let mut cands: Vec<Cand> = brackets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match (b.forecast_prob, b.ask_price) {
+            (Some(p), Some(a)) if a > 0.0 && a < 1.0 && p >= 0.01 => {
+                let anchor = b.lower.or(b.upper.map(|u| u - 1.0))?;
+                Some(Cand {
+                    idx_in_market: i,
+                    lower: anchor,
+                    label: b.label.clone(),
+                    token_id: b.token_id.clone(),
+                    prob: p,
+                    ask: a,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    cands.sort_by(|a, b| a.lower.partial_cmp(&b.lower).unwrap_or(std::cmp::Ordering::Equal));
+    if cands.len() < 2 {
+        return Vec::new();
+    }
+    let _ = |_c: &Cand| (); // silence idx_in_market-unused if adjacency check changes
+
+    let make_combo = |strategy: &str, window: &[&Cand]| -> CoverageComboJson {
+        let cost: f64 = window.iter().map(|c| c.ask).sum();
+        let win_prob: f64 = window.iter().map(|c| c.prob).sum();
+        CoverageComboJson {
+            strategy: strategy.to_string(),
+            size: window.len(),
+            labels: window.iter().map(|c| c.label.clone()).collect(),
+            token_ids: window.iter().map(|c| c.token_id.clone()).collect(),
+            cost,
+            win_prob,
+            ev: win_prob - cost,
+        }
+    };
+
+    // Adjacency: only contiguous windows of size k.
+    let windows_of_size = |k: usize| -> Vec<Vec<&Cand>> {
+        if k > cands.len() {
+            return vec![];
+        }
+        (0..=(cands.len() - k))
+            .map(|start| cands[start..start + k].iter().collect::<Vec<&Cand>>())
+            .collect()
+    };
+
+    let mut results: Vec<CoverageComboJson> = Vec::new();
+    for k in [2, 3] {
+        let mut scored: Vec<(Vec<&Cand>, f64, f64, f64)> = windows_of_size(k)
+            .into_iter()
+            .filter_map(|w| {
+                let cost: f64 = w.iter().map(|c| c.ask).sum();
+                if cost >= 1.0 {
+                    return None;
+                }
+                let wp: f64 = w.iter().map(|c| c.prob).sum();
+                let ev = wp - cost;
+                if ev <= 0.0 {
+                    return None;
+                }
+                Some((w, cost, wp, ev))
+            })
+            .collect();
+        if scored.is_empty() {
+            continue;
+        }
+
+        // "Best profit" = max EV
+        scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        let best_ev_window: Vec<&Cand> = scored[0].0.clone();
+        results.push(make_combo("best_profit", &best_ev_window));
+
+        // "Safest" = max P(win). Skip if identical to best-profit pick.
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let safest_window: Vec<&Cand> = scored[0].0.clone();
+        let same = safest_window.len() == best_ev_window.len()
+            && safest_window
+                .iter()
+                .zip(best_ev_window.iter())
+                .all(|(a, b)| a.idx_in_market == b.idx_in_market);
+        if !same {
+            results.push(make_combo("safest", &safest_window));
+        }
+    }
+    results
+}
+
+/// Shared helper used by both `/api/weather` and `/api/observations`:
+/// fetch today's running max/min/current using METAR → Wunderground → Open-Meteo.
+///
+/// Returns `None` when the market resolves on a future local date (no
+/// observations exist yet) or when every provider fails.
+async fn fetch_obs_block_for_event(
+    http: &reqwest::Client,
+    resolution_url: &str,
+    target_date: Option<chrono::NaiveDate>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    unit: surebet::weather::TemperatureUnit,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ObservationsBlock> {
+    let icao = surebet::weather::wunderground::icao_from_resolution_url(resolution_url);
+
+    let target_in_future = match (target_date, icao.as_deref()) {
+        (Some(date), Some(icao_code)) => {
+            let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+            let local_today = (now + chrono::Duration::seconds(tz)).date_naive();
+            date > local_today
+        }
+        (Some(date), None) => date > now.date_naive(),
+        _ => false,
+    };
+    if target_in_future {
+        return None;
+    }
+
+    let c_to_market_unit = |c: f64| match unit {
+        surebet::weather::TemperatureUnit::Celsius => c,
+        surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
+    };
+
+    // 1. METAR
+    if let (Some(icao_code), Some(date)) = (&icao, target_date) {
+        if let Ok(reports) =
+            surebet::weather::metar::fetch_metar_reports(http, icao_code, 36).await
+        {
+            let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+            if let Some(agg) =
+                surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)
+            {
+                return Some(ObservationsBlock {
+                    max_so_far: c_to_market_unit(agg.max_c),
+                    min_so_far: c_to_market_unit(agg.min_c),
+                    current: c_to_market_unit(agg.current_c),
+                    last_observation_at: agg.latest_obs_utc.to_rfc3339(),
+                    timezone: format!("UTC{:+}", tz / 3600),
+                    source: format!("METAR ({} reports)", agg.report_count),
+                    station: Some(agg.icao),
+                    resolution_url: Some(resolution_url.to_string()),
+                });
+            }
+        }
+    }
+
+    // 2. Wunderground
+    if let Some(icao_code) = &icao {
+        if let Ok(wu) =
+            surebet::weather::wunderground::fetch_wunderground(http, icao_code).await
+        {
+            let f_to_unit = |f: f64| match unit {
+                surebet::weather::TemperatureUnit::Celsius => (f - 32.0) * 5.0 / 9.0,
+                surebet::weather::TemperatureUnit::Fahrenheit => f,
+            };
+            return Some(ObservationsBlock {
+                max_so_far: f_to_unit(wu.max_since_7am_f),
+                min_so_far: f_to_unit(wu.min_24h_f),
+                current: f_to_unit(wu.current_f),
+                last_observation_at: wu.observation_time_utc.to_rfc3339(),
+                timezone: String::new(),
+                source: "Wunderground (fallback)".to_string(),
+                station: Some(wu.icao),
+                resolution_url: Some(resolution_url.to_string()),
+            });
+        }
+    }
+
+    // 3. Open-Meteo
+    if let (Some(lat), Some(lon), Some(date)) = (lat, lon, target_date) {
+        if let Ok(om) = fetch_observations(http, lat, lon, date, unit).await {
+            return Some(ObservationsBlock {
+                max_so_far: om.max_so_far,
+                min_so_far: om.min_so_far,
+                current: om.current,
+                last_observation_at: om.last_observation_at.to_rfc3339(),
+                timezone: om.timezone,
+                source: om.source.to_string(),
+                station: icao.clone(),
+                resolution_url: if resolution_url.is_empty() {
+                    None
+                } else {
+                    Some(resolution_url.to_string())
+                },
+            });
+        }
+    }
+
+    None
+}
+
+/// Parse a Polymarket weather event title like "Highest temperature in London on April 14?"
+/// into (measure, city). Returns None if the title doesn't match the expected pattern.
+fn parse_weather_event_title(title: &str) -> Option<(TemperatureMeasure, String)> {
+    for (prefix, measure) in [
+        ("Highest temperature in ", TemperatureMeasure::High),
+        ("highest temperature in ", TemperatureMeasure::High),
+        ("Lowest temperature in ", TemperatureMeasure::Low),
+        ("lowest temperature in ", TemperatureMeasure::Low),
+    ] {
+        if let Some(rest) = title.strip_prefix(prefix) {
+            if let Some((city, _)) = rest.split_once(" on ") {
+                return Some((measure, city.trim().to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// GET /weather — static HTML shell; JS loads /api/weather on page load.
+async fn weather_html() -> Html<String> {
+    Html(r##"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Weather Markets — Harvester</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; padding: 20px; max-width: 1400px; margin: 0 auto; }
+  h1 { color: #58a6ff; margin-bottom: 5px; font-size: 1.4em; }
+  .subtitle { color: #8b949e; margin-bottom: 20px; font-size: 0.85em; }
+  h2 { color: #8b949e; margin: 20px 0 10px 0; font-size: 1.05em; border-bottom: 1px solid #21262d; padding-bottom: 5px; }
+  .nav { display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+  .nav a { color: #8b949e; text-decoration: none; padding: 6px 14px; border-radius: 6px; font-size: 0.9em; border: 1px solid #21262d; }
+  .nav a.active { background: #1f6feb; color: #fff; border-color: #388bfd; }
+  .nav a:hover:not(.active) { background: #21262d; }
+  .loading { color: #8b949e; padding: 40px; text-align: center; font-size: 0.95em; }
+  .error { background: #4a1818; border: 1px solid #e74c3c; border-radius: 6px; padding: 12px 16px; color: #f5b7b1; margin: 12px 0; }
+  .market-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+  .market-header { padding: 12px 16px; border-bottom: 1px solid #21262d; }
+  .market-title { color: #58a6ff; font-size: 0.9em; font-weight: bold; margin-bottom: 4px; }
+  .market-meta { display: flex; gap: 16px; font-size: 0.78em; color: #8b949e; flex-wrap: wrap; margin-top: 4px; }
+  .meta-item { display: flex; gap: 4px; }
+  .meta-label { color: #484f58; }
+  .meta-value { color: #8b949e; }
+  .forecast-box { background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 8px 12px; font-size: 0.82em; margin: 10px 16px; }
+  .forecast-label { color: #484f58; font-size: 0.8em; text-transform: uppercase; margin-bottom: 4px; }
+  .forecast-val { color: #f0e68c; font-size: 1.05em; font-weight: bold; }
+  .forecast-source { color: #8b949e; font-size: 0.78em; margin-top: 2px; }
+  .no-forecast { color: #484f58; font-size: 0.8em; padding: 8px 16px; font-style: italic; }
+  .brackets-table { width: 100%; border-collapse: collapse; font-size: 0.82em; }
+  .brackets-table th { background: #21262d; color: #8b949e; text-align: left; padding: 7px 16px; font-size: 0.78em; text-transform: uppercase; }
+  .brackets-table td { padding: 7px 16px; border-top: 1px solid #21262d; }
+  .brackets-table tr:hover { background: #1c2128; }
+  .bracket-label { color: #c9d1d9; font-weight: bold; }
+  .price-cell { color: #8b949e; }
+  .prob-cell { color: #79c0ff; }
+  .edge-pos { color: #2ecc71; font-weight: bold; }
+  .edge-neg { color: #484f58; }
+  .signal-row { background: rgba(46, 204, 113, 0.06) !important; }
+  .signal-badge { background: #2ecc71; color: #000; border-radius: 3px; padding: 1px 6px; font-size: 0.78em; font-weight: bold; }
+  .no-ask { color: #484f58; font-style: italic; font-size: 0.85em; }
+  .summary-bar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .summary-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 14px; }
+  .slabel { color: #8b949e; font-size: 0.7em; text-transform: uppercase; }
+  .sval { font-size: 1.1em; font-weight: bold; margin-top: 2px; }
+  .refresh-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 6px 14px; border-radius: 4px; font-family: inherit; font-size: 0.82em; cursor: pointer; margin-left: auto; }
+  .refresh-btn:hover { background: #30363d; }
+  .spinner { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<h1>Weather Markets</h1>
+<div class="nav">
+  <a href="/">Markets</a>
+  <a href="/trades">Trades</a>
+  <a href="/weather" class="active">Weather</a>
+  <a href="/observations">Observations</a>
+  <a href="/paper-trades">Paper Trades</a>
+</div>
+
+<div id="content">
+  <div class="loading"><span class="spinner">⟳</span> Loading weather markets...</div>
+</div>
+
+<!-- Floating paper-trade builder: appears when ≥1 bracket checkbox is picked.
+     Only allows picks from a single market at a time. -->
+<div id="trade-builder" style="
+  position:fixed; bottom:0; left:0; right:0; background:#161b22;
+  border-top:2px solid #30363d; padding:0.6em 1em; display:none; z-index:100;
+  box-shadow:0 -4px 16px rgba(0,0,0,0.4);">
+  <div style="display:flex; align-items:center; gap:1em; flex-wrap:wrap">
+    <div style="font-weight:600" id="tb-market"></div>
+    <div id="tb-summary" style="color:#8b949e"></div>
+    <div style="margin-left:auto; display:flex; align-items:center; gap:0.5em">
+      <label style="color:#8b949e;font-size:0.9em">Shares per leg:
+        <input type="number" id="tb-shares" value="100" min="1" max="100000"
+               style="width:5em; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; padding:0.15em 0.3em" onchange="renderBuilder()">
+      </label>
+      <label style="color:#8b949e;font-size:0.9em">Mode:
+        <select id="tb-mode" onchange="renderBuilder()"
+                style="background:#0d1117; color:#c9d1d9; border:1px solid #30363d; padding:0.2em 0.4em">
+          <option value="paper">Paper (simulated)</option>
+          <option value="live" id="tb-mode-live" disabled>Live (real order)</option>
+        </select>
+      </label>
+      <button id="tb-save" onclick="savePaperTrade()" style="
+        background:#238636; color:white; border:none; padding:0.4em 1em;
+        border-radius:4px; cursor:pointer; font-weight:600">Save paper trade</button>
+      <button onclick="clearBuilder()" style="
+        background:#21262d; color:#c9d1d9; border:1px solid #30363d; padding:0.4em 0.8em;
+        border-radius:4px; cursor:pointer">Clear</button>
+    </div>
+  </div>
+  <div id="tb-status" style="color:#7ee2a8; font-size:0.9em; margin-top:0.3em; display:none"></div>
+</div>
+
+<script>
+let selectedLegs = [];
+let selectedMarketSlug = null;
+let serverLiveMode = false;
+
+async function initMode() {
+  try {
+    const r = await fetch('/api/status');
+    const j = await r.json();
+    serverLiveMode = !!j.live_mode;
+    const liveOpt = document.getElementById('tb-mode-live');
+    if (liveOpt) {
+      liveOpt.disabled = !serverLiveMode;
+      liveOpt.textContent = serverLiveMode
+        ? 'Live (real order) ⚠️'
+        : 'Live — server not in --live mode';
+    }
+  } catch (e) { /* best-effort */ }
+}
+
+async function load() {
+  const content = document.getElementById('content');
+  try {
+    const r = await fetch('/api/weather');
+    const data = await r.json();
+    render(content, data);
+  } catch (e) {
+    content.innerHTML = `<div class="error">Failed to load: ${e}</div>`;
+  }
+}
+
+function fmt(v, decimals=3) {
+  if (v == null) return '<span class="no-ask">—</span>';
+  return (v * 100).toFixed(1) + '%';
+}
+
+function fmtEdge(v) {
+  if (v == null) return '<span class="no-ask">—</span>';
+  const pct = (v * 100).toFixed(1) + '%';
+  if (v >= 0.10) return `<span class="edge-pos">+${pct} ▲</span>`;
+  if (v >= 0) return `<span class="edge-pos">+${pct}</span>`;
+  return `<span class="edge-neg">${pct}</span>`;
+}
+
+function onLegPick(el) {
+  const d = el.dataset;
+  const mkt = d.marketSlug;
+  if (el.checked) {
+    // Only allow picks from a single market at a time.
+    if (selectedMarketSlug && selectedMarketSlug !== mkt) {
+      clearBuilder();
+      el.checked = true;
+    }
+    selectedMarketSlug = mkt;
+    if (selectedLegs.length >= 3) {
+      alert('Max 3 legs per combo.');
+      el.checked = false;
+      return;
+    }
+    selectedLegs.push({
+      market_slug: d.marketSlug,
+      market_question: d.marketQuestion,
+      unit: d.unit,
+      target_date: d.targetDate || null,
+      regime: d.regime,
+      bracket_label: d.bracket,
+      token_id: d.tokenId,
+      ask_at_buy: parseFloat(d.ask),
+      model_prob_at_buy: d.prob === '' ? null : parseFloat(d.prob),
+    });
+  } else {
+    selectedLegs = selectedLegs.filter(l => l.token_id !== d.tokenId);
+    if (selectedLegs.length === 0) selectedMarketSlug = null;
+  }
+  renderBuilder();
+}
+
+function renderBuilder() {
+  const bar = document.getElementById('trade-builder');
+  if (selectedLegs.length === 0) { bar.style.display = 'none'; return; }
+  bar.style.display = 'block';
+  const shares = Math.max(1, parseInt(document.getElementById('tb-shares').value) || 100);
+  const mode = document.getElementById('tb-mode').value;
+  const cost = selectedLegs.reduce((s, l) => s + l.ask_at_buy * shares, 0);
+  const prob = selectedLegs.reduce((s, l) => s + (l.model_prob_at_buy || 0), 0);
+  const payout = shares;
+  const ev = prob * payout - cost;
+  document.getElementById('tb-market').textContent = selectedLegs[0].market_question;
+  const legsStr = selectedLegs.map(l => `${l.bracket_label} @ $${l.ask_at_buy.toFixed(3)}`).join(' + ');
+  const evColor = ev >= 0 ? '#7ee2a8' : '#ffa198';
+  const sign = ev >= 0 ? '+' : '';
+  document.getElementById('tb-summary').innerHTML = `
+    <span style="color:#c9d1d9">${legsStr}</span>
+    &nbsp;·&nbsp; cost <b style="color:#c9d1d9">$${cost.toFixed(2)}</b>
+    &nbsp;·&nbsp; P(any wins) <b style="color:#c9d1d9">${(prob*100).toFixed(1)}%</b>
+    &nbsp;·&nbsp; EV <b style="color:${evColor}">${sign}$${ev.toFixed(2)}</b>
+    &nbsp;·&nbsp; max payout <b style="color:#c9d1d9">$${payout.toFixed(2)}</b>`;
+
+  // Toggle button color + label based on mode.
+  const btn = document.getElementById('tb-save');
+  if (mode === 'live') {
+    btn.style.background = '#da3633';
+    btn.textContent = '⚠️ Place LIVE order (real money)';
+  } else {
+    btn.style.background = '#238636';
+    btn.textContent = 'Save paper trade';
+  }
+}
+
+function clearBuilder() {
+  selectedLegs = [];
+  selectedMarketSlug = null;
+  document.querySelectorAll('.leg-pick:checked').forEach(cb => cb.checked = false);
+  document.getElementById('tb-status').style.display = 'none';
+  renderBuilder();
+}
+
+async function savePaperTrade() {
+  if (selectedLegs.length === 0) return;
+  const shares = Math.max(1, parseInt(document.getElementById('tb-shares').value) || 100);
+  const mode = document.getElementById('tb-mode').value;
+  const btn = document.getElementById('tb-save');
+
+  if (mode === 'live') {
+    const cost = selectedLegs.reduce((s, l) => s + l.ask_at_buy * shares, 0);
+    const confirmMsg = `⚠️ PLACE LIVE ORDER? This will spend $${cost.toFixed(2)} of REAL USDC on ${selectedLegs.length} buy order(s). This cannot be undone. Type 'place' to confirm.`;
+    const resp = prompt(confirmMsg);
+    if (resp !== 'place') {
+      alert('Cancelled.');
+      return;
+    }
+  }
+
+  btn.disabled = true;
+  btn.textContent = mode === 'live' ? 'Placing orders…' : 'Saving…';
+  const first = selectedLegs[0];
+  const body = {
+    market_slug: first.market_slug,
+    market_question: first.market_question,
+    unit: first.unit,
+    target_date: first.target_date,
+    regime: first.regime,
+    legs: selectedLegs.map(l => ({
+      bracket_label: l.bracket_label,
+      token_id: l.token_id,
+      ask_at_buy: l.ask_at_buy,
+      shares: shares,
+      model_prob_at_buy: l.model_prob_at_buy,
+    })),
+    model_win_prob_at_buy: selectedLegs.reduce((s, l) => s + (l.model_prob_at_buy || 0), 0),
+    mode,
+  };
+  try {
+    const r = await fetch('/api/paper-trade', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    const status = document.getElementById('tb-status');
+    if (j.saved) {
+      const modeTag = j.mode === 'live' ? ' [LIVE]' : '';
+      const orderSummary = j.order_ids
+        ? ` · orders: ${j.order_ids.filter(x => x).length}/${j.order_ids.length} filled`
+        : '';
+      status.innerHTML = `✓ Saved trade${modeTag} <code>${j.id}</code> · cost $${j.total_cost.toFixed(2)}${orderSummary} · <a href="/paper-trades" style="color:#58a6ff">view on /paper-trades</a>`;
+      status.style.color = '#7ee2a8';
+      status.style.display = 'block';
+      setTimeout(clearBuilder, 3500);
+    } else {
+      status.textContent = `Error: ${j.error || 'unknown'}`;
+      status.style.color = '#ffa198';
+      status.style.display = 'block';
+    }
+  } catch (e) {
+    const status = document.getElementById('tb-status');
+    status.textContent = `Error: ${e}`;
+    status.style.color = '#ffa198';
+    status.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save paper trade';
+  }
+}
+
+function render(el, data) {
+  if (data.error) {
+    el.innerHTML = `<div class="error">API error: ${data.error}</div>`;
+    return;
+  }
+  const markets = data.markets || [];
+  const totalSignals = markets.reduce((s, m) => s + m.brackets.filter(b => b.is_signal).length, 0);
+  const withForecast = markets.filter(m => m.forecast != null).length;
+
+  let html = `<div class="summary-bar">
+    <div class="summary-card"><div class="slabel">Weather Markets</div><div class="sval">${markets.length}</div></div>
+    <div class="summary-card"><div class="slabel">With Forecast</div><div class="sval" style="color:#79c0ff">${withForecast}</div></div>
+    <div class="summary-card"><div class="slabel">Buy Signals</div><div class="sval" style="color:#2ecc71">${totalSignals}</div></div>
+    <div class="summary-card"><div class="slabel">Fetched</div><div class="sval" style="font-size:0.85em;color:#8b949e">${new Date(data.fetched_at).toLocaleTimeString()}</div></div>
+    <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+  </div>`;
+
+  if (markets.length === 0) {
+    html += '<div class="loading" style="margin-top:40px">No active weather markets found in the next 20 days.</div>';
+  }
+
+  for (const m of markets) {
+    const daysLeft = m.end_date ? Math.round((new Date(m.end_date) - Date.now()) / 86400000) : '?';
+    const daysAheadStr = m.days_ahead != null ? `${m.days_ahead}d window` : '';
+    const createdTime = m.created_at ? new Date(m.created_at).toISOString().slice(0,16).replace('T', ' ') + ' UTC' : '—';
+    const endTime = m.end_date ? new Date(m.end_date).toISOString().slice(0,10) : '—';
+    const signalCount = m.brackets.filter(b => b.is_signal).length;
+    const signalBadge = signalCount > 0 ? ` <span class="signal-badge">${signalCount} signal${signalCount>1?'s':''}</span>` : '';
+
+    let forecastHtml = '';
+    if (m.forecast) {
+      const f = m.forecast;
+      const regimeLabel = m.regime === 'intra-day' ? 'Intra-day model' : 'Forecast';
+      forecastHtml = `<div class="forecast-box">
+        <div class="forecast-label">${regimeLabel} (${f.source})</div>
+        <div class="forecast-val">${f.mean.toFixed(1)}${m.unit} <span style="color:#8b949e;font-size:0.85em">± ${f.std_dev.toFixed(2)}°</span></div>
+      </div>`;
+    } else {
+      forecastHtml = `<div class="no-forecast">No forecast available (date may be out of range or location unmapped)</div>`;
+    }
+
+    // Observed running max/min from METAR (or fallback). When present,
+    // bracket probabilities below are observation-aware: brackets that are
+    // already mathematically unreachable get 0, remaining brackets absorb the
+    // collapsed mass.
+    let observedHtml = '';
+    if (m.observed) {
+      const o = m.observed;
+      const stationLink = o.resolution_url
+        ? `<a href="${o.resolution_url}" target="_blank" style="color:#58a6ff">${o.station || o.source}</a>`
+        : (o.station || o.source);
+      const ageMin = Math.round((Date.now() - new Date(o.last_observation_at).getTime()) / 60000);
+      observedHtml = `<div class="forecast-box" style="background:#0d2818">
+        <div class="forecast-label">Observed so far (${o.source})</div>
+        <div class="forecast-val">
+          max ${o.max_so_far.toFixed(1)}${m.unit} · min ${o.min_so_far.toFixed(1)}${m.unit} · now ${o.current.toFixed(1)}${m.unit}
+          <span style="color:#8b949e;font-size:0.85em"> · ${stationLink} · ${ageMin}m ago</span>
+        </div>
+      </div>`;
+    }
+
+    let bracketsHtml = `<table class="brackets-table">
+      <tr><th style="width:2em">Pick</th><th>Bracket</th><th>Ask</th><th>Forecast Prob</th><th>Edge</th><th></th></tr>`;
+    for (const b of m.brackets) {
+      const rowClass = b.is_signal ? ' class="signal-row"' : '';
+      // Only offer selection if the bracket has a tradeable ask.
+      const checkable = b.ask_price != null && b.ask_price > 0 && b.ask_price < 1;
+      // Encode the payload we need when saving a leg — the onchange handler
+      // reads data-* attrs.
+      const cbData = checkable
+        ? `data-market-slug="${m.condition_id}" data-market-question="${m.question.replace(/"/g, '&quot;')}" data-unit="${m.unit}" data-target-date="${m.date || ''}" data-regime="${m.regime}" data-bracket="${b.label}" data-token-id="${b.token_id}" data-ask="${b.ask_price}" data-prob="${b.forecast_prob != null ? b.forecast_prob : ''}"`
+        : '';
+      const cb = checkable
+        ? `<input type="checkbox" class="leg-pick" ${cbData} onchange="onLegPick(this)">`
+        : '';
+      bracketsHtml += `<tr${rowClass}>
+        <td>${cb}</td>
+        <td class="bracket-label">${b.label}</td>
+        <td class="price-cell">${fmt(b.ask_price)}</td>
+        <td class="prob-cell">${fmt(b.forecast_prob)}</td>
+        <td>${fmtEdge(b.edge)}</td>
+        <td>${b.is_signal ? '<span class="signal-badge">BUY</span>' : ''}</td>
+      </tr>`;
+    }
+    bracketsHtml += '</table>';
+
+    // Coverage combos: buy multiple YES tokens so one of them wins. Each row
+    // shows labels, total cost, P(one wins), and net EV per share-set.
+    let coverageHtml = '';
+    if (m.coverage && m.coverage.length > 0) {
+      const rows = m.coverage.map(c => {
+        const strategyLabel = c.strategy === 'best_profit'
+          ? `Best profit (${c.size}-combo)`
+          : `Safest (${c.size}-combo)`;
+        const labelsStr = c.labels.join(' + ');
+        return `<tr>
+          <td style="padding-right:1em">${strategyLabel}</td>
+          <td class="bracket-label">${labelsStr}</td>
+          <td class="price-cell">$${c.cost.toFixed(3)}</td>
+          <td class="prob-cell">${(c.win_prob * 100).toFixed(1)}%</td>
+          <td class="edge-pos">+$${c.ev.toFixed(3)}</td>
+        </tr>`;
+      }).join('');
+      coverageHtml = `<div class="coverage-section">
+        <div class="coverage-label">Coverage bets — buy adjacent YES tokens, win if any resolves</div>
+        <table class="brackets-table" style="margin-top:0.3em">
+          <tr><th>Strategy</th><th>Brackets</th><th>Cost</th><th>P(win)</th><th>EV/share-set</th></tr>
+          ${rows}
+        </table>
+      </div>`;
+    }
+
+    // Divergence badge — flag events where our model strongly disagrees
+    // with the market (probably a forecast error on our side).
+    let divBadge = '';
+    if (m.divergence) {
+      const dv = m.divergence;
+      const dir = dv.delta > 0 ? '↑ market warmer' : '↓ market cooler';
+      const color = dv.alert === 'high' ? '#ff7b72'
+                  : dv.alert === 'moderate' ? '#d29922'
+                  : '#7ee2a8';
+      const tag = dv.alert === 'high' ? '⚠️ model vs market'
+                : dv.alert === 'moderate' ? 'model vs market'
+                : 'model vs market';
+      const deltaStr = `${dv.delta > 0 ? '+' : ''}${dv.delta.toFixed(1)}${m.unit} (${dv.delta_sigmas.toFixed(1)}σ)`;
+      divBadge = ` <span style="background:#21262d;color:${color};padding:0.05em 0.4em;border-radius:3px;font-size:0.78em">${tag}: ${deltaStr} ${dir}</span>`;
+    }
+
+    html += `<div class="market-card">
+      <div class="market-header">
+        <div class="market-title">${m.question}${signalBadge}${divBadge}</div>
+        <div class="market-meta">
+          <span class="meta-item"><span class="meta-label">City:</span><span class="meta-value">${m.location}</span></span>
+          <span class="meta-item"><span class="meta-label">Date:</span><span class="meta-value">${m.date || '—'}</span></span>
+          <span class="meta-item"><span class="meta-label">Measure:</span><span class="meta-value">${m.measure} ${m.unit}</span></span>
+          <span class="meta-item"><span class="meta-label">End:</span><span class="meta-value">${endTime} (${daysLeft}d)</span></span>
+          <span class="meta-item"><span class="meta-label">Created:</span><span class="meta-value">${createdTime}</span></span>
+          <span class="meta-item"><span class="meta-label">Window:</span><span class="meta-value">${daysAheadStr}</span></span>
+        </div>
+      </div>
+      ${forecastHtml}
+      ${observedHtml}
+      ${bracketsHtml}
+      ${coverageHtml}
+    </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+load();
+initMode();
+</script>
+</body>
+</html>"##.to_string())
+}
+
+// ─── Observations / dead-bracket page ───────────────────────────────────────
+
+#[derive(Serialize)]
+struct ObsBracketJson {
+    label: String,
+    token_id_yes: String,
+    token_id_no: String,
+    lower: Option<f64>,
+    upper: Option<f64>,
+    yes_ask: Option<f64>,
+    yes_bid: Option<f64>,
+    /// NO ask price ≈ 1 − YES bestBid (orderbook inversion). None if YES has no bid.
+    no_ask_estimate: Option<f64>,
+    /// "DEAD" (cannot win), "LOCKED_WIN" (already won), or "LIVE".
+    status: String,
+    /// For DEAD brackets: profit/share if you buy NO at no_ask_estimate
+    /// and the bracket resolves NO (= YES bestBid).
+    profit_per_share: Option<f64>,
+}
+
+#[derive(Serialize, Clone)]
+struct ObservationsBlock {
+    max_so_far: f64,
+    min_so_far: f64,
+    current: f64,
+    last_observation_at: String,
+    timezone: String,
+    /// Data provider: "Wunderground" (scraped from station page) or "Open-Meteo" (gridded fallback).
+    source: String,
+    /// Station ICAO code if available (e.g. "EGLC"). Only set for Wunderground reads.
+    station: Option<String>,
+    /// Resolution source URL from Polymarket's event metadata.
+    resolution_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ObservationEventJson {
+    condition_id: String,
+    question: String,
+    location: String,
+    date: Option<String>,
+    measure: String,
+    unit: String,
+    end_date: Option<String>,
+    observed: Option<ObservationsBlock>,
+    brackets: Vec<ObsBracketJson>,
+    dead_count: usize,
+    /// Sum of `yes_bid` across DEAD brackets — rough proxy for arbitrage size.
+    total_dead_opportunity: f64,
+}
+
+#[derive(Serialize)]
+struct ObservationsApiResponse {
+    events: Vec<ObservationEventJson>,
+    fetched_at: String,
+    error: Option<String>,
+}
+
+/// GET /api/observations — fetch active weather events, pull current-day
+/// observations from Open-Meteo, and tag each bracket as DEAD / LOCKED_WIN / LIVE.
+///
+/// For "Highest temperature" markets, the running max can only go up — so any
+/// bracket whose upper bound is already passed is mathematically dead. Buying
+/// the NO side at (1 − YES bestBid) yields a guaranteed $1 payout.
+async fn api_observations(State(state): State<AppState>) -> impl IntoResponse {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+
+    let url = format!(
+        "{}/events?tag_slug=weather&active=true&closed=false&limit=200",
+        state.gamma_url
+    );
+
+    let raw_events: Vec<serde_json::Value> = match http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        Ok(resp) => {
+            let status = resp.status();
+            return Json(ObservationsApiResponse {
+                events: vec![],
+                fetched_at: now.to_rfc3339(),
+                error: Some(format!("Gamma /events returned {status}")),
+            });
+        }
+        Err(e) => {
+            return Json(ObservationsApiResponse {
+                events: vec![],
+                fetched_at: now.to_rfc3339(),
+                error: Some(format!("Gamma /events failed: {e}")),
+            });
+        }
+    };
+
+    // Fan out per-event processing concurrently. Each event does up to 3 HTTP
+    // calls (METAR → Wunderground → Open-Meteo); doing them sequentially for
+    // 150 events takes ~30 seconds. Bounded concurrency = 20 keeps the host
+    // honest without hammering remote APIs.
+    let per_event_futures = raw_events.into_iter().map(|event| {
+        let http = http.clone();
+        async move {
+            process_weather_event(&http, event, now).await
+        }
+    });
+    let collected: Vec<Option<ObservationEventJson>> = futures_util::stream::iter(per_event_futures)
+        .buffer_unordered(20)
+        .collect()
+        .await;
+    let mut results: Vec<ObservationEventJson> = collected.into_iter().flatten().collect();
+
+    // Sort by arbitrage opportunity size (highest first)
+    results.sort_by(|a, b| {
+        b.total_dead_opportunity
+            .partial_cmp(&a.total_dead_opportunity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Json(ObservationsApiResponse {
+        events: results,
+        fetched_at: now.to_rfc3339(),
+        error: None,
+    })
+}
+
+/// Process one weather event: fetch observations (METAR → Wunderground →
+/// Open-Meteo), classify each bracket, return the JSON row the UI will render.
+///
+/// Returns `None` for events that aren't temperature-bracket markets or have
+/// no parseable brackets.
+async fn process_weather_event(
+    http: &reqwest::Client,
+    event: serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ObservationEventJson> {
+    let title = event.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let (measure, city) = parse_weather_event_title(title)?;
+
+    let end_date_utc = event
+        .get("endDate")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let target_date = end_date_utc.map(|d| d.date_naive());
+
+    let (lat, lon) = lookup_station(&city)
+        .map(|(_, la, lo)| (Some(la), Some(lo)))
+        .unwrap_or((None, None));
+
+    let unit = event
+        .get("markets")
+        .and_then(|v| v.as_array())
+        .and_then(|markets| {
+            markets.iter().find_map(|m| {
+                let label = m
+                    .get("groupItemTitle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if label.contains("°F") {
+                    Some(surebet::weather::TemperatureUnit::Fahrenheit)
+                } else if label.contains("°C") {
+                    Some(surebet::weather::TemperatureUnit::Celsius)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(surebet::weather::TemperatureUnit::Celsius);
+
+    // Provider dispatch: METAR (native integer °C from aviationweather.gov) is
+    // the same data Wunderground reformats — hitting it directly avoids the
+    // °C → °F → °C round-trip that Wunderground's embedded JSON introduces.
+    // Order: METAR → Wunderground scrape → Open-Meteo gridded fallback.
+    let resolution_url = event
+        .get("resolutionSource")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let icao = surebet::weather::wunderground::icao_from_resolution_url(resolution_url);
+
+    // Skip observation fetch for markets whose target date is still in the future:
+    // METAR has no reports yet, and Wunderground's "today's running max" is about
+    // the wrong day. The Weather tab is for forecasts; Observations is for
+    // already-observed data only.
+    let target_in_future = match (target_date, icao.as_deref()) {
+        (Some(date), Some(icao_code)) => {
+            let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+            let local_today = (now + chrono::Duration::seconds(tz)).date_naive();
+            date > local_today
+        }
+        (Some(date), None) => date > now.date_naive(),
+        _ => false,
+    };
+
+    let obs: Option<ObservationsBlock> = if target_in_future {
+        None
+    } else {
+        let mut result = None;
+
+        let c_to_market_unit = |c: f64| match unit {
+            surebet::weather::TemperatureUnit::Celsius => c,
+            surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
+        };
+
+        // 1. METAR.
+        if let (Some(icao_code), Some(date)) = (&icao, target_date) {
+            match surebet::weather::metar::fetch_metar_reports(http, icao_code, 36).await {
+                Ok(reports) => {
+                    let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+                    if let Some(agg) =
+                        surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)
+                    {
+                        result = Some(ObservationsBlock {
+                            max_so_far: c_to_market_unit(agg.max_c),
+                            min_so_far: c_to_market_unit(agg.min_c),
+                            current: c_to_market_unit(agg.current_c),
+                            last_observation_at: agg.latest_obs_utc.to_rfc3339(),
+                            timezone: format!("UTC{:+}", tz / 3600),
+                            source: format!("METAR ({} reports)", agg.report_count),
+                            station: Some(agg.icao),
+                            resolution_url: Some(resolution_url.to_string()),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(icao = %icao_code, error = %e, "METAR fetch failed");
+                }
+            }
+        }
+
+        // 2. Wunderground HTML fallback.
+        if result.is_none() {
+            if let Some(icao_code) = &icao {
+                if let Ok(wu) =
+                    surebet::weather::wunderground::fetch_wunderground(http, icao_code).await
+                {
+                    let f_to_unit = |f: f64| match unit {
+                        surebet::weather::TemperatureUnit::Celsius => (f - 32.0) * 5.0 / 9.0,
+                        surebet::weather::TemperatureUnit::Fahrenheit => f,
+                    };
+                    result = Some(ObservationsBlock {
+                        max_so_far: f_to_unit(wu.max_since_7am_f),
+                        min_so_far: f_to_unit(wu.min_24h_f),
+                        current: f_to_unit(wu.current_f),
+                        last_observation_at: wu.observation_time_utc.to_rfc3339(),
+                        timezone: String::new(),
+                        source: "Wunderground (fallback)".to_string(),
+                        station: Some(wu.icao),
+                        resolution_url: Some(resolution_url.to_string()),
+                    });
+                }
+            }
+        }
+
+        // 3. Open-Meteo last-resort (past-hours only, never forecast hours).
+        if result.is_none() {
+            if let (Some(lat), Some(lon), Some(date)) = (lat, lon, target_date) {
+                if let Ok(om) = fetch_observations(http, lat, lon, date, unit).await {
+                    result = Some(ObservationsBlock {
+                        max_so_far: om.max_so_far,
+                        min_so_far: om.min_so_far,
+                        current: om.current,
+                        last_observation_at: om.last_observation_at.to_rfc3339(),
+                        timezone: om.timezone,
+                        source: om.source.to_string(),
+                        station: icao.clone(),
+                        resolution_url: if resolution_url.is_empty() {
+                            None
+                        } else {
+                            Some(resolution_url.to_string())
+                        },
+                    });
+                }
+            }
+        }
+        result
+    };
+
+    let mut brackets: Vec<ObsBracketJson> = Vec::new();
+    let mut dead_count = 0;
+    let mut total_dead_opportunity = 0.0_f64;
+
+    if let Some(child_markets) = event.get("markets").and_then(|v| v.as_array()) {
+        for m in child_markets {
+            let label = m
+                .get("groupItemTitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if label.is_empty() {
+                continue;
+            }
+            let Some((lower, upper)) = parse_bracket_label(&label) else {
+                continue;
+            };
+
+            let token_ids: Vec<String> = m
+                .get("clobTokenIds")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
+            if token_ids.len() < 2 {
+                continue;
+            }
+            let token_id_yes = token_ids[0].clone();
+            let token_id_no = token_ids[1].clone();
+
+            let yes_ask = m.get("bestAsk").and_then(|v| v.as_f64()).filter(|p| *p > 0.0);
+            let yes_bid = m.get("bestBid").and_then(|v| v.as_f64()).filter(|p| *p > 0.0);
+            let no_ask_estimate = yes_bid.map(|b| 1.0 - b);
+
+            let status = if let Some(o) = obs.as_ref() {
+                classify_bracket(measure, lower, upper, o.max_so_far, o.min_so_far)
+            } else {
+                "LIVE"
+            }
+            .to_string();
+
+            let mut profit_per_share = None;
+            if status == "DEAD" {
+                dead_count += 1;
+                if let Some(b) = yes_bid {
+                    profit_per_share = Some(b);
+                    total_dead_opportunity += b;
+                }
+            }
+
+            brackets.push(ObsBracketJson {
+                label,
+                token_id_yes,
+                token_id_no,
+                lower,
+                upper,
+                yes_ask,
+                yes_bid,
+                no_ask_estimate,
+                status,
+                profit_per_share,
+            });
+        }
+    }
+
+    if brackets.is_empty() {
+        return None;
+    }
+
+    let condition_id = event
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| event.get("id").map(|v| v.to_string()))
+        .unwrap_or_default();
+
+    Some(ObservationEventJson {
+        condition_id,
+        question: title.to_string(),
+        location: city,
+        date: target_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        measure: match measure {
+            TemperatureMeasure::High => "High".to_string(),
+            TemperatureMeasure::Low => "Low".to_string(),
+        },
+        unit: match unit {
+            surebet::weather::TemperatureUnit::Celsius => "°C".to_string(),
+            surebet::weather::TemperatureUnit::Fahrenheit => "°F".to_string(),
+        },
+        end_date: end_date_utc.map(|d| d.to_rfc3339()),
+        observed: obs,
+        brackets,
+        dead_count,
+        total_dead_opportunity,
+    })
+}
+
+/// Classify a bracket given the day's running max/min so far.
+///
+/// Floor-rounded brackets [lower, upper) — for HIGH markets max can only go up,
+/// for LOW markets min can only go down.
+fn classify_bracket(
+    measure: TemperatureMeasure,
+    lower: Option<f64>,
+    upper: Option<f64>,
+    max_so_far: f64,
+    min_so_far: f64,
+) -> &'static str {
+    match measure {
+        TemperatureMeasure::High => {
+            if let Some(u) = upper {
+                if max_so_far >= u {
+                    return "DEAD";
+                }
+            } else if let Some(l) = lower {
+                // "X or above" — locked once max ≥ X
+                if max_so_far >= l {
+                    return "LOCKED_WIN";
+                }
+            }
+            "LIVE"
+        }
+        TemperatureMeasure::Low => {
+            if let Some(l) = lower {
+                if min_so_far < l {
+                    return "DEAD";
+                }
+            } else if let Some(u) = upper {
+                // "X or below" — locked once min < X+1
+                if min_so_far < u {
+                    return "LOCKED_WIN";
+                }
+            }
+            "LIVE"
+        }
+    }
+}
+
+async fn observations_html() -> Html<String> {
+    Html(r##"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Weather observations · dead-bracket scanner</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 1em; background: #0d1117; color: #c9d1d9; }
+    h1 { margin: 0 0 0.5em; }
+    .meta { color: #8b949e; font-size: 0.9em; margin-bottom: 1em; }
+    nav a { color: #58a6ff; margin-right: 1em; text-decoration: none; }
+    .event { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75em 1em; margin-bottom: 1em; }
+    .event-title { font-weight: 600; font-size: 1.05em; }
+    .event-sub { color: #8b949e; font-size: 0.85em; margin: 0.3em 0 0.6em; }
+    .obs { color: #c9d1d9; font-size: 0.9em; padding: 0.4em 0.6em; background: #0d1117; border-radius: 4px; margin-bottom: 0.5em; display: inline-block; }
+    .obs strong { color: #58a6ff; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.85em; }
+    th, td { padding: 0.3em 0.5em; text-align: right; border-bottom: 1px solid #21262d; }
+    th { color: #8b949e; font-weight: normal; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    .badge { display: inline-block; padding: 0.05em 0.4em; border-radius: 3px; font-size: 0.8em; font-weight: 600; }
+    .badge-dead { background: #6e1818; color: #ffa198; }
+    .badge-locked { background: #1a4d2e; color: #7ee2a8; }
+    .badge-live { background: #1f2933; color: #8b949e; }
+    .opportunity { color: #7ee2a8; font-weight: 600; }
+    .no-obs { color: #8b949e; font-style: italic; }
+    .dead-count { color: #ffa198; }
+  </style>
+</head>
+<body>
+  <nav><a href="/">Markets</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
+  <h1>Weather observations · dead bracket scanner</h1>
+  <div class="meta" id="meta">Loading…</div>
+  <div id="events"></div>
+<script>
+async function load() {
+  const r = await fetch('/api/observations');
+  const d = await r.json();
+  const meta = document.getElementById('meta');
+  const events = document.getElementById('events');
+  if (d.error) { meta.innerHTML = `<span style="color:#ffa198">Error: ${d.error}</span>`; return; }
+
+  const totalDead = d.events.reduce((s,e) => s + e.dead_count, 0);
+  const totalOpp = d.events.reduce((s,e) => s + e.total_dead_opportunity, 0);
+  meta.innerHTML = `Fetched at ${d.fetched_at} · ${d.events.length} events · <span class="dead-count">${totalDead} dead brackets</span> · total YES-bid opportunity $${totalOpp.toFixed(2)}/share-set`;
+
+  events.innerHTML = d.events.map(e => {
+    const obsHtml = e.observed
+      ? (() => {
+          const o = e.observed;
+          const stationLink = o.resolution_url
+            ? `<a href="${o.resolution_url}" target="_blank" style="color:#58a6ff">${o.station || o.source}</a>`
+            : (o.station || o.source);
+          const tzBit = o.timezone ? ` · tz=${o.timezone}` : '';
+          const ageMin = Math.round((Date.now() - new Date(o.last_observation_at).getTime()) / 60000);
+          return `<div class="obs">
+            <strong>Max so far: ${o.max_so_far.toFixed(1)}${e.unit}</strong> ·
+            Min: ${o.min_so_far.toFixed(1)}${e.unit} ·
+            Current: ${o.current.toFixed(1)}${e.unit} ·
+            <span style="color:#8b949e">${o.source} ${stationLink}${tzBit} · ${ageMin}m ago</span>
+          </div>`;
+        })()
+      : (() => {
+          // Distinguish future-date markets from missing-data markets.
+          const today = new Date().toISOString().slice(0,10);
+          if (e.date && e.date > today) {
+            return `<div class="obs no-obs">Target date is in the future — see <a href="/weather" style="color:#58a6ff">Weather tab</a> for forecast</div>`;
+          }
+          return `<div class="obs no-obs">No observations available (no station mapping)</div>`;
+        })();
+
+    const rows = e.brackets.map(b => {
+      const cls = b.status === 'DEAD' ? 'badge-dead'
+                : b.status === 'LOCKED_WIN' ? 'badge-locked'
+                : 'badge-live';
+      const yesAsk = b.yes_ask != null ? '$' + b.yes_ask.toFixed(4) : '—';
+      const yesBid = b.yes_bid != null ? '$' + b.yes_bid.toFixed(4) : '—';
+      const noAsk  = b.no_ask_estimate != null ? '$' + b.no_ask_estimate.toFixed(4) : '—';
+      const profit = b.profit_per_share != null
+        ? `<span class="opportunity">+$${b.profit_per_share.toFixed(4)}</span>`
+        : '—';
+      return `<tr>
+        <td>${b.label}</td>
+        <td><span class="badge ${cls}">${b.status}</span></td>
+        <td>${yesAsk}</td>
+        <td>${yesBid}</td>
+        <td>${noAsk}</td>
+        <td>${profit}</td>
+      </tr>`;
+    }).join('');
+
+    const oppStr = e.total_dead_opportunity > 0
+      ? ` · <span class="opportunity">$${e.total_dead_opportunity.toFixed(4)}/set arb</span>`
+      : '';
+
+    return `<div class="event">
+      <div class="event-title">${e.question}</div>
+      <div class="event-sub">${e.location} · ${e.measure} · resolves ${e.date} <span class="dead-count">${e.dead_count} dead</span>${oppStr}</div>
+      ${obsHtml}
+      <table>
+        <thead><tr><th>Bracket</th><th>Status</th><th>YES ask</th><th>YES bid</th><th>NO ask (est)</th><th>Buy-NO profit/share</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+}
+load();
+</script>
+</body>
+</html>"##.to_string())
+}
+
+// ─── Paper trades (multi-outcome weather combos) ─────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PaperTradeLeg {
+    bracket_label: String,
+    token_id: String,
+    ask_at_buy: f64,
+    shares: f64,
+    /// Model-assigned probability of this bracket winning at the time of purchase.
+    #[serde(default)]
+    model_prob_at_buy: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PaperTrade {
+    id: String,
+    created_at: String,
+    market_slug: String,
+    market_question: String,
+    unit: String,
+    target_date: Option<String>,
+    regime: String,
+    legs: Vec<PaperTradeLeg>,
+    total_cost: f64,
+    /// Model-assigned sum of leg probabilities ≈ P(any leg wins) at entry.
+    #[serde(default)]
+    model_win_prob_at_buy: Option<f64>,
+    /// "paper" (default, no on-chain activity) or "live" (real CLOB orders placed).
+    #[serde(default = "default_paper_mode")]
+    mode: String,
+    /// For live trades: the CLOB order IDs returned when each leg was placed.
+    /// Aligned positionally with `legs` — `order_ids[i]` is the order for `legs[i]`.
+    #[serde(default)]
+    order_ids: Vec<Option<String>>,
+    /// For live trades: per-leg fill error messages (if any placement failed).
+    #[serde(default)]
+    leg_errors: Vec<Option<String>>,
+    /// "open" | "closed_manual" | "resolved".
+    /// - open: still waiting on resolution or exit
+    /// - closed_manual: user hit the Close button, capturing a snapshot of exit state
+    /// - resolved: market resolved, one leg won, realized P&L recorded
+    status: String,
+    /// Populated when `status == "closed_manual"` or `"resolved"`. Sum of exit
+    /// revenue across all legs at close time.
+    #[serde(default)]
+    close_sell_revenue: Option<f64>,
+    /// Realized P&L at close/resolve: close_sell_revenue − total_cost.
+    #[serde(default)]
+    realized_pnl: Option<f64>,
+    /// Timestamp of close/resolve (RFC3339).
+    #[serde(default)]
+    closed_at: Option<String>,
+    /// For resolved trades: the bracket label that won (if any leg won).
+    #[serde(default)]
+    winning_bracket: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PaperTradeRequest {
+    market_slug: String,
+    market_question: String,
+    unit: String,
+    target_date: Option<String>,
+    regime: String,
+    legs: Vec<PaperTradeLeg>,
+    model_win_prob_at_buy: Option<f64>,
+    /// "paper" (default) or "live". Live mode places real buy orders through
+    /// the CLOB SDK; paper mode only records the intended trade.
+    #[serde(default = "default_paper_mode")]
+    mode: String,
+}
+
+const PAPER_TRADES_FILE: &str = "paper_trades.jsonl";
+
+fn default_paper_mode() -> String {
+    "paper".to_string()
+}
+
+async fn api_save_paper_trade(
+    State(state): State<AppState>,
+    Json(req): Json<PaperTradeRequest>,
+) -> impl IntoResponse {
+    if req.legs.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "no legs in trade"})),
+        )
+            .into_response();
+    }
+
+    let is_live = req.mode == "live";
+
+    // Live-mode gate: the server must be running with --live, and we need
+    // the SDK-backed order client + a USDC balance covering the total.
+    if is_live {
+        if !state.live_mode {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "server not in live mode — restart with --live to place real orders"
+                })),
+            )
+                .into_response();
+        }
+        let Some(order_client) = state.order_client.as_ref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "order_client not initialized"})),
+            )
+                .into_response();
+        };
+        // Balance check before committing
+        if let Some(api) = state.api.as_ref() {
+            let needed: Decimal = req
+                .legs
+                .iter()
+                .map(|l| {
+                    Decimal::from_f64_retain(l.ask_at_buy * l.shares).unwrap_or(Decimal::ZERO)
+                })
+                .sum();
+            let balance = api.get_balance_usdc().await;
+            if needed > balance {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Insufficient USDC: need ${needed:.4}, have ${balance:.4}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
+        // Place buy orders for each leg. Errors are captured per leg; a partial
+        // fill still saves the trade (the user can handle cleanup manually).
+        let mut order_ids: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
+        let mut leg_errors: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
+        for leg in &req.legs {
+            let price = Decimal::from_f64_retain(leg.ask_at_buy).unwrap_or(Decimal::ZERO);
+            let size = Decimal::from_f64_retain(leg.shares).unwrap_or(Decimal::ZERO);
+            match order_client
+                .place_limit(&leg.token_id, price, size, OrderSide::Buy)
+                .await
+            {
+                Ok(r) if r.success => {
+                    order_ids.push(Some(r.order_id));
+                    leg_errors.push(None);
+                }
+                Ok(r) => {
+                    order_ids.push(None);
+                    leg_errors.push(Some(r.error_msg));
+                }
+                Err(e) => {
+                    order_ids.push(None);
+                    leg_errors.push(Some(format!("{e}")));
+                }
+            }
+        }
+
+        // If NOTHING placed successfully, treat as an error; otherwise save with
+        // whatever got through and the user can decide what to do.
+        if order_ids.iter().all(|o| o.is_none()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "all legs failed",
+                    "leg_errors": leg_errors,
+                })),
+            )
+                .into_response();
+        }
+
+        let total_cost: f64 = req.legs.iter().map(|l| l.ask_at_buy * l.shares).sum();
+        let trade = PaperTrade {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            market_slug: req.market_slug,
+            market_question: req.market_question,
+            unit: req.unit,
+            target_date: req.target_date,
+            regime: req.regime,
+            legs: req.legs,
+            total_cost,
+            model_win_prob_at_buy: req.model_win_prob_at_buy,
+            mode: "live".to_string(),
+            order_ids: order_ids.clone(),
+            leg_errors: leg_errors.clone(),
+            status: "open".to_string(),
+            close_sell_revenue: None,
+            realized_pnl: None,
+            closed_at: None,
+            winning_bracket: None,
+        };
+        if let Err(e) = persist_trade(&trade).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
+        return Json(serde_json::json!({
+            "saved": true,
+            "id": trade.id,
+            "mode": "live",
+            "total_cost": trade.total_cost,
+            "order_ids": order_ids,
+            "leg_errors": leg_errors,
+        }))
+        .into_response();
+    }
+
+    // Paper mode: just record the intended trade, no on-chain activity.
+    let total_cost: f64 = req.legs.iter().map(|l| l.ask_at_buy * l.shares).sum();
+    let trade = PaperTrade {
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        market_slug: req.market_slug,
+        market_question: req.market_question,
+        unit: req.unit,
+        target_date: req.target_date,
+        regime: req.regime,
+        legs: req.legs,
+        total_cost,
+        model_win_prob_at_buy: req.model_win_prob_at_buy,
+        mode: "paper".to_string(),
+        order_ids: Vec::new(),
+        leg_errors: Vec::new(),
+        status: "open".to_string(),
+        close_sell_revenue: None,
+        realized_pnl: None,
+        closed_at: None,
+        winning_bracket: None,
+    };
+
+    if let Err(e) = persist_trade(&trade).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "saved": true,
+        "id": trade.id,
+        "mode": "paper",
+        "total_cost": trade.total_cost,
+    }))
+    .into_response()
+}
+
+/// Fetch the best (highest) bid for a CLOB YES token.
+///
+/// Polymarket's CLOB `/book` endpoint returns bids sorted ASCENDING (lowest
+/// first) and asks sorted DESCENDING (highest first) — both moving away from
+/// the mid. So `bids.first()` is the WORST bid, not the best. Take the max
+/// across all levels to get the real best bid.
+async fn fetch_best_bid(
+    http: &reqwest::Client,
+    clob_url: &str,
+    token_id: &str,
+) -> Option<f64> {
+    #[derive(Deserialize)]
+    struct BookResp {
+        bids: Option<Vec<PriceLevel>>,
+    }
+    #[derive(Deserialize)]
+    struct PriceLevel {
+        price: String,
+    }
+    let url = format!("{clob_url}/book?token_id={token_id}");
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let book: BookResp = resp.json().await.ok()?;
+    book.bids.and_then(|bs| {
+        bs.iter()
+            .filter_map(|p| p.price.parse::<f64>().ok())
+            .reduce(f64::max)
+    })
+}
+
+/// Append a trade to the JSONL log. Shared by both paper and live save paths.
+async fn persist_trade(trade: &PaperTrade) -> Result<(), String> {
+    let line = serde_json::to_string(trade)
+        .map_err(|e| format!("serialize failed: {e}"))?;
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PAPER_TRADES_FILE)
+        .await
+        .map_err(|e| format!("open failed: {e}"))?;
+    use tokio::io::AsyncWriteExt;
+    f.write_all(format!("{line}\n").as_bytes())
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct CloseTradeRequest {
+    id: String,
+}
+
+/// POST /api/paper-trade/close
+/// Mark a paper trade as closed, snapshot current exit revenue, and rewrite
+/// the JSONL. Load-modify-rewrite is fine for a local file with small trade
+/// counts; if this ever grows we'd move to a real store.
+async fn api_close_paper_trade(
+    State(state): State<AppState>,
+    Json(req): Json<CloseTradeRequest>,
+) -> impl IntoResponse {
+    let contents = match tokio::fs::read_to_string(PAPER_TRADES_FILE).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("no paper trades file: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let mut trades: Vec<PaperTrade> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<PaperTrade>(l).ok())
+        .collect();
+
+    let idx = match trades.iter().position(|t| t.id == req.id) {
+        Some(i) => i,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "trade not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    if trades[idx].status != "open" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("trade already {}", trades[idx].status)})),
+        )
+            .into_response();
+    }
+
+    // Snapshot current exit revenue by refetching each leg's best bid.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+    let trade = trades[idx].clone();
+    let mut exit_revenue = 0.0_f64;
+    for leg in &trade.legs {
+        if let Some(b) = fetch_best_bid(&http, &state.clob_url, &leg.token_id).await {
+            exit_revenue += b * leg.shares;
+        }
+    }
+
+    let realized = exit_revenue - trade.total_cost;
+    trades[idx].status = "closed_manual".to_string();
+    trades[idx].close_sell_revenue = Some(exit_revenue);
+    trades[idx].realized_pnl = Some(realized);
+    trades[idx].closed_at = Some(chrono::Utc::now().to_rfc3339());
+
+    // Rewrite the file atomically via temp-file + rename.
+    let tmp_path = format!("{}.tmp", PAPER_TRADES_FILE);
+    let mut out = String::new();
+    for t in &trades {
+        match serde_json::to_string(t) {
+            Ok(s) => {
+                out.push_str(&s);
+                out.push('\n');
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("serialize failed: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(&tmp_path, out).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("write failed: {e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, PAPER_TRADES_FILE).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("rename failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "closed": true,
+        "id": req.id,
+        "exit_revenue": exit_revenue,
+        "realized_pnl": realized,
+    }))
+    .into_response()
+}
+
+#[derive(Serialize)]
+struct PaperTradeWithPnl {
+    #[serde(flatten)]
+    trade: PaperTrade,
+    /// Current bid on each leg's YES (what we could sell it for right now).
+    current_bids: Vec<Option<f64>>,
+    /// Sum of (current_bid × shares) across legs — hypothetical sell-all revenue.
+    current_sell_revenue: f64,
+    /// `current_sell_revenue - total_cost`.
+    unrealized_pnl: f64,
+    /// Best-case payout at resolution: max shares across legs (only one can win).
+    max_payout_at_resolution: f64,
+    /// Profit at best case: max_payout - total_cost.
+    profit_if_any_leg_wins: f64,
+    /// Loss at worst case: -total_cost.
+    loss_if_all_legs_lose: f64,
+    /// Live lifecycle signal:
+    /// - "exit_opportunity": `current_sell_revenue > total_cost` — you can sell now for locked profit
+    /// - "open":             still waiting on resolution, sell-now would lose
+    live_status: String,
+}
+
+async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
+    let mut trades: Vec<PaperTrade> = match tokio::fs::read_to_string(PAPER_TRADES_FILE).await {
+        Ok(s) => s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<PaperTrade>(l).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+
+    // Cache Gamma event lookups by slug so we don't fetch the same event
+    // repeatedly when multiple trades reference it.
+    let mut event_cache: std::collections::HashMap<String, Option<serde_json::Value>> =
+        std::collections::HashMap::new();
+    let mut dirty = false;
+
+    // Resolution detection: for each open trade, fetch the event and see if
+    // one of its child markets has resolved (outcomePrices == ["1","0"] →
+    // that market's YES won). If so, flip our trade to "resolved" and compute
+    // realized_pnl. Persist the state change back to disk so we don't repeat work.
+    for t in &mut trades {
+        if t.status != "open" {
+            continue;
+        }
+        let event_opt = if let Some(cached) = event_cache.get(&t.market_slug) {
+            cached.clone()
+        } else {
+            let url = format!("{}/events/slug/{}", state.gamma_url, t.market_slug);
+            let fetched: Option<serde_json::Value> = match http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
+                _ => None,
+            };
+            event_cache.insert(t.market_slug.clone(), fetched.clone());
+            fetched
+        };
+        let Some(event) = event_opt else { continue };
+
+        // Find the winning bracket by scanning child markets for
+        // outcomePrices == ["1","0"] (YES pays $1).
+        let winner_label: Option<String> = event
+            .get("markets")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|m| {
+                    let prices = m
+                        .get("outcomePrices")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())?;
+                    let yes_price: f64 = prices.first()?.parse().ok()?;
+                    if yes_price >= 0.99 {
+                        m.get("groupItemTitle")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        if let Some(winner) = winner_label {
+            // Resolution detected. Realized = $1 × shares if we held that leg, else 0.
+            let winning_leg_payout: f64 = t
+                .legs
+                .iter()
+                .find(|l| l.bracket_label == winner)
+                .map(|l| l.shares)
+                .unwrap_or(0.0);
+            let realized = winning_leg_payout - t.total_cost;
+            t.status = "resolved".to_string();
+            t.close_sell_revenue = Some(winning_leg_payout);
+            t.realized_pnl = Some(realized);
+            t.closed_at = Some(chrono::Utc::now().to_rfc3339());
+            t.winning_bracket = Some(winner);
+            dirty = true;
+        }
+    }
+
+    // Persist any resolutions we just detected.
+    if dirty {
+        let tmp_path = format!("{}.tmp", PAPER_TRADES_FILE);
+        let mut out = String::new();
+        for t in &trades {
+            if let Ok(s) = serde_json::to_string(t) {
+                out.push_str(&s);
+                out.push('\n');
+            }
+        }
+        if tokio::fs::write(&tmp_path, out).await.is_ok() {
+            let _ = tokio::fs::rename(&tmp_path, PAPER_TRADES_FILE).await;
+        }
+    }
+
+    let mut enriched: Vec<PaperTradeWithPnl> = Vec::new();
+    for t in trades {
+        let mut current_bids: Vec<Option<f64>> = Vec::new();
+        let mut current_sell_revenue = 0.0_f64;
+        // Only fetch live bids for open trades — closed/resolved don't need them.
+        if t.status == "open" {
+            for leg in &t.legs {
+                let bid = fetch_best_bid(&http, &state.clob_url, &leg.token_id).await;
+                if let Some(b) = bid {
+                    current_sell_revenue += b * leg.shares;
+                }
+                current_bids.push(bid);
+            }
+        } else {
+            current_bids = t.legs.iter().map(|_| None).collect();
+        }
+        let unrealized_pnl = current_sell_revenue - t.total_cost;
+        let max_payout_at_resolution = t
+            .legs
+            .iter()
+            .map(|l| l.shares)
+            .fold(0.0_f64, f64::max);
+        let profit_if_any_leg_wins = max_payout_at_resolution - t.total_cost;
+        let loss_if_all_legs_lose = -t.total_cost;
+        let live_status = match t.status.as_str() {
+            "open" if unrealized_pnl > 0.0 => "exit_opportunity".to_string(),
+            other => other.to_string(),
+        };
+        enriched.push(PaperTradeWithPnl {
+            trade: t,
+            current_bids,
+            current_sell_revenue,
+            unrealized_pnl,
+            max_payout_at_resolution,
+            profit_if_any_leg_wins,
+            loss_if_all_legs_lose,
+            live_status,
+        });
+    }
+
+    // Newest first
+    enriched.sort_by(|a, b| b.trade.created_at.cmp(&a.trade.created_at));
+    Json(serde_json::json!({ "trades": enriched }))
+}
+
+async fn paper_trades_html() -> Html<String> {
+    Html(r##"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Paper trades</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 1em; background: #0d1117; color: #c9d1d9; }
+    h1 { margin: 0 0 0.5em; }
+    nav a { color: #58a6ff; margin-right: 1em; text-decoration: none; }
+    .meta { color: #8b949e; font-size: 0.9em; margin: 0.5em 0 1em; }
+    .trade { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75em 1em; margin-bottom: 1em; }
+    .trade-title { font-weight: 600; font-size: 1.02em; }
+    .trade-sub { color: #8b949e; font-size: 0.85em; margin: 0.3em 0; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.9em; margin-top: 0.5em; }
+    th, td { padding: 0.3em 0.5em; text-align: right; border-bottom: 1px solid #21262d; }
+    th { color: #8b949e; font-weight: normal; }
+    th:first-child, td:first-child { text-align: left; }
+    .pnl-pos { color: #7ee2a8; }
+    .pnl-neg { color: #ffa198; }
+    .regime-badge { background: #1f2933; color: #8b949e; padding: 0.1em 0.4em; border-radius: 3px; font-size: 0.75em; }
+  </style>
+</head>
+<body>
+  <nav><a href="/">Markets</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
+  <h1>Paper Trades</h1>
+  <div class="meta" id="meta">Loading…</div>
+  <div id="last-updated" style="color:#8b949e; font-size:0.85em; margin-bottom:0.75em"></div>
+  <div id="trades"></div>
+<script>
+let lastFetch = null;
+
+async function load() {
+  const r = await fetch('/api/paper-trades');
+  const d = await r.json();
+  lastFetch = Date.now();
+  const meta = document.getElementById('meta');
+  const el = document.getElementById('trades');
+  const trades = d.trades || [];
+  const totalCost = trades.reduce((s,t) => s + t.total_cost, 0);
+  const totalPnl = trades.reduce((s,t) => s + t.unrealized_pnl, 0);
+  const exitOpps = trades.filter(t => t.live_status === 'exit_opportunity').length;
+  const pnlClass = totalPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+  const sign = totalPnl >= 0 ? '+' : '';
+
+  let exitBadge = '';
+  if (exitOpps > 0) {
+    exitBadge = ` · <span style="background:#238636;color:white;padding:0.1em 0.5em;border-radius:3px;font-weight:600">${exitOpps} EXIT OPPORTUNITY${exitOpps>1?'s':''}</span>`;
+  }
+
+  meta.innerHTML = trades.length === 0
+    ? 'No paper trades yet. Select brackets on the <a href="/weather" style="color:#58a6ff">Weather tab</a> to create one.'
+    : `${trades.length} trade${trades.length>1?'s':''} · total cost $${totalCost.toFixed(2)} · <span class="${pnlClass}">sell-now P&amp;L ${sign}$${totalPnl.toFixed(2)}</span>${exitBadge}`;
+
+  el.innerHTML = trades.map(t => {
+    const pnlClass = t.unrealized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const sign = t.unrealized_pnl >= 0 ? '+' : '';
+    const exitBanner = t.live_status === 'exit_opportunity'
+      ? `<div style="background:#238636;color:white;padding:0.4em 0.8em;border-radius:4px;margin-bottom:0.5em;font-weight:600">
+          ⚡ EXIT NOW — locked profit if you sell at current bids: +$${t.unrealized_pnl.toFixed(2)}
+         </div>`
+      : '';
+
+    const legsHtml = t.legs.map((leg, i) => {
+      const bid = t.current_bids[i];
+      const bidStr = bid == null ? '—' : `$${bid.toFixed(3)}`;
+      const leg_revenue = bid == null ? 0 : bid * leg.shares;
+      const leg_cost = leg.ask_at_buy * leg.shares;
+      const legPnl = leg_revenue - leg_cost;
+      const legSign = legPnl >= 0 ? '+' : '';
+      const legCls = legPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const probStr = leg.model_prob_at_buy != null ? `${(leg.model_prob_at_buy*100).toFixed(1)}%` : '—';
+      return `<tr>
+        <td>${leg.bracket_label}</td>
+        <td>${leg.shares}</td>
+        <td>$${leg.ask_at_buy.toFixed(3)}</td>
+        <td>${probStr}</td>
+        <td>$${leg_cost.toFixed(2)}</td>
+        <td>${bidStr}</td>
+        <td class="${legCls}">${legSign}$${legPnl.toFixed(2)}</td>
+      </tr>`;
+    }).join('');
+    const modelProb = t.model_win_prob_at_buy != null ? `${(t.model_win_prob_at_buy*100).toFixed(1)}%` : '—';
+    const created = new Date(t.created_at).toLocaleString();
+    const profitIfWin = t.profit_if_any_leg_wins;
+    const lossIfLose = t.loss_if_all_legs_lose;
+    const cardBorder = t.live_status === 'exit_opportunity'
+      ? 'border:2px solid #2ea043'
+      : 'border:1px solid #30363d';
+
+    // Lifecycle state and buttons.
+    const isOpen = t.status === 'open';
+    const statusBadge = t.status === 'open' ? ''
+      : t.status === 'closed_manual'
+        ? `<span style="background:#30363d;color:#c9d1d9;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">CLOSED MANUALLY</span>`
+        : t.status === 'resolved'
+          ? `<span style="background:#1a4d2e;color:#7ee2a8;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">RESOLVED</span>`
+          : `<span style="background:#30363d;color:#c9d1d9;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">${t.status.toUpperCase()}</span>`;
+
+    // When closed, show realized P&L + close timestamp instead of live sell-now.
+    let closedBlock = '';
+    if (!isOpen) {
+      const rp = t.realized_pnl;
+      const rpCls = rp != null && rp >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const rpSign = rp != null && rp >= 0 ? '+' : '';
+      const rpStr = rp != null ? `${rpSign}$${rp.toFixed(2)}` : '—';
+      const csr = t.close_sell_revenue != null ? `$${t.close_sell_revenue.toFixed(2)}` : '—';
+      const winnerStr = t.winning_bracket ? ` · winner <b>${t.winning_bracket}</b>` : '';
+      const closedAt = t.closed_at ? new Date(t.closed_at).toLocaleString() : '—';
+      closedBlock = `<div style="background:#0d2818;color:#c9d1d9;padding:0.4em 0.8em;border-radius:4px;margin-bottom:0.5em;font-size:0.9em">
+        Closed at ${closedAt}${winnerStr} · exit revenue ${csr} · realized P&amp;L <b class="${rpCls}">${rpStr}</b>
+      </div>`;
+    }
+
+    const closeBtn = isOpen
+      ? `<button onclick="closeTrade('${t.id}')" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">Close (snapshot at current bids)</button>`
+      : '';
+
+    const modeTag = (t.mode === 'live')
+      ? `<span style="background:#da3633;color:white;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em;font-weight:600">LIVE</span>`
+      : `<span style="background:#1f2933;color:#8b949e;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">PAPER</span>`;
+    return `<div class="trade" style="${cardBorder}${!isOpen ? ';opacity:0.75' : ''}">
+      <div class="trade-title" style="display:flex;align-items:center;gap:0.5em">
+        <span>${t.market_question}</span>
+        ${modeTag}
+        <span class="regime-badge">${t.regime}</span>
+        ${statusBadge}
+        ${closeBtn}
+      </div>
+      <div class="trade-sub">Entered ${created} · Model P(win at entry) ${modelProb}</div>
+      ${closedBlock}
+      ${isOpen ? exitBanner : ''}
+      <div style="display:flex;gap:2em;font-size:0.9em;margin:0.5em 0;flex-wrap:wrap">
+        <div>Cost: <b>$${t.total_cost.toFixed(2)}</b></div>
+        <div>Max payout (any leg wins): <b>$${t.max_payout_at_resolution.toFixed(2)}</b></div>
+        <div>Profit if any wins: <b class="pnl-pos">+$${profitIfWin.toFixed(2)}</b></div>
+        <div>Loss if all lose: <b class="pnl-neg">$${lossIfLose.toFixed(2)}</b></div>
+        ${isOpen ? `<div>Sell-now revenue: <b>$${t.current_sell_revenue.toFixed(2)}</b></div>
+        <div>Sell-now P&amp;L: <b class="${pnlClass}">${sign}$${t.unrealized_pnl.toFixed(2)}</b></div>` : ''}
+      </div>
+      <table>
+        <tr><th>Bracket</th><th>Shares</th><th>Ask at buy</th><th>Model P</th><th>Leg cost</th><th>Current bid</th><th>Leg sell-now P&amp;L</th></tr>
+        ${legsHtml}
+      </table>
+    </div>`;
+  }).join('');
+
+  tickAge();
+}
+
+function tickAge() {
+  if (!lastFetch) return;
+  const s = Math.round((Date.now() - lastFetch) / 1000);
+  document.getElementById('last-updated').textContent = `updated ${s}s ago · auto-refresh every 15s`;
+}
+
+async function closeTrade(id) {
+  if (!confirm('Close this trade at current bids? This snapshots the exit P&L and marks it closed (cannot be undone).')) return;
+  try {
+    const r = await fetch('/api/paper-trade/close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id}),
+    });
+    const j = await r.json();
+    if (j.closed) {
+      await load();
+    } else {
+      alert(`Close failed: ${j.error || 'unknown'}`);
+    }
+  } catch (e) {
+    alert(`Close failed: ${e}`);
+  }
+}
+
+load();
+setInterval(load, 15000);
+setInterval(tickAge, 1000);
+</script>
+</body>
+</html>"##.to_string())
+}
+
 // ─── HTML Dashboard ──────────────────────────────────────────────────────────
 
 // ─── Trades + Positions page ────────────────────────────────────────────────
@@ -2631,6 +5276,9 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
 <div class="nav">
   <a href="/">Markets</a>
   <a href="/trades" class="active">Trades</a>
+  <a href="/weather">Weather</a>
+  <a href="/observations">Observations</a>
+  <a href="/paper-trades">Paper Trades</a>
 </div>
 
 {geoblock_banner}
@@ -2915,6 +5563,9 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 <div class="nav">
   <a href="/" class="active">Markets</a>
   <a href="/trades">Trades</a>
+  <a href="/weather">Weather</a>
+  <a href="/observations">Observations</a>
+  <a href="/paper-trades">Paper Trades</a>
 </div>
 <div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Scan: <b style="color:{scan_color}">{scan_label}</b></div>
 

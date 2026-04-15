@@ -196,6 +196,235 @@ async fn fetch_nws_forecast(
 }
 
 // ---------------------------------------------------------------------------
+// Observations (running max/min so far today)
+// ---------------------------------------------------------------------------
+
+/// Observed conditions for the resolution day so far.
+///
+/// For "Highest temperature" markets, `max_so_far` is the running max — daily
+/// max can only stay or increase, so any bracket with `upper ≤ max_so_far`
+/// is mathematically dead.
+#[derive(Debug, Clone)]
+pub struct ObservedConditions {
+    /// Highest temperature observed so far on the target date (in market's unit).
+    pub max_so_far: f64,
+    /// Lowest temperature observed so far on the target date.
+    pub min_so_far: f64,
+    /// Most recent observed temperature.
+    pub current: f64,
+    /// Timestamp of the most recent observation (UTC).
+    pub last_observation_at: chrono::DateTime<chrono::Utc>,
+    /// IANA timezone of the station (used to interpret "today" correctly).
+    pub timezone: String,
+    pub source: ForecastSource,
+}
+
+#[derive(Deserialize)]
+struct OpenMeteoObservationsResp {
+    timezone: String,
+    utc_offset_seconds: i64,
+    hourly: OpenMeteoHourly,
+}
+
+#[derive(Deserialize)]
+struct OpenMeteoHourly {
+    time: Vec<String>,
+    temperature_2m: Vec<Option<f64>>,
+}
+
+/// Forecast for the remaining hours of a calendar day — used by LOW markets
+/// to detect "late-evening cooling may push a new daily min below the morning
+/// trough" scenarios.
+#[derive(Debug, Clone)]
+pub struct RemainingDayForecast {
+    /// Minimum forecasted temperature across all hours from `now` through
+    /// 23:00 local on the target date (Open-Meteo's last sample for the day).
+    pub min_temp: f64,
+    /// Local time (station tz) at which `min_temp` is forecasted. Format: "HH:00".
+    pub min_hour: String,
+    /// Count of hourly samples that contributed (for confidence sanity-check).
+    pub sample_count: usize,
+}
+
+/// Fetch Open-Meteo's hourly forecast for the target date and return the
+/// minimum temperature across the *remaining* hours of that local day
+/// (current_local_hour onward, inclusive of 23:00 which represents the
+/// ~23:00–00:00 window). This is the "tail trajectory" input that tells us
+/// whether evening cooling is expected to push a new daily low.
+///
+/// `target_date` and `current_local_hour` are in the station's local timezone.
+pub async fn fetch_remaining_day_forecast(
+    client: &reqwest::Client,
+    lat: f64,
+    lon: f64,
+    target_date: chrono::NaiveDate,
+    current_local_hour: f64,
+    unit: super::TemperatureUnit,
+) -> Result<RemainingDayForecast> {
+    let temp_unit = match unit {
+        super::TemperatureUnit::Celsius => "celsius",
+        super::TemperatureUnit::Fahrenheit => "fahrenheit",
+    };
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast\
+         ?latitude={:.4}&longitude={:.4}\
+         &hourly=temperature_2m\
+         &temperature_unit={}\
+         &timezone=auto\
+         &forecast_days=2",
+        lat, lon, temp_unit
+    );
+    debug!(url = %url, "Open-Meteo: fetching remaining-day hourly forecast");
+
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "Open-Meteo remaining-day forecast returned HTTP {}",
+            resp.status()
+        ));
+    }
+    let data: OpenMeteoObservationsResp = resp.json().await?;
+
+    let target_prefix = target_date.format("%Y-%m-%d").to_string();
+    // Floor so we compare "hour X >= current_hour" correctly (e.g., 14:20 → 14).
+    let cur_hour_int = current_local_hour.floor() as i64;
+
+    let mut samples: Vec<(String, f64)> = Vec::new();
+    for (ts, temp_opt) in data.hourly.time.iter().zip(data.hourly.temperature_2m.iter()) {
+        if !ts.starts_with(&target_prefix) {
+            continue;
+        }
+        let Some(temp) = temp_opt else { continue };
+        // Parse hour-of-day from "YYYY-MM-DDTHH:MM"
+        let Some(hm) = ts.split('T').nth(1) else { continue };
+        let Some(hh) = hm.split(':').next() else { continue };
+        let Ok(hour_int) = hh.parse::<i64>() else { continue };
+        if hour_int < cur_hour_int {
+            continue; // already past, METAR owns this
+        }
+        samples.push((format!("{hh}:00"), *temp));
+    }
+
+    if samples.is_empty() {
+        return Err(anyhow!(
+            "no remaining-day forecast samples for {} starting at hour {}",
+            target_prefix,
+            cur_hour_int
+        ));
+    }
+
+    let (min_hour, min_temp) = samples
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .cloned()
+        .unwrap();
+
+    Ok(RemainingDayForecast {
+        min_temp,
+        min_hour,
+        sample_count: samples.len(),
+    })
+}
+
+/// Fetch today's running max/min/current for a station from Open-Meteo's hourly
+/// observations + nowcast (`past_days=1` returns recorded values).
+///
+/// `target_date` should be the resolution date in the station's local timezone.
+pub async fn fetch_observations(
+    client: &reqwest::Client,
+    lat: f64,
+    lon: f64,
+    target_date: chrono::NaiveDate,
+    unit: super::TemperatureUnit,
+) -> Result<ObservedConditions> {
+    let temp_unit = match unit {
+        super::TemperatureUnit::Celsius => "celsius",
+        super::TemperatureUnit::Fahrenheit => "fahrenheit",
+    };
+
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast\
+         ?latitude={:.4}&longitude={:.4}\
+         &hourly=temperature_2m\
+         &temperature_unit={}\
+         &timezone=auto\
+         &past_days=2&forecast_days=1",
+        lat, lon, temp_unit
+    );
+
+    debug!(url = %url, "Open-Meteo: fetching observations");
+
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("Open-Meteo observations returned HTTP {}", resp.status()));
+    }
+
+    let data: OpenMeteoObservationsResp = resp.json().await?;
+    let target_prefix = target_date.format("%Y-%m-%d").to_string();
+    let now_utc = chrono::Utc::now();
+    let offset = data.utc_offset_seconds;
+
+    // Open-Meteo's hourly response mixes past observations and forecast hours.
+    // Filter to the target date AND drop any entry whose UTC time is in the
+    // future — otherwise "max so far today" includes tomorrow's peak forecast
+    // and produces a bogus high (e.g. 83.8°F at 4 AM in Dallas).
+    let mut samples: Vec<(chrono::NaiveDateTime, f64)> = Vec::new();
+    for (ts, temp_opt) in data.hourly.time.iter().zip(data.hourly.temperature_2m.iter()) {
+        if !ts.starts_with(&target_prefix) {
+            continue;
+        }
+        let Some(temp) = temp_opt else { continue };
+        let Ok(local_dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M") else {
+            continue;
+        };
+        // Convert local hourly-slot time to UTC and skip anything still in the future.
+        let entry_utc = local_dt.and_utc().timestamp() - offset;
+        if entry_utc > now_utc.timestamp() {
+            continue;
+        }
+        samples.push((local_dt, *temp));
+    }
+
+    if samples.is_empty() {
+        return Err(anyhow!(
+            "no past hourly observations for {} (timezone {})",
+            target_prefix,
+            data.timezone
+        ));
+    }
+
+    // Latest sample is the "current" reading; max/min cover all samples for the day so far.
+    samples.sort_by_key(|(dt, _)| *dt);
+    let (latest_dt, latest_temp) = *samples.last().expect("non-empty after sort");
+    let max_so_far = samples.iter().map(|(_, t)| *t).fold(f64::NEG_INFINITY, f64::max);
+    let min_so_far = samples.iter().map(|(_, t)| *t).fold(f64::INFINITY, f64::min);
+
+    // We don't know the station's UTC offset without parsing the IANA tz; approximate
+    // last_observation_at as "now" since hourly data is updated within the last hour.
+    // This is good enough for "how stale is this" UX.
+    let _ = latest_dt; // placeholder until we wire proper tz parsing
+    let last_observation_at = now_utc;
+
+    Ok(ObservedConditions {
+        max_so_far,
+        min_so_far,
+        current: latest_temp,
+        last_observation_at,
+        timezone: data.timezone,
+        source: ForecastSource::OpenMeteo,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Open-Meteo API (free, no API key required)
 // ---------------------------------------------------------------------------
 

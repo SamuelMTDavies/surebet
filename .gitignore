@@ -13,6 +13,7 @@
 
 # Runtime state — personal trading activity / on-chain checkpoints
 harvester_trades.jsonl
+paper_trades.jsonl
 onchain_checkpoint.txt
 report.txt
 
