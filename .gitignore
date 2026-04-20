@@ -21,3 +21,9 @@ report.txt
 .DS_Store
 .idea/
 .claude/
+
+# Strategy drafts / notes — never commit, always WIP
+plans/
+
+# Local polymarket SDK fork (2GB+ local-only)
+polymarket-client-sdk-patch/

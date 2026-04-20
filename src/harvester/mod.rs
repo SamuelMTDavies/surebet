@@ -69,6 +69,19 @@ pub struct OutcomeInfo {
     pub best_bid: Option<Decimal>,
     pub sellable_shares: Decimal,
     pub sellable_revenue: Decimal,
+    // Capital-capped "top of book" view. These mirror the `sweepable_*`
+    // / `sellable_*` fields but stop accumulating once the cost (or
+    // revenue) reaches the caller's per-trade budget — i.e. what a
+    // small-capital trade would *actually* fill at, using only the
+    // cheapest/richest ladder levels. Gives a realistic profit figure
+    // when you can't swallow the full book.
+    pub top_shares: Decimal,
+    pub top_cost: Decimal,
+    pub top_profit: Decimal,
+    pub top_avg_ask: Option<Decimal>,
+    pub top_sellable_shares: Decimal,
+    pub top_sellable_revenue: Decimal,
+    pub top_avg_bid: Option<Decimal>,
 }
 
 // ─── Gamma API scan ─────────────────────────────────────────────────────────
@@ -328,21 +341,48 @@ pub fn build_outcome_info(
     book: &OrderBook,
     max_buy: Decimal,
     min_sell: Decimal,
+    budget_usd: Decimal,
 ) -> OutcomeInfo {
     // Buy side — sweep asks up to max_buy
     let best_ask = book.asks.best(false).map(|(p, _)| p);
 
     let mut shares = Decimal::ZERO;
     let mut cost = Decimal::ZERO;
+    // Top-of-book (capital-capped) walk runs in parallel and stops
+    // once `cost` would exceed `budget_usd`. Partial levels are taken
+    // at fractional depth so the cost hits the budget exactly.
+    let mut top_shares = Decimal::ZERO;
+    let mut top_cost = Decimal::ZERO;
+    let mut top_budget_remaining = budget_usd;
     for (&price, &size) in book.asks.levels.iter() {
         if price > max_buy {
             break;
         }
         shares += size;
         cost += price * size;
+
+        if top_budget_remaining > Decimal::ZERO {
+            let level_cost = price * size;
+            if level_cost <= top_budget_remaining {
+                top_shares += size;
+                top_cost += level_cost;
+                top_budget_remaining -= level_cost;
+            } else if price > Decimal::ZERO {
+                let frac_shares = top_budget_remaining / price;
+                top_shares += frac_shares;
+                top_cost += top_budget_remaining;
+                top_budget_remaining = Decimal::ZERO;
+            }
+        }
     }
 
     let profit = shares - cost;
+    let top_profit = top_shares - top_cost;
+    let top_avg_ask = if top_shares > Decimal::ZERO {
+        Some(top_cost / top_shares)
+    } else {
+        None
+    };
 
     // Sell side — hit bids at or above min_sell.
     // These are bids for LOSING tokens.  After a CTF split ($1 → 1 YES + 1 NO)
@@ -351,6 +391,13 @@ pub fn build_outcome_info(
 
     let mut sell_shares = Decimal::ZERO;
     let mut sell_revenue = Decimal::ZERO;
+    let mut top_sell_shares = Decimal::ZERO;
+    let mut top_sell_revenue = Decimal::ZERO;
+    // Sell-side budget proxy: each loser token we mint costs $1 (via
+    // CTF split), so the sell budget in shares == budget_usd in shares.
+    // Cap the TOP walk at that many shares so the numbers line up with
+    // a capital-constrained mint+sell on the same USDC budget.
+    let mut top_sell_budget_shares = budget_usd;
     // BTreeMap iterates ascending; bids should be walked top-down
     for (&price, &size) in book.bids.levels.iter().rev() {
         if price < min_sell {
@@ -358,7 +405,19 @@ pub fn build_outcome_info(
         }
         sell_shares += size;
         sell_revenue += price * size;
+
+        if top_sell_budget_shares > Decimal::ZERO {
+            let take = size.min(top_sell_budget_shares);
+            top_sell_shares += take;
+            top_sell_revenue += price * take;
+            top_sell_budget_shares -= take;
+        }
     }
+    let top_avg_bid = if top_sell_shares > Decimal::ZERO {
+        Some(top_sell_revenue / top_sell_shares)
+    } else {
+        None
+    };
 
     OutcomeInfo {
         label: label.to_string(),
@@ -370,5 +429,12 @@ pub fn build_outcome_info(
         best_bid,
         sellable_shares: sell_shares,
         sellable_revenue: sell_revenue,
+        top_shares,
+        top_cost,
+        top_profit,
+        top_avg_ask,
+        top_sellable_shares: top_sell_shares,
+        top_sellable_revenue: top_sell_revenue,
+        top_avg_bid,
     }
 }

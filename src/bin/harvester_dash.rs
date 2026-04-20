@@ -28,8 +28,8 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::types::{OrderType as SdkOrderType, Side as SdkSide};
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
 use polymarket_client_sdk::ctf::types::{
-    CollectionIdRequest, MergePositionsRequest, PositionIdRequest, RedeemPositionsRequest,
-    SplitPositionRequest,
+    CollectionIdRequest, MergePositionsRequest, PositionIdRequest, RedeemNegRiskRequest,
+    RedeemPositionsRequest, SplitPositionRequest,
 };
 use polymarket_client_sdk::types::address;
 use polymarket_client_sdk::POLYGON;
@@ -157,6 +157,17 @@ trait CtfSplitTrait: Send + Sync {
 
     async fn redeem_position(&self, condition_id: B256) -> anyhow::Result<OnchainTxResult>;
 
+    /// Redeem a position in a Polymarket negative-risk market via the
+    /// `NegRiskAdapter` contract. Standard `redeem_position` won't work for
+    /// these — they have their own redemption path that takes per-outcome
+    /// token amounts ([yesAmount, noAmount]) rather than index sets.
+    async fn redeem_neg_risk_position(
+        &self,
+        condition_id: B256,
+        yes_units: U256,
+        no_units: U256,
+    ) -> anyhow::Result<OnchainTxResult>;
+
     /// Returns `(yes_balance, no_balance)` for the wallet, in raw 6-decimal
     /// units. Used to gate merge calls so we don't submit a guaranteed-revert
     /// transaction (and waste gas) when the user has already sold one side.
@@ -210,6 +221,46 @@ struct CtfClientWrapper<P: alloy::providers::Provider + Clone + Send + Sync + 's
 }
 
 impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfClientWrapper<P> {
+    /// Query the ERC-1155 balance for one side of a binary market. Used by
+    /// `balance_for` to fan out YES and NO in parallel.
+    ///
+    /// `index_set = 1` → YES, `index_set = 2` → NO.
+    async fn balance_for_side(
+        &self,
+        condition_id: B256,
+        index_set: U256,
+    ) -> anyhow::Result<U256> {
+        let coll = self
+            .client
+            .collection_id(
+                &CollectionIdRequest::builder()
+                    .parent_collection_id(B256::ZERO)
+                    .condition_id(condition_id)
+                    .index_set(index_set)
+                    .build(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("collection_id failed: {e}"))?;
+        let pos = self
+            .client
+            .position_id(
+                &PositionIdRequest::builder()
+                    .collateral_token(USDC)
+                    .collection_id(coll.collection_id)
+                    .build(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("position_id failed: {e}"))?;
+        let provider = self.client.provider().clone();
+        let erc1155 = IConditionalTokensView::new(CTF_CONTRACT, provider);
+        let bal = erc1155
+            .balanceOf(self.wallet, pos.position_id)
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("balanceOf failed: {e}"))?;
+        Ok(bal)
+    }
+
     /// Fetch the receipt for `tx_hash` and compute MATIC gas cost. Falls back
     /// to a tx_hash-only result if the receipt is missing or fields are
     /// unavailable — we'd rather lose gas accuracy than fail an entire trade.
@@ -334,40 +385,32 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
         Ok(self.gas_for(resp.transaction_hash).await)
     }
 
+    async fn redeem_neg_risk_position(
+        &self,
+        condition_id: B256,
+        yes_units: U256,
+        no_units: U256,
+    ) -> anyhow::Result<OnchainTxResult> {
+        let req = RedeemNegRiskRequest::builder()
+            .condition_id(condition_id)
+            .amounts(vec![yes_units, no_units])
+            .build();
+        let resp = self
+            .client
+            .redeem_neg_risk(&req)
+            .await
+            .map_err(|e| anyhow::anyhow!("CTF neg-risk redeem failed: {}", e))?;
+        Ok(self.gas_for(resp.transaction_hash).await)
+    }
+
     async fn balance_for(&self, condition_id: B256) -> anyhow::Result<(U256, U256)> {
-        let provider = self.client.provider().clone();
-        let erc1155 = IConditionalTokensView::new(CTF_CONTRACT, provider);
-        let mut out = [U256::ZERO; 2];
-        for (idx, index_set) in [(0, U256::from(1u64)), (1, U256::from(2u64))] {
-            let coll = self
-                .client
-                .collection_id(
-                    &CollectionIdRequest::builder()
-                        .parent_collection_id(B256::ZERO)
-                        .condition_id(condition_id)
-                        .index_set(index_set)
-                        .build(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("collection_id failed: {e}"))?;
-            let pos = self
-                .client
-                .position_id(
-                    &PositionIdRequest::builder()
-                        .collateral_token(USDC)
-                        .collection_id(coll.collection_id)
-                        .build(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("position_id failed: {e}"))?;
-            let bal = erc1155
-                .balanceOf(self.wallet, pos.position_id)
-                .call()
-                .await
-                .map_err(|e| anyhow::anyhow!("balanceOf failed: {e}"))?;
-            out[idx] = bal;
-        }
-        Ok((out[0], out[1]))
+        // Run YES and NO side lookups in parallel to halve round-trip latency
+        // and reduce the chance of a single transient RPC error taking out the
+        // whole query.
+        let yes_fut = self.balance_for_side(condition_id, U256::from(1u64));
+        let no_fut = self.balance_for_side(condition_id, U256::from(2u64));
+        let (yes, no) = tokio::try_join!(yes_fut, no_fut)?;
+        Ok((yes, no))
     }
 
     async fn current_gas_price_wei(&self) -> anyhow::Result<u128> {
@@ -517,6 +560,12 @@ struct AppState {
     /// through `api` (ClobApiClient).
     order_client: Option<Arc<OrderClient>>,
     ctf: Option<Arc<CtfSplitter>>,
+    /// Polygon wallet address derived from POLYMARKET_PRIVATE_KEY. Used by
+    /// `compute_open_positions` to query the Polymarket Data API for the
+    /// authoritative list of held positions (so positions bought via CLOB or
+    /// in negative-risk markets — both of which the local activity log misses
+    /// — show up in the dashboard). `None` when not in live mode.
+    wallet_address: Option<alloy::primitives::Address>,
     activity: Arc<RwLock<Vec<ActivityEntry>>>,
     max_buy: Decimal,
     min_sell: Decimal,
@@ -590,6 +639,17 @@ struct HarvestRequest {
     winner_idx: usize,      // which outcome is the winner
     label: String,
     market_question: String,
+    /// Which strategy to execute:
+    /// - `None`           → legacy auto-allocate (prioritise mint, fill buy
+    ///   with remainder — historical default before the preview UI).
+    /// - `Some("buy")`    → direct buy only, zero mint.
+    /// - `Some("mint")`   → mint + sell-losers only, zero buy.
+    ///
+    /// Preview endpoint (`/api/harvest-preview`) returns the numbers for
+    /// both; the UI shows them side-by-side and passes the chosen one
+    /// back here.
+    #[serde(default)]
+    strategy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,6 +782,12 @@ async fn main() -> Result<()> {
     };
 
     // ── Step 2b: Build CTF client for mint+sell (on-chain) ────────────────
+    //
+    // Capture the wallet address up-front so it's available to AppState even
+    // if the CTF client fails to initialize (e.g., RPC down). The dashboard's
+    // open-positions view needs the wallet address to query the Polymarket
+    // Data API — that's independent of whether mint+sell is enabled.
+    let mut wallet_address: Option<alloy::primitives::Address> = None;
 
     let ctf: Option<Arc<CtfSplitter>> = if live_mode {
         match std::env::var("POLYMARKET_PRIVATE_KEY") {
@@ -731,6 +797,7 @@ async fn main() -> Result<()> {
                 match LocalSigner::from_str(&pk) {
                     Ok(signer) => {
                         let wallet_addr = signer.address();
+                        wallet_address = Some(wallet_addr);
                         let signer = signer.with_chain_id(Some(POLYGON_CHAIN_ID));
                         match ProviderBuilder::new()
                             .wallet(signer)
@@ -845,6 +912,7 @@ async fn main() -> Result<()> {
         api,
         order_client,
         ctf,
+        wallet_address,
         activity: Arc::new(RwLock::new(prior_activity)),
         max_buy,
         min_sell,
@@ -872,9 +940,11 @@ async fn main() -> Result<()> {
         .route("/api/markets", get(api_markets))
         .route("/api/book", get(api_book))
         .route("/api/harvest", post(api_harvest))
+        .route("/api/harvest-preview", post(api_harvest_preview))
         .route("/api/activity", get(api_activity))
         .route("/api/merge", post(api_merge))
         .route("/api/redeem", post(api_redeem))
+        .route("/api/redeem-neg-risk", post(api_redeem_neg_risk))
         .route("/api/clear-geoblock", post(api_clear_geoblock))
         .route("/api/rescan", post(api_rescan))
         .route("/api/status", get(api_status))
@@ -1239,20 +1309,198 @@ async fn api_redeem(
     Json(serde_json::json!({"ok": ok, "entry": entry})).into_response()
 }
 
+/// Body for `/api/redeem-neg-risk`. Amounts are USDC (display units, decimal
+/// strings) — they get scaled to 6-decimal base units before submission. At
+/// least one of `yes_amount` / `no_amount` must be > 0.
+#[derive(Debug, Deserialize)]
+struct NegRiskRedeemRequest {
+    condition_id: String,
+    #[serde(default)]
+    yes_amount: Option<String>,
+    #[serde(default)]
+    no_amount: Option<String>,
+    #[serde(default)]
+    market: Option<String>,
+}
+
+async fn api_redeem_neg_risk(
+    State(state): State<AppState>,
+    Json(req): Json<NegRiskRedeemRequest>,
+) -> impl IntoResponse {
+    let ctf = match state.ctf.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "CTF client not enabled (run with --live and POLYMARKET_PRIVATE_KEY)"})),
+            )
+                .into_response();
+        }
+    };
+
+    let condition_id = match B256::from_str(&req.condition_id) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid condition_id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let parse_amt = |opt: Option<&str>| -> Result<Decimal, String> {
+        match opt {
+            None => Ok(Decimal::ZERO),
+            Some(s) if s.is_empty() => Ok(Decimal::ZERO),
+            Some(s) => Decimal::from_str(s)
+                .map_err(|_| format!("invalid amount '{s}'"))
+                .and_then(|d| {
+                    if d < Decimal::ZERO {
+                        Err("amount must be >= 0".to_string())
+                    } else {
+                        Ok(d)
+                    }
+                }),
+        }
+    };
+
+    let yes_dec = match parse_amt(req.yes_amount.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
+    let no_dec = match parse_amt(req.no_amount.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
+    if yes_dec == Decimal::ZERO && no_dec == Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "at least one of yes_amount / no_amount must be > 0"
+            })),
+        )
+            .into_response();
+    }
+
+    let yes_units = U256::from(usdc_units_from_decimal(yes_dec));
+    let no_units = U256::from(usdc_units_from_decimal(no_dec));
+
+    let result = ctf
+        .inner
+        .redeem_neg_risk_position(condition_id, yes_units, no_units)
+        .await;
+
+    let (status_text, ok, gas_matic_str) = match result {
+        Ok(tx) => (
+            format!(
+                "REDEEM-NEG-RISK OK tx={} gas={} MATIC",
+                tx.tx_hash, tx.gas_cost_matic
+            ),
+            true,
+            format!("{}", tx.gas_cost_matic),
+        ),
+        Err(e) => (format!("REDEEM-NEG-RISK ERR: {e}"), false, "0".to_string()),
+    };
+
+    // Sum up the gross redeem value (winning side pays 1:1, losing side 0,
+    // and we don't know which won at this point — record the larger amount as
+    // the upper bound for sell_revenue accounting). The Data API will reflect
+    // the actual outcome on the next refresh.
+    let recorded_revenue = yes_dec.max(no_dec);
+    let entry = ActivityEntry {
+        time: Utc::now().format("%H:%M:%S").to_string(),
+        market: req.market.clone().unwrap_or_default(),
+        outcome: String::new(),
+        strategy: "REDEEM-NEG-RISK".to_string(),
+        buy_shares: "0".to_string(),
+        buy_cost: "0.0000".to_string(),
+        mint_cost: "0.0000".to_string(),
+        sell_revenue: format!("{:.4}", recorded_revenue),
+        net_profit: "0.0000".to_string(),
+        status: status_text.clone(),
+        condition_id: req.condition_id.clone(),
+        gas_matic: gas_matic_str,
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+    };
+
+    persist_and_record(&state, entry.clone()).await;
+
+    if ok {
+        mark_position_recovered(&state, &req.condition_id, "RECOVERED via redeem-neg-risk").await;
+    }
+
+    Json(serde_json::json!({"ok": ok, "entry": entry})).into_response()
+}
+
 /// Append entry to in-memory activity AND the on-disk JSONL log.
 async fn persist_and_record(state: &AppState, entry: ActivityEntry) {
-    if let Ok(mut f) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("harvester_trades.jsonl")
-        .await
     {
-        use tokio::io::AsyncWriteExt;
-        let line = serde_json::to_string(&entry).unwrap_or_default();
-        let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
+        let mut activity = state.activity.write().await;
+        activity.push(entry);
     }
-    let mut activity = state.activity.write().await;
-    activity.push(entry);
+    rewrite_activity_file(state).await;
+}
+
+/// Push a provisional entry to the in-memory activity log and persist the
+/// file immediately. Returns the index of the new entry so later code can
+/// mutate it via `update_entry_at`.
+///
+/// Used by the harvest handler to record a mint IMMEDIATELY after it succeeds,
+/// so that if the subsequent sell/buy phases fail or the handler crashes, the
+/// mint is still captured in the log.
+async fn record_provisional(state: &AppState, entry: ActivityEntry) -> usize {
+    let idx;
+    {
+        let mut activity = state.activity.write().await;
+        activity.push(entry);
+        idx = activity.len() - 1;
+    }
+    rewrite_activity_file(state).await;
+    idx
+}
+
+/// Apply a mutation to the entry at `idx` and persist the file. Used to
+/// update the provisional entry as sell/buy phases complete.
+async fn update_entry_at<F: FnOnce(&mut ActivityEntry)>(state: &AppState, idx: usize, f: F) {
+    {
+        let mut activity = state.activity.write().await;
+        if let Some(e) = activity.get_mut(idx) {
+            f(e);
+        }
+    }
+    rewrite_activity_file(state).await;
+}
+
+/// Atomically rewrite the full activity JSONL file from the in-memory Vec.
+/// Writes to a `.tmp` file then renames — so a crash mid-write can't corrupt
+/// the existing log.
+async fn rewrite_activity_file(state: &AppState) {
+    let activity = state.activity.read().await;
+    let mut content = String::with_capacity(activity.len() * 300);
+    for entry in activity.iter() {
+        if let Ok(line) = serde_json::to_string(entry) {
+            content.push_str(&line);
+            content.push('\n');
+        }
+    }
+    let tmp_path = "harvester_trades.jsonl.tmp";
+    let final_path = "harvester_trades.jsonl";
+    if tokio::fs::write(tmp_path, content.as_bytes()).await.is_ok() {
+        let _ = tokio::fs::rename(tmp_path, final_path).await;
+    }
 }
 
 /// Mark prior stuck trades for this condition_id as recovered. We mutate the
@@ -1295,6 +1543,10 @@ struct TradeStats {
     total_gas_usdc: Decimal,
     /// realized_pnl - total_gas_usdc — what you actually netted after gas
     net_pnl_after_gas: Decimal,
+    /// `net_pnl_after_gas / (total_buy_cost + total_mint_cost) × 100`.
+    /// `None` when no capital has been deployed yet (all entries are
+    /// paper or pure recovery actions).
+    total_return_pct: Option<Decimal>,
 }
 
 fn compute_stats(activity: &[ActivityEntry], matic_usd: Decimal) -> TradeStats {
@@ -1336,6 +1588,12 @@ fn compute_stats(activity: &[ActivityEntry], matic_usd: Decimal) -> TradeStats {
     }
     s.total_gas_usdc = (s.total_gas_matic * matic_usd).round_dp(6);
     s.net_pnl_after_gas = s.realized_pnl - s.total_gas_usdc;
+    let capital = s.total_buy_cost + s.total_mint_cost;
+    s.total_return_pct = if capital > Decimal::ZERO {
+        Some(((s.net_pnl_after_gas * Decimal::ONE_HUNDRED) / capital).round_dp(2))
+    } else {
+        None
+    };
     s
 }
 
@@ -1343,121 +1601,341 @@ fn compute_stats(activity: &[ActivityEntry], matic_usd: Decimal) -> TradeStats {
 struct OpenPosition {
     condition_id: String,
     market: String,
-    /// Last activity entry's outcome label (the side the user picked as winner)
+    /// Activity log's outcome label (the side picked as winner during MINT+SELL).
+    /// Empty for positions sourced only from the Data API (e.g. CLOB buys).
     winner_label: String,
-    /// Raw on-chain balances (6-decimal base units)
+    /// Tokens currently held in each side, sourced from the Data API. For
+    /// neg-risk markets the wallet typically only holds one side; for binary
+    /// mint+sell mid-flow it can hold both.
     yes_tokens: Decimal,
     no_tokens: Decimal,
-    /// True if the user holds equal YES + NO and could merge
+    /// True if the user holds non-zero amounts of both sides and the market
+    /// is binary CTF (neg-risk markets are merged via a different contract
+    /// path that we don't currently support — show but don't enable).
     mergeable: bool,
-    /// On-chain resolution state. `unresolved` / `resolved-yes` / `resolved-no`.
+    /// Resolution status from the Data API perspective:
+    ///   "unresolved" / "resolved-yes" / "resolved-no" / "resolved"
     resolution: String,
-    /// True iff the market is resolved (read from CTF.payoutDenominator)
+    /// True iff the Data API marks any held side as redeemable (i.e. the
+    /// market resolved AND we hold winning tokens).
     redeemable: bool,
-    /// Original mint cost from the activity log (for P&L estimation)
+    /// True for Polymarket negative-risk multi-outcome markets. Determines
+    /// which on-chain redeem path the dashboard should call.
+    #[serde(default)]
+    neg_risk: bool,
+    /// Current dollar value of the held position(s) for this market.
+    #[serde(default)]
+    current_value: Decimal,
+    /// Cash P&L per the Data API (current_value - cost_basis). Already nets
+    /// avg_price × size against the live curPrice, so we don't have to
+    /// reconstruct it from the activity log.
+    #[serde(default)]
+    cash_pnl: Decimal,
+    /// Original mint cost from the activity log, when this position came
+    /// from a local MINT (used for sanity-check display only).
     mint_cost_dec: Decimal,
-    /// Time-left string ("3d 4h", "in 12h", "ended 2h ago", or "unknown") if
-    /// the market is in the loaded markets list
+    /// Time-left string ("3d 4h", "in 12h", "ended 2h ago", or "unknown")
+    /// — sourced from the loaded markets list when present, else from the
+    /// Data API's `endDate` field, else unknown.
     time_left: String,
     end_date_iso: Option<String>,
+    /// Error message if the upstream query failed. When set, the UI shows
+    /// the row with a warning instead of hiding it.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// One row from the Polymarket Data API `/positions` endpoint. Only the fields
+/// we actually use are deserialized; the API returns ~25 fields per position.
+///
+/// This is the authoritative list of what the wallet currently holds. We
+/// prefer this over the local activity log because:
+///  - It captures positions bought via CLOB (no MINT entry in our log)
+///  - It captures negative-risk positions, whose on-chain ERC-1155 IDs use
+///    a different derivation than standard binary CTF and would return zero
+///    from our existing `balance_for()` lookup.
+#[derive(Debug, Clone, Deserialize)]
+struct DataApiPosition {
+    #[serde(rename = "conditionId")]
+    condition_id: String,
+    title: String,
+    /// "Yes" or "No" (display text — also reflected in `outcome_index`)
+    outcome: String,
+    /// Tokens held in display units (already divided by 1e6)
+    size: f64,
+    #[serde(rename = "currentValue", default)]
+    current_value: f64,
+    #[serde(rename = "cashPnl", default)]
+    cash_pnl: f64,
+    #[serde(default)]
+    redeemable: bool,
+    #[serde(default)]
+    mergeable: bool,
+    #[serde(rename = "negativeRisk", default)]
+    neg_risk: bool,
+    #[serde(rename = "endDate", default)]
+    end_date: Option<String>,
+}
+
+/// GET /positions for the given wallet. Includes zero-size rows so we can
+/// render a "fully closed" badge if needed (`sizeThreshold=0`). Errors are
+/// returned to the caller — `compute_open_positions` decides how to surface
+/// them in the UI.
+async fn fetch_wallet_positions_from_api(
+    wallet: alloy::primitives::Address,
+) -> anyhow::Result<Vec<DataApiPosition>> {
+    let url = format!(
+        "https://data-api.polymarket.com/positions?user={:#x}&sizeThreshold=0&limit=500",
+        wallet
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<DataApiPosition>>()
+        .await?;
+    Ok(resp)
+}
+
+/// Convert an `f64` from the Data API into a `Decimal` rounded to 6dp (USDC
+/// precision). Falls back to zero on NaN/infinity rather than panicking.
+fn f64_to_decimal(v: f64) -> Decimal {
+    use rust_decimal::prelude::FromPrimitive;
+    Decimal::from_f64(v)
+        .map(|d| d.round_dp(6))
+        .unwrap_or(Decimal::ZERO)
 }
 
 /// Build the list of open positions by:
-/// 1. Walking the activity log for unique condition_ids that had a successful MINT OK
-/// 2. For each, querying the on-chain CTF balance
-/// 3. Filtering out fully-emptied positions
+/// 1. Querying the Polymarket Data API for the wallet's authoritative holdings
+///    (covers CLOB buys, mints, and neg-risk markets — anything we own).
+/// 2. Grouping by condition_id (a wallet may hold both YES and NO of one market)
+/// 3. Enriching each row with our local activity log's mint cost, when known
 async fn compute_open_positions(state: &AppState) -> Vec<OpenPosition> {
+    use std::collections::BTreeMap;
+
+    // Need a wallet address to query the Data API. Without it (paper mode or
+    // missing private key) we just return empty — the UI shows "no positions"
+    // rather than the legacy activity-log-only view, which was misleading.
+    let Some(wallet) = state.wallet_address else {
+        return Vec::new();
+    };
+
+    // Snapshot the activity log for cost-basis enrichment. We index by lowercase
+    // condition_id since the API returns lowercase hex while our log entries
+    // sometimes preserve mixed case.
     let activity_snap: Vec<ActivityEntry> = {
         let activity = state.activity.read().await;
         activity.clone()
     };
-
-    // Index latest market/outcome/mint_cost per condition_id
-    use std::collections::BTreeMap;
-    let mut latest: BTreeMap<String, (String, String, Decimal)> = BTreeMap::new();
+    let mut log_index: BTreeMap<String, (String, String, Decimal)> = BTreeMap::new();
     for a in &activity_snap {
-        if a.condition_id.is_empty() {
-            continue;
-        }
-        if !a.status.contains("MINT OK") {
+        if a.condition_id.is_empty() || !a.status.contains("MINT OK") {
             continue;
         }
         let mc = Decimal::from_str(&a.mint_cost).unwrap_or(Decimal::ZERO);
-        latest.insert(
-            a.condition_id.clone(),
+        log_index.insert(
+            a.condition_id.to_lowercase(),
             (a.market.clone(), a.outcome.clone(), mc),
         );
     }
 
-    // Lookup market end dates from the in-memory market list (if loaded)
+    // Loaded markets list — provides nicer time-left strings than parsing the
+    // Data API's `endDate` ourselves.
     let markets_snap: Vec<HarvestableMarket> = {
         let m = state.markets.read().await;
         m.clone()
     };
 
-    let mut positions = Vec::new();
-    let Some(ctf) = state.ctf.as_ref() else {
-        return positions; // CTF not enabled — can't query holdings
+    // Fetch the wallet's actual holdings. If this fails we surface a single
+    // error row so the user knows positions might exist that we couldn't read.
+    let api_positions = match fetch_wallet_positions_from_api(wallet).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Polymarket Data API positions fetch failed");
+            return vec![OpenPosition {
+                condition_id: String::new(),
+                market: "(error querying Polymarket Data API — open positions may be missing)"
+                    .to_string(),
+                winner_label: String::new(),
+                yes_tokens: Decimal::ZERO,
+                no_tokens: Decimal::ZERO,
+                mergeable: false,
+                resolution: "unknown".to_string(),
+                redeemable: false,
+                neg_risk: false,
+                current_value: Decimal::ZERO,
+                cash_pnl: Decimal::ZERO,
+                mint_cost_dec: Decimal::ZERO,
+                time_left: String::new(),
+                end_date_iso: None,
+                error: Some(format!("{e}")),
+            }];
+        }
     };
-    for (cid_str, (market_q, outcome, mint_cost_dec)) in latest {
-        let cid = match B256::from_str(&cid_str) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let (yes_raw, no_raw) = match ctf.inner.balance_for(cid).await {
-            Ok(b) => b,
-            Err(_) => (U256::ZERO, U256::ZERO),
-        };
-        if yes_raw == U256::ZERO && no_raw == U256::ZERO {
-            // Position fully closed/redeemed/sold — don't show
+
+    // Group by condition_id — the API returns one row per (condition, outcome),
+    // but we want one display row per market with YES + NO summed.
+    let mut grouped: BTreeMap<String, Vec<DataApiPosition>> = BTreeMap::new();
+    for p in api_positions {
+        // Skip dust rows (the API includes positions with size 0 when we ask
+        // for sizeThreshold=0 — those are fully closed positions we don't need).
+        if p.size <= 0.0 {
             continue;
         }
-        let yes = Decimal::from(yes_raw.to::<u128>()) / Decimal::from(1_000_000u64);
-        let no = Decimal::from(no_raw.to::<u128>()) / Decimal::from(1_000_000u64);
+        grouped
+            .entry(p.condition_id.to_lowercase())
+            .or_default()
+            .push(p);
+    }
 
-        // Try to find the market in the loaded list to get end_date
-        let (time_left, end_iso) = markets_snap
-            .iter()
-            .find(|m| m.condition_id.eq_ignore_ascii_case(&cid_str))
-            .and_then(|m| m.end_date.map(|d| (format_time_left(d), d.to_rfc3339())))
-            .unwrap_or_else(|| ("unknown (outside window)".to_string(), String::new()));
+    let mut positions = Vec::with_capacity(grouped.len());
+    for (cid_lower, group) in grouped {
+        let first = &group[0];
 
-        // Resolution status — free read-only call to CTF.payoutDenominator.
-        // Falls back to "unresolved" if the call errors out so a flaky RPC
-        // can't break the page.
-        let res = ctf
-            .inner
-            .resolution_for(cid)
-            .await
-            .unwrap_or(ResolutionStatus {
-                denominator: 0,
-                yes_payout: 0,
-                no_payout: 0,
-            });
-        let resolution = if !res.is_resolved() {
-            "unresolved".to_string()
-        } else {
-            match res.winner() {
-                Some(side) => format!("resolved-{}", side.to_lowercase()),
-                None => "resolved-tied".to_string(),
+        // Sum YES + NO sides held for this market.
+        let mut yes_size = Decimal::ZERO;
+        let mut no_size = Decimal::ZERO;
+        let mut total_value = Decimal::ZERO;
+        let mut total_pnl = Decimal::ZERO;
+        let mut any_redeemable = false;
+        let mut any_mergeable = false;
+        let mut end_date_iso: Option<String> = first.end_date.clone();
+        for p in &group {
+            let sz = f64_to_decimal(p.size);
+            if p.outcome.eq_ignore_ascii_case("Yes") {
+                yes_size += sz;
+            } else {
+                no_size += sz;
             }
+            total_value += f64_to_decimal(p.current_value);
+            total_pnl += f64_to_decimal(p.cash_pnl);
+            if p.redeemable {
+                any_redeemable = true;
+            }
+            if p.mergeable {
+                any_mergeable = true;
+            }
+            if end_date_iso.is_none() {
+                end_date_iso = p.end_date.clone();
+            }
+        }
+
+        // Resolution string for the badge. The Data API doesn't return the
+        // raw payoutDenominator, but `redeemable: true` together with which
+        // outcome the wallet holds tells us the winner.
+        let resolution = if any_redeemable {
+            // Whichever side is held is the winning side (else it wouldn't be
+            // redeemable). For binary markets with a held side this gives the
+            // correct YES/NO label; neg-risk markets just get "resolved".
+            if first.neg_risk {
+                "resolved".to_string()
+            } else if yes_size > Decimal::ZERO {
+                "resolved-yes".to_string()
+            } else {
+                "resolved-no".to_string()
+            }
+        } else {
+            "unresolved".to_string()
         };
 
+        // Activity log enrichment — preserves the chosen winner label and
+        // original mint cost so existing UI columns still light up for
+        // positions that came from a local MINT.
+        let (log_market, winner_label, mint_cost_dec) = log_index
+            .get(&cid_lower)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), String::new(), Decimal::ZERO));
+        // Prefer the API's market title (always available + canonical) over
+        // whatever was logged at MINT time.
+        let market_title = if first.title.is_empty() {
+            log_market
+        } else {
+            first.title.clone()
+        };
+
+        // Time-left: prefer the loaded markets list (richer formatting), fall
+        // back to parsing the API's endDate.
+        let (time_left, end_iso_final) = if let Some(m) = markets_snap
+            .iter()
+            .find(|m| m.condition_id.eq_ignore_ascii_case(&cid_lower))
+            .and_then(|m| m.end_date.map(|d| (format_time_left(d), d.to_rfc3339())))
+        {
+            (m.0, m.1)
+        } else if let Some(end) = end_date_iso.as_ref() {
+            // The Data API's `endDate` is a date string (e.g. "2026-04-10").
+            // Try to parse it and format relative to now.
+            let parsed = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|ndt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+            match parsed {
+                Some(d) => (format_time_left(d), d.to_rfc3339()),
+                None => (end.clone(), end.clone()),
+            }
+        } else {
+            ("unknown".to_string(), String::new())
+        };
+
+        // Mergeability: only enable for binary CTF markets where we hold both
+        // sides. Neg-risk merges go through a different contract path that
+        // we don't currently support, so we report `false` regardless of what
+        // the API says (the merge button would just fail).
+        let mergeable = !first.neg_risk
+            && yes_size > Decimal::ZERO
+            && no_size > Decimal::ZERO
+            && any_mergeable;
+
         positions.push(OpenPosition {
-            condition_id: cid_str,
-            market: market_q,
-            winner_label: outcome,
-            yes_tokens: yes,
-            no_tokens: no,
-            mergeable: yes_raw > U256::ZERO && no_raw > U256::ZERO,
-            redeemable: res.is_resolved(),
+            condition_id: cid_lower,
+            market: market_title,
+            winner_label,
+            yes_tokens: yes_size,
+            no_tokens: no_size,
+            mergeable,
+            redeemable: any_redeemable,
+            neg_risk: first.neg_risk,
+            current_value: total_value,
+            cash_pnl: total_pnl,
             resolution,
             mint_cost_dec,
             time_left,
-            end_date_iso: if end_iso.is_empty() { None } else { Some(end_iso) },
+            end_date_iso: if end_iso_final.is_empty() {
+                None
+            } else {
+                Some(end_iso_final)
+            },
+            error: None,
         });
     }
     positions
+}
+
+/// Retry an async operation up to `max_attempts` times with exponential
+/// backoff starting at 150ms. Returns the last error on final failure.
+async fn retry_async<T, E, Fut, F>(max_attempts: u32, mut f: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut delay_ms: u64 = 150;
+    let mut last_err: Option<E> = None;
+    for attempt in 0..max_attempts {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("retry_async: at least one attempt was made"))
 }
 
 /// Format a time-left string like "2d 4h", "in 3h", "ended 2h ago".
@@ -1550,7 +2028,7 @@ async fn api_book(
         let book = state.book_store.fetch_rest_book(&state.clob_url, token_id).await;
 
         let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade),
             None => OutcomeInfo {
                 label: label.clone(),
                 token_id: token_id.clone(),
@@ -1561,6 +2039,13 @@ async fn api_book(
                 best_bid: None,
                 sellable_shares: Decimal::ZERO,
                 sellable_revenue: Decimal::ZERO,
+                top_shares: Decimal::ZERO,
+                top_cost: Decimal::ZERO,
+                top_profit: Decimal::ZERO,
+                top_avg_ask: None,
+                top_sellable_shares: Decimal::ZERO,
+                top_sellable_revenue: Decimal::ZERO,
+                top_avg_bid: None,
             },
         };
         outcomes.push(info);
@@ -1570,6 +2055,164 @@ async fn api_book(
         "idx": q.idx,
         "question": market.question,
         "outcomes": outcomes,
+    }))
+    .into_response()
+}
+
+/// Compute both strategies (direct buy of the winner, vs mint+sell
+/// losers) without executing anything. Mirrors the first ~100 lines of
+/// `api_harvest`: looks up the market, re-fetches the books, applies
+/// the `max_trade` budget cap to each strategy independently — so the
+/// UI can show the two options side-by-side and let the user pick.
+async fn api_harvest_preview(
+    State(state): State<AppState>,
+    Json(req): Json<HarvestRequest>,
+) -> impl IntoResponse {
+    // Look up market
+    let market = {
+        let markets = state.markets.read().await;
+        match markets.get(req.market_idx) {
+            Some(m) => m.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid market index"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if req.winner_idx >= market.clob_token_ids.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid winner outcome index"})),
+        )
+            .into_response();
+    }
+
+    // Re-fetch books for fresh data
+    let mut outcomes: Vec<OutcomeInfo> = Vec::new();
+    for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+        let label = market
+            .outcomes
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Outcome {}", i));
+        let book = state
+            .book_store
+            .fetch_rest_book(&state.clob_url, token_id)
+            .await;
+        let info = match book {
+            Some(ref b) => {
+                build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade)
+            }
+            None => OutcomeInfo {
+                label: label.clone(),
+                token_id: token_id.clone(),
+                best_ask: None,
+                sweepable_shares: Decimal::ZERO,
+                sweepable_cost: Decimal::ZERO,
+                sweepable_profit: Decimal::ZERO,
+                best_bid: None,
+                sellable_shares: Decimal::ZERO,
+                sellable_revenue: Decimal::ZERO,
+                top_shares: Decimal::ZERO,
+                top_cost: Decimal::ZERO,
+                top_profit: Decimal::ZERO,
+                top_avg_ask: None,
+                top_sellable_shares: Decimal::ZERO,
+                top_sellable_revenue: Decimal::ZERO,
+                top_avg_bid: None,
+            },
+        };
+        outcomes.push(info);
+    }
+
+    let winner = &outcomes[req.winner_idx];
+
+    // ── Buy-only strategy (already budget-capped at top_cost) ──────────
+    let buy_cost = winner.top_cost;
+    let buy_shares = winner.top_shares;
+    let buy_profit = winner.top_profit;
+    let buy_avg = winner.top_avg_ask;
+    let buy_pct = if buy_cost > Decimal::ZERO {
+        (buy_profit * Decimal::ONE_HUNDRED) / buy_cost
+    } else {
+        Decimal::ZERO
+    };
+
+    // ── Mint+sell-losers strategy ──────────────────────────────────────
+    // mint_amount (USDC) = min of losers' top_sellable_shares (since each
+    // mint produces 1 of each loser and we need to sell all of them);
+    // capped at budget.
+    let mut min_loser_depth = Decimal::MAX;
+    let mut have_all_bids = true;
+    let mut sell_plans: Vec<serde_json::Value> = Vec::new();
+    for (i, info) in outcomes.iter().enumerate() {
+        if i == req.winner_idx {
+            continue;
+        }
+        if info.top_sellable_shares == Decimal::ZERO || info.best_bid.is_none() {
+            have_all_bids = false;
+            break;
+        }
+        min_loser_depth = min_loser_depth.min(info.top_sellable_shares);
+        sell_plans.push(serde_json::json!({
+            "label": info.label,
+            "top_sellable_shares": info.top_sellable_shares.to_string(),
+            "best_bid": info.best_bid.unwrap().to_string(),
+            "top_avg_bid": info.top_avg_bid.map(|v| v.to_string()),
+        }));
+    }
+    let mint_available = have_all_bids && min_loser_depth < Decimal::MAX && state.ctf.is_some();
+    let (mint_amount, mint_sell_revenue, mint_profit_pct) = if mint_available {
+        let amount = min_loser_depth.min(state.max_trade);
+        // Revenue at this exact amount: walk each loser's bids fresh.
+        // Cached `top_sellable_revenue` is for `top_sellable_shares` —
+        // which may exceed `amount` if one loser has much deeper top.
+        // Recompute by taking `amount` shares at best bid per loser.
+        let mut revenue = Decimal::ZERO;
+        for (i, info) in outcomes.iter().enumerate() {
+            if i == req.winner_idx {
+                continue;
+            }
+            if let Some(best) = info.best_bid {
+                // Best-case approximation: assume top bid has enough
+                // depth for `amount`. For capital-constrained trades
+                // this is usually true; the executor re-walks for real.
+                revenue += best * amount;
+            }
+        }
+        let pct = if amount > Decimal::ZERO {
+            (revenue * Decimal::ONE_HUNDRED) / amount
+        } else {
+            Decimal::ZERO
+        };
+        (amount, revenue, pct)
+    } else {
+        (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+    };
+
+    Json(serde_json::json!({
+        "market_question": req.market_question,
+        "winner_label": winner.label,
+        "max_trade": state.max_trade.to_string(),
+        "buy": {
+            "shares": buy_shares.to_string(),
+            "cost": buy_cost.to_string(),
+            "avg_price": buy_avg.map(|v| v.to_string()),
+            "profit": buy_profit.to_string(),
+            "profit_pct": format!("{:.2}", buy_pct),
+            "available": buy_cost > Decimal::ZERO,
+        },
+        "mint": {
+            "mint_amount": mint_amount.to_string(),
+            "sell_revenue": mint_sell_revenue.to_string(),
+            "profit": mint_sell_revenue.to_string(),
+            "profit_pct": format!("{:.2}", mint_profit_pct),
+            "available": mint_available && mint_amount > Decimal::ZERO,
+            "sell_plans": sell_plans,
+        },
     }))
     .into_response()
 }
@@ -1618,7 +2261,7 @@ async fn api_harvest(
             .fetch_rest_book(&state.clob_url, token_id)
             .await;
         let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade),
             None => OutcomeInfo {
                 label: label.clone(),
                 token_id: token_id.clone(),
@@ -1629,18 +2272,32 @@ async fn api_harvest(
                 best_bid: None,
                 sellable_shares: Decimal::ZERO,
                 sellable_revenue: Decimal::ZERO,
+                top_shares: Decimal::ZERO,
+                top_cost: Decimal::ZERO,
+                top_profit: Decimal::ZERO,
+                top_avg_ask: None,
+                top_sellable_shares: Decimal::ZERO,
+                top_sellable_revenue: Decimal::ZERO,
+                top_avg_bid: None,
             },
         };
         outcomes.push(info);
     }
 
+    // Use the capital-capped "top of book" numbers as the starting
+    // point — these walk only the best ladder levels up to `max_trade`,
+    // matching what the dashboard's "↳ top …" line advertises. Using
+    // `sweepable_*` here caused the preview to scale the full-sweep
+    // average back down to the budget, producing fewer shares at a
+    // worse (blended) avg price than reality.
     let winner = &outcomes[req.winner_idx];
-    let buy_shares = winner.sweepable_shares;
-    let buy_cost = winner.sweepable_cost;
+    let buy_shares = winner.top_shares;
+    let buy_cost = winner.top_cost;
 
     // ── 3. Check loser sell-side (mint+sell opportunity) ─────────────────
     // For each loser outcome, check fillable bids.  The mint amount is
     // capped by the minimum sellable depth across ALL losers (bottleneck).
+    // Also budget-capped to the best bids only (same `top_*` reasoning).
     let mut min_loser_sellable = Decimal::MAX;
     let mut total_sell_revenue = Decimal::ZERO;
     let mut loser_sell_plans: Vec<(String, Decimal, Decimal)> = Vec::new(); // (token_id, shares, best_bid)
@@ -1650,15 +2307,15 @@ async fn api_harvest(
         if i == req.winner_idx {
             continue;
         }
-        if info.sellable_shares == Decimal::ZERO || info.best_bid.is_none() {
+        if info.top_sellable_shares == Decimal::ZERO || info.best_bid.is_none() {
             has_loser_bids = false;
             break;
         }
-        min_loser_sellable = min_loser_sellable.min(info.sellable_shares);
-        total_sell_revenue += info.sellable_revenue;
+        min_loser_sellable = min_loser_sellable.min(info.top_sellable_shares);
+        total_sell_revenue += info.top_sellable_revenue;
         loser_sell_plans.push((
             info.token_id.clone(),
-            info.sellable_shares,
+            info.top_sellable_shares,
             info.best_bid.unwrap(),
         ));
     }
@@ -1681,10 +2338,28 @@ async fn api_harvest(
         Decimal::ZERO
     };
 
-    // ── 3b. SAFETY: enforce spending limits ─────────────────────────────
-    // Total cost of this trade = buy_cost + mint_amount
+    // ── 3a. STRATEGY OVERRIDE ────────────────────────────────────────────
+    // If the caller explicitly asked for one strategy via the preview UI,
+    // zero out the other side here. This sidesteps the legacy "prioritise
+    // mint, fill buy with remainder" allocator — the user has already
+    // seen both numbers and made the call.
     let mut capped_buy_cost = buy_cost;
     let mut capped_buy_shares = buy_shares;
+    match req.strategy.as_deref() {
+        Some("buy") => {
+            mint_amount = Decimal::ZERO;
+            loser_sell_plans.clear();
+            total_sell_revenue = Decimal::ZERO;
+        }
+        Some("mint") => {
+            capped_buy_cost = Decimal::ZERO;
+            capped_buy_shares = Decimal::ZERO;
+        }
+        _ => {} // None → legacy auto-allocate (handled below)
+    }
+
+    // ── 3b. SAFETY: enforce spending limits ─────────────────────────────
+    // Total cost of this trade = buy_cost + mint_amount
 
     // Cap per-trade spend
     let total_raw_cost = capped_buy_cost + mint_amount;
@@ -1796,6 +2471,12 @@ async fn api_harvest(
     let mut actual_mint_cost = Decimal::ZERO;
     let mut actual_sell_revenue = Decimal::ZERO;
     let mut total_gas_matic = Decimal::ZERO;
+
+    // When a mint succeeds, we immediately persist a provisional entry so
+    // the trade is recorded on disk even if the subsequent sell/buy phases
+    // fail or the handler crashes. `provisional_idx` is the position in
+    // state.activity of that entry; we mutate it as phases complete.
+    let mut provisional_idx: Option<usize> = None;
 
     // The outer `state.api` gate stays — we still need ClobApiClient for the
     // balance check earlier. Order placement uses `state.order_client` instead.
@@ -1909,6 +2590,27 @@ async fn api_harvest(
                         tx.tx_hash, tx.gas_cost_matic
                     ));
 
+                    // Persist a provisional entry IMMEDIATELY after mint so
+                    // the on-chain action is recorded even if subsequent code
+                    // fails or the handler task is cancelled. We mutate this
+                    // entry as sell/buy phases finish via `update_entry_at`.
+                    let provisional = ActivityEntry {
+                        time: now.clone(),
+                        market: req.market_question.clone(),
+                        outcome: req.label.clone(),
+                        strategy: strategy.clone(),
+                        buy_shares: buy_shares.to_string(),
+                        buy_cost: format!("{:.4}", buy_cost),
+                        mint_cost: format!("{:.4}", actual_mint_cost),
+                        sell_revenue: format!("{:.4}", actual_sell_revenue),
+                        net_profit: "0.0000".to_string(),
+                        status: status_parts.join(" | "),
+                        condition_id: market.condition_id.clone(),
+                        gas_matic: format!("{}", total_gas_matic),
+                        date: Utc::now().format("%Y-%m-%d").to_string(),
+                    };
+                    provisional_idx = Some(record_provisional(&state, provisional).await);
+
                     // Sell each loser outcome's tokens via limit orders.
                     // Orders are built + EIP-712 signed through the SDK-backed
                     // `order_client` — the bare HMAC `api.place_order` path
@@ -1983,15 +2685,35 @@ async fn api_harvest(
                                     status_parts.push(err);
                                 }
                             }
+
+                            // Update the provisional entry after each sell so
+                            // partial progress is durably recorded.
+                            if let Some(idx) = provisional_idx {
+                                let status = status_parts.join(" | ");
+                                let rev = actual_sell_revenue;
+                                update_entry_at(&state, idx, move |e| {
+                                    e.sell_revenue = format!("{:.4}", rev);
+                                    e.status = status;
+                                })
+                                .await;
+                            }
                         }
                     } else {
                         status_parts
                             .push("SELL SKIP: order_client not initialized".to_string());
+                        if let Some(idx) = provisional_idx {
+                            let status = status_parts.join(" | ");
+                            update_entry_at(&state, idx, move |e| {
+                                e.status = status;
+                            })
+                            .await;
+                        }
                     }
                 }
                 Err(e) => {
                     status_parts.push(format!("MINT FAIL: {e}"));
-                    // Fall through — still try direct buy below
+                    // Fall through — still try direct buy below. No provisional
+                    // entry is written because nothing landed on-chain.
                 }
             }
         }
@@ -2002,8 +2724,6 @@ async fn api_harvest(
         if buy_shares > Decimal::ZERO {
             let Some(order_client) = state.order_client.as_ref() else {
                 status_parts.push("BUY SKIP: order_client not initialized".to_string());
-                // Record the partial result and return
-                // (mint may still have happened)
                 let entry = ActivityEntry {
                     time: now,
                     market: req.market_question,
@@ -2019,7 +2739,15 @@ async fn api_harvest(
                     gas_matic: format!("{}", total_gas_matic),
                     date: Utc::now().format("%Y-%m-%d").to_string(),
                 };
-                persist_and_record(&state, entry.clone()).await;
+                // If a provisional was written during mint, update it in place.
+                // Otherwise append a new entry.
+                match provisional_idx {
+                    Some(idx) => {
+                        let to_write = entry.clone();
+                        update_entry_at(&state, idx, move |e| *e = to_write).await;
+                    }
+                    None => persist_and_record(&state, entry.clone()).await,
+                }
                 return Json(serde_json::json!({"ok": false, "entry": entry})).into_response();
             };
 
@@ -2081,14 +2809,12 @@ async fn api_harvest(
         status_parts.push("PAPER — no orders placed".to_string());
     }
 
-    // ── 6. Compute net profit and log ───────────────────────────────────
-    // net_profit = buy_profit + (sell_revenue - mint_cost + mint_amount_as_winner_value)
-    // Since minted winners are worth $1 each at resolution:
-    //   mint+sell profit = sell_revenue (losers) + mint_amount (winner value) - mint_amount (cost) = sell_revenue
-    // Plus direct buy profit from the ask sweep:
+    // ── 6. Compute net profit and finalize log entry ────────────────────
+    // net_profit = buy_profit + sell_revenue (minted winners retained are
+    // worth the mint cost at resolution, so mint+sell profit = sell_revenue).
     let net_profit = buy_profit + actual_sell_revenue;
 
-    let entry = ActivityEntry {
+    let final_entry = ActivityEntry {
         time: now,
         market: req.market_question,
         outcome: req.label.clone(),
@@ -2111,22 +2837,22 @@ async fn api_harvest(
         spend_log.push((Utc::now(), total_spent));
     }
 
-    // Persist to trade log file (append, one JSON line per trade)
-    if let Ok(mut f) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("harvester_trades.jsonl")
-        .await
-    {
-        use tokio::io::AsyncWriteExt;
-        let line = serde_json::to_string(&entry).unwrap_or_default();
-        let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
-    }
+    // Persist: if a provisional entry was written after the mint, update it
+    // in place with the final state. Otherwise (no mint happened — buy-only
+    // or paper mode) append a fresh entry.
+    let returned_entry = match provisional_idx {
+        Some(idx) => {
+            let to_write = final_entry.clone();
+            update_entry_at(&state, idx, move |e| *e = to_write).await;
+            final_entry
+        }
+        None => {
+            persist_and_record(&state, final_entry.clone()).await;
+            final_entry
+        }
+    };
 
-    let mut activity = state.activity.write().await;
-    activity.push(entry.clone());
-
-    Json(serde_json::json!({"ok": true, "entry": entry})).into_response()
+    Json(serde_json::json!({"ok": true, "entry": returned_entry})).into_response()
 }
 
 // ─── WebSocket book streaming ────────────────────────────────────────────────
@@ -2242,7 +2968,7 @@ async fn build_book_payload(
             .fetch_rest_book(&state.clob_url, token_id)
             .await;
         let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade),
             None => OutcomeInfo {
                 label: label.clone(),
                 token_id: token_id.clone(),
@@ -2253,6 +2979,13 @@ async fn build_book_payload(
                 best_bid: None,
                 sellable_shares: Decimal::ZERO,
                 sellable_revenue: Decimal::ZERO,
+                top_shares: Decimal::ZERO,
+                top_cost: Decimal::ZERO,
+                top_profit: Decimal::ZERO,
+                top_avg_ask: None,
+                top_sellable_shares: Decimal::ZERO,
+                top_sellable_revenue: Decimal::ZERO,
+                top_avg_bid: None,
             },
         };
         outcomes.push(info);
@@ -2280,7 +3013,7 @@ fn build_book_payload_from_store(
             .unwrap_or_else(|| format!("Outcome {}", i));
         let book = state.book_store.get_book(token_id);
         let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell),
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade),
             None => OutcomeInfo {
                 label: label.clone(),
                 token_id: token_id.clone(),
@@ -2291,6 +3024,13 @@ fn build_book_payload_from_store(
                 best_bid: None,
                 sellable_shares: Decimal::ZERO,
                 sellable_revenue: Decimal::ZERO,
+                top_shares: Decimal::ZERO,
+                top_cost: Decimal::ZERO,
+                top_profit: Decimal::ZERO,
+                top_avg_ask: None,
+                top_sellable_shares: Decimal::ZERO,
+                top_sellable_revenue: Decimal::ZERO,
+                top_avg_bid: None,
             },
         };
         outcomes.push(info);
@@ -3294,6 +4034,63 @@ async fn fetch_obs_block_for_event(
     None
 }
 
+/// Convenience wrapper used by the paper-trade save/load paths: given a
+/// Polymarket event slug, fetch the event, extract its resolution URL,
+/// and delegate to [`fetch_obs_block_for_event`]. Returns `None` if the
+/// event can't be fetched, has no resolution source, or the downstream
+/// fetch fails. Lat/lon are left as `None` — the METAR path keyed on
+/// the resolution URL's ICAO is sufficient for every weather market
+/// we currently trade.
+async fn fetch_obs_for_slug(
+    http: &reqwest::Client,
+    gamma_url: &str,
+    market_slug: &str,
+    target_date_str: Option<&str>,
+    unit_str: &str,
+) -> Option<ObservationsBlock> {
+    let url = format!("{gamma_url}/events/slug/{market_slug}");
+    let event: serde_json::Value = match http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.ok()?,
+        _ => return None,
+    };
+    fetch_obs_for_event_json(http, &event, target_date_str, unit_str).await
+}
+
+/// Like [`fetch_obs_for_slug`] but reuses a cached event JSON blob — the
+/// path taken by `/api/paper-trades` where the same event is already
+/// fetched for resolution detection.
+async fn fetch_obs_for_event_json(
+    http: &reqwest::Client,
+    event: &serde_json::Value,
+    target_date_str: Option<&str>,
+    unit_str: &str,
+) -> Option<ObservationsBlock> {
+    let resolution_url = event
+        .get("resolutionSource")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if resolution_url.is_empty() {
+        return None;
+    }
+    let target_date = target_date_str
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+    let unit = if unit_str.contains("°F") || unit_str.eq_ignore_ascii_case("f") {
+        surebet::weather::TemperatureUnit::Fahrenheit
+    } else {
+        surebet::weather::TemperatureUnit::Celsius
+    };
+    fetch_obs_block_for_event(
+        http,
+        resolution_url,
+        target_date,
+        None,
+        None,
+        unit,
+        chrono::Utc::now(),
+    )
+    .await
+}
+
 /// Parse a Polymarket weather event title like "Highest temperature in London on April 14?"
 /// into (measure, city). Returns None if the title doesn't match the expected pattern.
 fn parse_weather_event_title(title: &str) -> Option<(TemperatureMeasure, String)> {
@@ -3773,7 +4570,7 @@ struct ObsBracketJson {
     profit_per_share: Option<f64>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct ObservationsBlock {
     max_so_far: f64,
     min_so_far: f64,
@@ -4336,6 +5133,12 @@ struct PaperTrade {
     /// For resolved trades: the bracket label that won (if any leg won).
     #[serde(default)]
     winning_bracket: Option<String>,
+    /// Snapshot of the station's running max/min/current reading at the
+    /// moment this trade was created. Lets the trades page show what the
+    /// weather looked like when the trigger was pulled. `None` for
+    /// trades saved before this field existed.
+    #[serde(default)]
+    obs_at_buy: Option<ObservationsBlock>,
 }
 
 #[derive(Deserialize)]
@@ -4370,6 +5173,24 @@ async fn api_save_paper_trade(
         )
             .into_response();
     }
+
+    // Snapshot the station's running observations at trade-creation
+    // time. Best-effort: a failure here just leaves `obs_at_buy = None`
+    // (trades saved before this field existed look the same). No user-
+    // visible error on the save path.
+    let obs_snapshot_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+    let obs_at_buy = fetch_obs_for_slug(
+        &obs_snapshot_http,
+        &state.gamma_url,
+        &req.market_slug,
+        req.target_date.as_deref(),
+        &req.unit,
+    )
+    .await;
 
     let is_live = req.mode == "live";
 
@@ -4472,6 +5293,7 @@ async fn api_save_paper_trade(
             realized_pnl: None,
             closed_at: None,
             winning_bracket: None,
+            obs_at_buy: obs_at_buy.clone(),
         };
         if let Err(e) = persist_trade(&trade).await {
             return (
@@ -4512,6 +5334,7 @@ async fn api_save_paper_trade(
         realized_pnl: None,
         closed_at: None,
         winning_bracket: None,
+        obs_at_buy,
     };
 
     if let Err(e) = persist_trade(&trade).await {
@@ -4709,6 +5532,16 @@ struct PaperTradeWithPnl {
     /// - "exit_opportunity": `current_sell_revenue > total_cost` — you can sell now for locked profit
     /// - "open":             still waiting on resolution, sell-now would lose
     live_status: String,
+    /// % return if any leg wins at resolution: `profit_if_any_leg_wins /
+    /// total_cost * 100`. `None` for zero-cost trades (shouldn't happen).
+    win_return_pct: Option<f64>,
+    /// % return if exited immediately at current bids: `unrealized_pnl /
+    /// total_cost * 100`. `None` for closed trades.
+    exit_return_pct: Option<f64>,
+    /// Current observation snapshot (max / min / current) for open trades,
+    /// same shape as `trade.obs_at_buy`. `None` for closed trades or when
+    /// the upstream observation provider fails.
+    current_obs: Option<ObservationsBlock>,
 }
 
 async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
@@ -4813,7 +5646,9 @@ async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
     for t in trades {
         let mut current_bids: Vec<Option<f64>> = Vec::new();
         let mut current_sell_revenue = 0.0_f64;
-        // Only fetch live bids for open trades — closed/resolved don't need them.
+        let mut current_obs: Option<ObservationsBlock> = None;
+        // Only fetch live bids + observations for open trades — closed/
+        // resolved trades freeze at their close snapshot.
         if t.status == "open" {
             for leg in &t.legs {
                 let bid = fetch_best_bid(&http, &state.clob_url, &leg.token_id).await;
@@ -4821,6 +5656,16 @@ async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
                     current_sell_revenue += b * leg.shares;
                 }
                 current_bids.push(bid);
+            }
+            // Reuse the event we already fetched for resolution detection.
+            if let Some(Some(event)) = event_cache.get(&t.market_slug) {
+                current_obs = fetch_obs_for_event_json(
+                    &http,
+                    event,
+                    t.target_date.as_deref(),
+                    &t.unit,
+                )
+                .await;
             }
         } else {
             current_bids = t.legs.iter().map(|_| None).collect();
@@ -4837,6 +5682,16 @@ async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
             "open" if unrealized_pnl > 0.0 => "exit_opportunity".to_string(),
             other => other.to_string(),
         };
+        let win_return_pct = if t.total_cost > 0.0 {
+            Some(profit_if_any_leg_wins / t.total_cost * 100.0)
+        } else {
+            None
+        };
+        let exit_return_pct = if t.total_cost > 0.0 && t.status == "open" {
+            Some(unrealized_pnl / t.total_cost * 100.0)
+        } else {
+            None
+        };
         enriched.push(PaperTradeWithPnl {
             trade: t,
             current_bids,
@@ -4846,6 +5701,9 @@ async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
             profit_if_any_leg_wins,
             loss_if_all_legs_lose,
             live_status,
+            win_return_pct,
+            exit_return_pct,
+            current_obs,
         });
     }
 
@@ -4975,6 +5833,32 @@ async function load() {
     const modeTag = (t.mode === 'live')
       ? `<span style="background:#da3633;color:white;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em;font-weight:600">LIVE</span>`
       : `<span style="background:#1f2933;color:#8b949e;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">PAPER</span>`;
+
+    // Observations block. `obs_at_buy` is frozen at trade creation, so
+    // it's present on any trade that saved after the feature shipped;
+    // `current_obs` is the live reading fetched on this page load.
+    const unitSym = (t.unit || '').includes('F') ? '°F' : '°C';
+    const fmtObs = (o) => o == null
+      ? '—'
+      : `max <b>${o.max_so_far.toFixed(1)}${unitSym}</b> · min <b>${o.min_so_far.toFixed(1)}${unitSym}</b> · now <b>${o.current.toFixed(1)}${unitSym}</b>`;
+    const hasAnyObs = t.obs_at_buy != null || t.current_obs != null;
+    const obsBlock = !hasAnyObs ? '' : `
+      <div style="display:flex;gap:2em;font-size:0.85em;margin:0.4em 0;flex-wrap:wrap;color:#8b949e">
+        ${t.obs_at_buy != null ? `<div>At buy: ${fmtObs(t.obs_at_buy)}</div>` : ''}
+        ${isOpen && t.current_obs != null ? `<div>Now: ${fmtObs(t.current_obs)}</div>` : ''}
+      </div>`;
+
+    // % return line. Win% always shown; Exit% only when open.
+    const winPct = t.win_return_pct;
+    const exitPct = t.exit_return_pct;
+    const exitCls = (exitPct != null && exitPct >= 0) ? 'pnl-pos' : 'pnl-neg';
+    const exitSign = (exitPct != null && exitPct >= 0) ? '+' : '';
+    const pctLine = `
+      <div style="display:flex;gap:2em;font-size:0.9em;margin:0.4em 0;flex-wrap:wrap">
+        ${winPct != null ? `<div>Win return: <b class="pnl-pos">+${winPct.toFixed(1)}%</b></div>` : ''}
+        ${isOpen && exitPct != null ? `<div>Sell-now return: <b class="${exitCls}">${exitSign}${exitPct.toFixed(1)}%</b></div>` : ''}
+      </div>`;
+
     return `<div class="trade" style="${cardBorder}${!isOpen ? ';opacity:0.75' : ''}">
       <div class="trade-title" style="display:flex;align-items:center;gap:0.5em">
         <span>${t.market_question}</span>
@@ -4986,6 +5870,7 @@ async function load() {
       <div class="trade-sub">Entered ${created} · Model P(win at entry) ${modelProb}</div>
       ${closedBlock}
       ${isOpen ? exitBanner : ''}
+      ${obsBlock}
       <div style="display:flex;gap:2em;font-size:0.9em;margin:0.5em 0;flex-wrap:wrap">
         <div>Cost: <b>$${t.total_cost.toFixed(2)}</b></div>
         <div>Max payout (any leg wins): <b>$${t.max_payout_at_resolution.toFixed(2)}</b></div>
@@ -4994,6 +5879,7 @@ async function load() {
         ${isOpen ? `<div>Sell-now revenue: <b>$${t.current_sell_revenue.toFixed(2)}</b></div>
         <div>Sell-now P&amp;L: <b class="${pnlClass}">${sign}$${t.unrealized_pnl.toFixed(2)}</b></div>` : ''}
       </div>
+      ${pctLine}
       <table>
         <tr><th>Bracket</th><th>Shares</th><th>Ask at buy</th><th>Model P</th><th>Leg cost</th><th>Current bid</th><th>Leg sell-now P&amp;L</th></tr>
         ${legsHtml}
@@ -5065,6 +5951,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
           <div class="stat-card"><div class="slabel">Gas (MATIC)</div><div class="sval" style="color:#f39c12">{gas}</div></div>
           <div class="stat-card"><div class="slabel">Gas (USDC)</div><div class="sval" style="color:#f39c12">${gas_usdc:.4}</div></div>
           <div class="stat-card"><div class="slabel">Net P&amp;L (after gas)</div><div class="sval" style="color:{net_color}">${net:.4}</div></div>
+          <div class="stat-card" title="Net P&amp;L after gas divided by capital deployed (total buy + mint)"><div class="slabel">Total Return %</div><div class="sval" style="color:{ret_color}">{ret_str}</div></div>
         </div>"##,
         total = stats.total_entries,
         success = stats.successful_trades,
@@ -5079,15 +5966,31 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
         gas_usdc = stats.total_gas_usdc,
         net = stats.net_pnl_after_gas,
         net_color = if stats.net_pnl_after_gas > Decimal::ZERO { "#2ecc71" } else { "#e74c3c" },
+        ret_str = stats
+            .total_return_pct
+            .map(|v| {
+                let sign = if v > Decimal::ZERO { "+" } else { "" };
+                format!("{sign}{v}%")
+            })
+            .unwrap_or_else(|| "—".to_string()),
+        ret_color = match stats.total_return_pct {
+            Some(v) if v > Decimal::ZERO => "#2ecc71",
+            Some(v) if v < Decimal::ZERO => "#e74c3c",
+            _ => "#8b949e",
+        },
         positions = positions.len(),
     );
 
-    // Positions table
+    // Positions table — sourced from the Polymarket Data API so it reflects
+    // ALL holdings (CLOB buys + mints + neg-risk markets), not just locally
+    // tracked mints.
     let positions_rows: String = if positions.is_empty() {
-        r#"<tr><td colspan="7" style="text-align:center;color:#666">No open positions on-chain</td></tr>"#.to_string()
+        r#"<tr><td colspan="10" style="text-align:center;color:#666">No open positions for this wallet (or wallet not configured — needs --live + POLYMARKET_PRIVATE_KEY)</td></tr>"#.to_string()
     } else {
         positions.iter().map(|p| {
-            // Merge button: only when both sides held
+            // ── Action buttons ───────────────────────────────────────────
+            // Merge: only valid for binary CTF where we hold both sides.
+            // The compute step already gates `mergeable` on !neg_risk.
             let merge_btn = if p.mergeable {
                 let amt = p.yes_tokens.min(p.no_tokens);
                 format!(
@@ -5095,17 +5998,26 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                     p.condition_id, amt, p.market.replace('\'', "\\'")
                 )
             } else {
-                "—".to_string()
+                String::new()
             };
 
-            // Redeem button: only enabled when CTF says the market is resolved
+            // Redeem: routes to the right contract path based on neg_risk.
+            // For neg-risk we pass the held YES + NO sizes so the adapter
+            // knows which side to claim.
             let redeem_btn = if p.redeemable {
-                format!(
-                    r#"<button class="action-btn redeem-btn" onclick="recoverPosition('{}','','{}','redeem')">Redeem</button>"#,
-                    p.condition_id, p.market.replace('\'', "\\'")
-                )
+                if p.neg_risk {
+                    format!(
+                        r#"<button class="action-btn redeem-btn" onclick="recoverNegRisk('{}','{}','{}','{}')">Redeem</button>"#,
+                        p.condition_id, p.yes_tokens, p.no_tokens, p.market.replace('\'', "\\'")
+                    )
+                } else {
+                    format!(
+                        r#"<button class="action-btn redeem-btn" onclick="recoverPosition('{}','','{}','redeem')">Redeem</button>"#,
+                        p.condition_id, p.market.replace('\'', "\\'")
+                    )
+                }
             } else {
-                r#"<button class="action-btn" disabled title="Market not resolved yet" style="opacity:0.4;cursor:not-allowed">Redeem</button>"#.to_string()
+                r#"<button class="action-btn" disabled title="Market not resolved yet (or you don't hold winning tokens)" style="opacity:0.4;cursor:not-allowed">Redeem</button>"#.to_string()
             };
 
             // Resolution status badge
@@ -5113,36 +6025,76 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 "unresolved" => ("unresolved", "#8b949e"),
                 "resolved-yes" => ("RESOLVED → YES", "#2ecc71"),
                 "resolved-no" => ("RESOLVED → NO", "#e74c3c"),
+                "resolved" => ("RESOLVED", "#2ecc71"),
                 _ => (p.resolution.as_str(), "#f39c12"),
             };
 
+            // Type badge: distinguishes neg-risk (multi-outcome) markets
+            // from standard binary CTF, since their merge/redeem paths
+            // differ on-chain.
+            let type_badge = if p.neg_risk {
+                r#"<span style="background:#6e40c9;color:#fff;padding:2px 6px;border-radius:3px;font-size:0.7em">NEG-RISK</span>"#
+            } else {
+                r#"<span style="background:#1f6feb;color:#fff;padding:2px 6px;border-radius:3px;font-size:0.7em">BINARY</span>"#
+            };
+
+            // If the upstream query errored, show a warning overlay rather
+            // than silently dropping the row.
+            let (yes_display, no_display, row_style) = if let Some(err) = &p.error {
+                let tooltip = err.replace('"', "&quot;");
+                (
+                    format!(r#"<span title="{}" style="color:#f39c12">?</span>"#, tooltip),
+                    format!(r#"<span title="{}" style="color:#f39c12">?</span>"#, tooltip),
+                    r#" style="background:#2d1f0d""#,
+                )
+            } else {
+                (p.yes_tokens.to_string(), p.no_tokens.to_string(), "")
+            };
+
+            // P&L color: green if positive, red if negative, grey if flat.
+            let pnl_color = if p.cash_pnl > Decimal::ZERO {
+                "#2ecc71"
+            } else if p.cash_pnl < Decimal::ZERO {
+                "#e74c3c"
+            } else {
+                "#8b949e"
+            };
+
             format!(
-                r#"<tr>
+                r#"<tr{row_style}>
                   <td class="pos-market-cell" title="{cid}">{market}</td>
-                  <td>{winner}</td>
+                  <td>{type_badge}</td>
                   <td>{yes}</td>
                   <td>{no}</td>
+                  <td>${value:.4}</td>
+                  <td style="color:{pnl_color}">${pnl:.4}</td>
                   <td><span style="color:{rcol}">{rlabel}</span></td>
                   <td>{tl}</td>
-                  <td>{merge} {redeem}</td>
+                  <td>{merge}{sep}{redeem}</td>
                 </tr>"#,
+                row_style = row_style,
                 cid = p.condition_id,
                 market = p.market,
-                winner = p.winner_label,
-                yes = p.yes_tokens,
-                no = p.no_tokens,
+                type_badge = type_badge,
+                yes = yes_display,
+                no = no_display,
+                value = p.current_value,
+                pnl = p.cash_pnl,
+                pnl_color = pnl_color,
                 rcol = res_color,
                 rlabel = res_label,
                 tl = p.time_left,
                 merge = merge_btn,
+                sep = if !merge_btn.is_empty() { " " } else { "" },
                 redeem = redeem_btn,
             )
         }).collect()
     };
 
     // Activity log table
+    let matic_usd = state.matic_usd_price;
     let activity_rows: String = if activity_snap.is_empty() {
-        r#"<tr><td colspan="11" style="text-align:center;color:#666">No activity yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="12" style="text-align:center;color:#666">No activity yet</td></tr>"#.to_string()
     } else {
         activity_snap.iter().rev().take(100).map(|a| {
             let status_color = if a.status.contains("OK") {
@@ -5154,6 +6106,33 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
             };
             let profit_val: f64 = a.net_profit.parse().unwrap_or(0.0);
             let profit_color = if profit_val > 0.0 { "#2ecc71" } else { "#8b949e" };
+
+            // Net return % = (net_profit − gas_usdc) / capital_deployed × 100.
+            // Capital deployed = buy_cost + mint_cost. MERGE/REDEEM are
+            // recovery actions with no cost basis — display "—".
+            let gas_matic_dec = Decimal::from_str(&a.gas_matic).unwrap_or(Decimal::ZERO);
+            let gas_usdc_dec = gas_matic_dec * matic_usd;
+            let buy_cost_dec = Decimal::from_str(&a.buy_cost).unwrap_or(Decimal::ZERO);
+            let mint_cost_dec = Decimal::from_str(&a.mint_cost).unwrap_or(Decimal::ZERO);
+            let capital_dec = buy_cost_dec + mint_cost_dec;
+            let net_pct_cell = if a.strategy == "MERGE" || a.strategy == "REDEEM" || capital_dec <= Decimal::ZERO {
+                r#"<td style="color:#8b949e">—</td>"#.to_string()
+            } else {
+                let net_profit_dec = Decimal::from_str(&a.net_profit).unwrap_or(Decimal::ZERO);
+                let net_after_gas = net_profit_dec - gas_usdc_dec;
+                let pct = (net_after_gas * Decimal::ONE_HUNDRED) / capital_dec;
+                let (sign, cls) = if net_after_gas > Decimal::ZERO {
+                    ("+", "#2ecc71")
+                } else if net_after_gas < Decimal::ZERO {
+                    ("", "#e74c3c")
+                } else {
+                    ("", "#8b949e")
+                };
+                format!(
+                    r#"<td style="color:{}" title="({}. − gas ${:.4}) / ${} capital deployed">{}{:.2}%</td>"#,
+                    cls, a.net_profit, gas_usdc_dec, capital_dec, sign, pct,
+                )
+            };
             // Recovery buttons for stuck mint trades
             let is_stuck = a.status.contains("MINT OK")
                 && (a.status.contains("SELL ERR") || a.status.contains("SELL FAIL"))
@@ -5206,7 +6185,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
             };
 
             format!(
-                r#"<tr><td>{date} {time}</td><td class="market-cell" title="{market_full}">{market}</td><td>{outcome}</td><td>{strategy}</td><td>{shares}</td><td>{cost}</td><td>{sm}</td><td style="color:{pcol}">{profit}</td><td>{gas}</td><td style="color:{scol};max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{stitle}">{status}</td><td>{actions}</td></tr>"#,
+                r#"<tr><td>{date} {time}</td><td class="market-cell" title="{market_full}">{market}</td><td>{outcome}</td><td>{strategy}</td><td>{shares}</td><td>{cost}</td><td>{sm}</td><td style="color:{pcol}">{profit}</td>{net_pct}<td>{gas}</td><td style="color:{scol};max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{stitle}">{status}</td><td>{actions}</td></tr>"#,
                 date = a.date,
                 time = a.time,
                 market_full = a.market.replace('"', "&quot;"),
@@ -5222,6 +6201,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 },
                 pcol = profit_color,
                 profit = a.net_profit,
+                net_pct = net_pct_cell,
                 gas = gas_display,
                 scol = status_color,
                 stitle = a.status.replace('"', "&quot;"),
@@ -5286,9 +6266,9 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
 <h2>Stats</h2>
 {stats_html}
 
-<h2>Open Positions <span style="color:#666;font-size:0.8em">(on-chain)</span></h2>
+<h2>Open Positions <span style="color:#666;font-size:0.8em">(Polymarket Data API — covers CLOB buys, mints, and neg-risk markets)</span></h2>
 <table>
-  <tr><th>Market</th><th>Winner</th><th>YES</th><th>NO</th><th>Resolution</th><th>Time Left</th><th>Actions</th></tr>
+  <tr><th>Market</th><th>Type</th><th>YES</th><th>NO</th><th>Value</th><th>P&amp;L</th><th>Resolution</th><th>Time Left</th><th>Actions</th></tr>
   {positions_rows}
 </table>
 
@@ -5305,7 +6285,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
 
 <h2>Activity Log</h2>
 <table>
-  <tr><th>When</th><th>Market</th><th>Outcome</th><th>Strategy</th><th>Shares</th><th>Buy Cost</th><th>Sell/Mint</th><th>Net Profit</th><th>Gas</th><th>Status</th><th>Actions</th></tr>
+  <tr><th>When</th><th>Market</th><th>Outcome</th><th>Strategy</th><th>Shares</th><th>Buy Cost</th><th>Sell/Mint</th><th>Net Profit</th><th title="(net_profit − gas_usdc) / (buy_cost + mint_cost) × 100">Net % <span style="color:#8b949e;font-weight:normal">(after gas)</span></th><th>Gas</th><th>Status</th><th>Actions</th></tr>
   {activity_rows}
 </table>
 
@@ -5330,6 +6310,36 @@ async function recoverPosition(conditionId, amount, market, action) {{
       location.reload();
     }} else {{
       alert(verb.toUpperCase() + ' failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
+      if (data.entry) location.reload();
+    }}
+  }} catch (e) {{
+    alert('Request failed: ' + e);
+  }}
+}}
+
+// Neg-risk markets need per-outcome amounts ([yesAmount, noAmount]) and a
+// different contract entry point. Routes to /api/redeem-neg-risk.
+async function recoverNegRisk(conditionId, yesAmount, noAmount, market) {{
+  const body = {{
+    condition_id: conditionId,
+    yes_amount: yesAmount || '0',
+    no_amount: noAmount || '0',
+    market: market,
+  }};
+  const desc = `Redeem neg-risk position in "${{market}}"?\n\n  YES tokens to redeem: ${{yesAmount || 0}}\n  NO  tokens to redeem: ${{noAmount || 0}}\n\nThis is irreversible.`;
+  if (!confirm(desc)) return;
+  try {{
+    const resp = await fetch('/api/redeem-neg-risk', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    const data = await resp.json();
+    if (data.ok) {{
+      alert('REDEEM (neg-risk) OK\n\n' + (data.entry ? data.entry.status : ''));
+      location.reload();
+    }} else {{
+      alert('REDEEM (neg-risk) failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
       if (data.entry) location.reload();
     }}
   }} catch (e) {{
@@ -5557,6 +6567,15 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
 </style>
 </head>
 <body>
+<!-- Strategy picker shown after clicking "Select Winner". Hidden by default.
+     Two cards side-by-side: direct buy vs mint+sell. Each shows the budget-
+     capped projection; clicking a card's Execute button posts /api/harvest
+     with an explicit strategy field. -->
+<div id="strategy-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1.5em;max-width:760px;width:92%;max-height:90vh;overflow-y:auto">
+    <div id="strategy-modal-body"></div>
+  </div>
+</div>
 <div class="dashboard-wrap">
 <div class="main-col">
 <h1>Harvester Dashboard</h1>
@@ -5838,6 +6857,26 @@ function renderOutcomes(idx, data) {{
     const profitColor = combined > 0 ? '#2ecc71' : '#8b949e';
     const sellDetail = sellRev > 0 ? ` <span style="color:#8b949e;font-size:0.8em">+ $${{sellRev.toFixed(4)}} sell losers</span>` : '';
     const hasOpp = parseFloat(buyShares) > 0 || sellRev > 0;
+
+    // Capital-capped "top of book" view. Shows what your per-trade USDC
+    // budget actually fills at — walks only the best ladder levels, so
+    // the avg price tends to be much closer to top-of-book than the
+    // full sweep average. Usually the realistic number for a real trade.
+    const topCost = parseFloat(info.top_cost) || 0;
+    const topProfit = parseFloat(info.top_profit) || 0;
+    const topShares = parseFloat(info.top_shares) || 0;
+    const topAvgAsk = info.top_avg_ask != null ? parseFloat(info.top_avg_ask) : null;
+    const topPct = topCost > 0 ? ((topProfit / topCost) * 100).toFixed(2) + '%' : '-';
+    let topSellRev = 0;
+    for (let j = 0; j < n; j++) {{
+      if (j !== oi) topSellRev += parseFloat(outcomes[j].top_sellable_revenue) || 0;
+    }}
+    const topCombined = topProfit + topSellRev;
+    const topColor = topCombined > 0 ? '#2ecc71' : '#8b949e';
+    const topSellDetail = topSellRev > 0 ? ` <span style="color:#8b949e;font-size:0.8em">+ $${{topSellRev.toFixed(4)}} sell losers</span>` : '';
+    const topSharesStr = topShares > 0 ? topShares.toFixed(1) : '0';
+    const topAvgAskStr = topAvgAsk != null ? topAvgAsk.toFixed(3) : '-';
+
     // Use data attributes to avoid quote-escaping issues in onclick
     const btn = hasOpp
       ? `<button class="harvest-btn" data-token="${{info.token_id}}" data-oi="${{oi}}" data-idx="${{idx}}">Select Winner</button>`
@@ -5851,6 +6890,15 @@ function renderOutcomes(idx, data) {{
       <span class="outcome-cost">$${{buyCost.toFixed(4)}}</span>
       <span class="outcome-profit" style="color:${{profitColor}}">$${{combined.toFixed(4)}} (${{buyPct}})${{sellDetail}}</span>
       ${{btn}}
+    </div>
+    <div class="outcome-row" style="padding-top:1px;border-top:none;font-size:0.82em;color:#8b949e">
+      <span class="outcome-label" style="opacity:0.6">↳ top ${{topSharesStr}} sh @ avg $${{topAvgAskStr}}</span>
+      <span></span>
+      <span></span>
+      <span></span>
+      <span class="outcome-cost">$${{topCost.toFixed(4)}}</span>
+      <span class="outcome-profit" style="color:${{topColor}}">$${{topCombined.toFixed(4)}} (${{topPct}})${{topSellDetail}}</span>
+      <span></span>
     </div>`;
   }}
 
@@ -5871,13 +6919,118 @@ function renderOutcomes(idx, data) {{
 }}
 
 // ── Harvest ────────────────────────────────────────────────────────────
+// Two-step flow: preview shows both strategies, user picks one,
+// then we execute.
 async function harvest(marketIdx, winnerIdx, label, question) {{
-  if (!confirm('Select "' + label + '" as winner for "' + question + '"?\n\nWill mint+sell losers if bids available, otherwise buy directly.')) return;
+  // 1. Fetch the preview
+  const previewResp = await fetch('/api/harvest-preview', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{
+      market_idx: marketIdx,
+      winner_idx: winnerIdx,
+      label: label,
+      market_question: question,
+    }}),
+  }});
+  const preview = await previewResp.json();
+  if (preview.error) {{
+    alert('Preview failed: ' + preview.error);
+    return;
+  }}
+
+  // 2. Build strategy cards and let the user pick
+  showStrategyModal(marketIdx, winnerIdx, label, question, preview);
+}}
+
+function showStrategyModal(marketIdx, winnerIdx, label, question, preview) {{
+  const modal = document.getElementById('strategy-modal');
+  const body = document.getElementById('strategy-modal-body');
+  const buy = preview.buy;
+  const mint = preview.mint;
+  const budget = preview.max_trade;
+
+  const buyShares = parseFloat(buy.shares) || 0;
+  const buyCost = parseFloat(buy.cost) || 0;
+  const buyProfit = parseFloat(buy.profit) || 0;
+  const buyPct = parseFloat(buy.profit_pct) || 0;
+  const buyAvg = buy.avg_price != null ? parseFloat(buy.avg_price) : null;
+
+  const mintAmount = parseFloat(mint.mint_amount) || 0;
+  const mintRev = parseFloat(mint.sell_revenue) || 0;
+  const mintProfit = parseFloat(mint.profit) || 0;
+  const mintPct = parseFloat(mint.profit_pct) || 0;
+
+  const buyCard = buy.available ? `
+    <div class="strategy-card" style="border:1px solid #30363d;padding:1em;border-radius:6px;min-width:280px;flex:1">
+      <div style="font-weight:600;font-size:1.05em;margin-bottom:0.5em">Direct buy</div>
+      <div style="color:#8b949e;font-size:0.85em;margin-bottom:0.5em">Sweep <b>${{label}}</b> asks up to $${{budget}}</div>
+      <div style="font-family:monospace;font-size:0.9em;line-height:1.6em">
+        <div>Shares: <b>${{buyShares.toFixed(2)}}</b></div>
+        <div>Avg ask: <b>$${{buyAvg != null ? buyAvg.toFixed(3) : '-'}}</b></div>
+        <div>Cost: <b>$${{buyCost.toFixed(4)}}</b></div>
+        <div>Profit if ${{label}} wins: <b class="pnl-pos">+$${{buyProfit.toFixed(4)}}</b></div>
+        <div>Return: <b class="pnl-pos">+${{buyPct.toFixed(2)}}%</b></div>
+      </div>
+      <button class="action-btn merge-btn" style="width:100%;margin-top:0.75em" onclick="executeHarvest(${{marketIdx}},${{winnerIdx}},'${{label.replace(/'/g,"\\\\'")}}',${{JSON.stringify(question).replace(/"/g,'&quot;')}},'buy')">Execute buy</button>
+    </div>` : `
+    <div class="strategy-card" style="border:1px solid #30363d;padding:1em;border-radius:6px;min-width:280px;flex:1;opacity:0.5">
+      <div style="font-weight:600;font-size:1.05em;margin-bottom:0.5em">Direct buy</div>
+      <div style="color:#8b949e;font-size:0.85em">No asks available for this outcome.</div>
+    </div>`;
+
+  const mintCard = mint.available ? `
+    <div class="strategy-card" style="border:1px solid #30363d;padding:1em;border-radius:6px;min-width:280px;flex:1">
+      <div style="font-weight:600;font-size:1.05em;margin-bottom:0.5em">Mint + sell losers</div>
+      <div style="color:#8b949e;font-size:0.85em;margin-bottom:0.5em">Split $${{mintAmount.toFixed(4)}} USDC → keep <b>${{label}}</b>, sell the other outcomes</div>
+      <div style="font-family:monospace;font-size:0.9em;line-height:1.6em">
+        <div>Mint amount: <b>$${{mintAmount.toFixed(4)}}</b></div>
+        <div>Sell-losers revenue: <b>$${{mintRev.toFixed(4)}}</b></div>
+        <div>Winner tokens kept: <b>${{mintAmount.toFixed(2)}}</b> (worth $${{mintAmount.toFixed(4)}} at resolution)</div>
+        <div>Profit if ${{label}} wins: <b class="pnl-pos">+$${{mintProfit.toFixed(4)}}</b></div>
+        <div>Return: <b class="pnl-pos">+${{mintPct.toFixed(2)}}%</b></div>
+      </div>
+      <button class="action-btn redeem-btn" style="width:100%;margin-top:0.75em" onclick="executeHarvest(${{marketIdx}},${{winnerIdx}},'${{label.replace(/'/g,"\\\\'")}}',${{JSON.stringify(question).replace(/"/g,'&quot;')}},'mint')">Execute mint+sell</button>
+    </div>` : `
+    <div class="strategy-card" style="border:1px solid #30363d;padding:1em;border-radius:6px;min-width:280px;flex:1;opacity:0.5">
+      <div style="font-weight:600;font-size:1.05em;margin-bottom:0.5em">Mint + sell losers</div>
+      <div style="color:#8b949e;font-size:0.85em">Not viable — loser outcomes lack bids.</div>
+    </div>`;
+
+  body.innerHTML = `
+    <div style="margin-bottom:1em">
+      <div style="font-size:1.1em">${{question}}</div>
+      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">Winner: <b>${{label}}</b> · per-trade budget <b>$${{budget}}</b></div>
+    </div>
+    <div style="display:flex;gap:1em;flex-wrap:wrap">
+      ${{buyCard}}
+      ${{mintCard}}
+    </div>
+    <div style="margin-top:1em;text-align:right">
+      <button class="action-btn" onclick="closeStrategyModal()">Cancel</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+}}
+
+function closeStrategyModal() {{
+  const modal = document.getElementById('strategy-modal');
+  if (modal) modal.style.display = 'none';
+}}
+
+async function executeHarvest(marketIdx, winnerIdx, label, question, strategy) {{
+  closeStrategyModal();
   try {{
     const resp = await fetch('/api/harvest', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ market_idx: marketIdx, winner_idx: winnerIdx, label: label, market_question: question }}),
+      body: JSON.stringify({{
+        market_idx: marketIdx,
+        winner_idx: winnerIdx,
+        label: label,
+        market_question: question,
+        strategy: strategy,
+      }}),
     }});
     const data = await resp.json();
     if (data.ok) {{

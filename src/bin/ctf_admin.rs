@@ -27,7 +27,8 @@ use alloy::signers::local::LocalSigner;
 use alloy::sol;
 use anyhow::{Context, Result, anyhow, bail};
 use polymarket_client_sdk::ctf::types::{
-    CollectionIdRequest, MergePositionsRequest, PositionIdRequest, RedeemPositionsRequest,
+    CollectionIdRequest, MergePositionsRequest, PositionIdRequest, RedeemNegRiskRequest,
+    RedeemPositionsRequest,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -49,16 +50,23 @@ const DEFAULT_RPC: &str = "https://polygon-rpc.com";
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  ctf_admin merge      --condition-id 0x... --amount <USDC>");
-    eprintln!("  ctf_admin redeem     --condition-id 0x...");
-    eprintln!("  ctf_admin balance    --condition-id 0x...");
-    eprintln!("  ctf_admin resolution --condition-id 0x...");
+    eprintln!("  ctf_admin merge           --condition-id 0x... --amount <USDC>");
+    eprintln!("  ctf_admin redeem          --condition-id 0x...");
+    eprintln!("  ctf_admin redeem-neg-risk --condition-id 0x... [--yes-amount <USDC>] [--no-amount <USDC>]");
+    eprintln!("  ctf_admin balance         --condition-id 0x...");
+    eprintln!("  ctf_admin resolution      --condition-id 0x...");
+    eprintln!();
+    eprintln!("Notes:");
+    eprintln!("  redeem          — standard CTF binary markets (single-question YES/NO).");
+    eprintln!("  redeem-neg-risk — Polymarket negative-risk markets (multi-outcome events).");
+    eprintln!("                    Pass the on-chain token amounts to redeem; defaults to 0 if omitted.");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  ctf_admin merge      --condition-id 0xd387bfe6... --amount 2.0");
-    eprintln!("  ctf_admin redeem     --condition-id 0xd387bfe6...");
-    eprintln!("  ctf_admin balance    --condition-id 0xd387bfe6...");
-    eprintln!("  ctf_admin resolution --condition-id 0xd387bfe6...");
+    eprintln!("  ctf_admin merge           --condition-id 0xd387bfe6... --amount 2.0");
+    eprintln!("  ctf_admin redeem          --condition-id 0xd387bfe6...");
+    eprintln!("  ctf_admin redeem-neg-risk --condition-id 0x35b47285... --no-amount 10.0");
+    eprintln!("  ctf_admin balance         --condition-id 0xd387bfe6...");
+    eprintln!("  ctf_admin resolution      --condition-id 0xd387bfe6...");
 }
 
 #[tokio::main]
@@ -104,8 +112,12 @@ async fn main() -> Result<()> {
         .await
         .context("failed to connect to Polygon RPC")?;
 
-    let ctf_client = polymarket_client_sdk::ctf::Client::new(provider, POLYGON_CHAIN_ID)
-        .context("failed to init CTF client")?;
+     // Use `with_neg_risk` so the same client handles both standard CTF and
+    // Polymarket negative-risk markets. The standard CTF entry points still
+    // work — the only difference is that `redeem_neg_risk()` is now available.
+    let ctf_client =
+        polymarket_client_sdk::ctf::Client::with_neg_risk(provider, POLYGON_CHAIN_ID)
+            .context("failed to init CTF client")?;
 
     match cmd {
         "merge" => {
@@ -139,6 +151,45 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("redeem failed: {e}"))?;
             println!("✓ redeem submitted");
+            println!("  tx_hash: {:?}", resp.transaction_hash);
+            println!("  block:   {}", resp.block_number);
+        }
+        "redeem-neg-risk" => {
+            // Polymarket negative-risk markets are redeemed through the
+            // NegRiskAdapter contract, which takes per-outcome token amounts
+            // rather than index sets. amounts = [yesUnits, noUnits] in 6-decimal
+            // base units (same scale as USDC).
+            let yes_dec = arg_value(&args, "--yes-amount")
+                .map(|s| Decimal::from_str(&s).context("invalid --yes-amount"))
+                .transpose()?
+                .unwrap_or(Decimal::ZERO);
+            let no_dec = arg_value(&args, "--no-amount")
+                .map(|s| Decimal::from_str(&s).context("invalid --no-amount"))
+                .transpose()?
+                .unwrap_or(Decimal::ZERO);
+            if yes_dec < Decimal::ZERO || no_dec < Decimal::ZERO {
+                bail!("amounts must be >= 0");
+            }
+            if yes_dec == Decimal::ZERO && no_dec == Decimal::ZERO {
+                bail!("at least one of --yes-amount / --no-amount must be > 0");
+            }
+            let yes_units = decimal_to_usdc_units(yes_dec)?;
+            let no_units = decimal_to_usdc_units(no_dec)?;
+
+            println!("action:    redeem-neg-risk");
+            println!("yes:       {yes_dec} ({yes_units} units)");
+            println!("no:        {no_dec} ({no_units} units)");
+            println!();
+
+            let req = RedeemNegRiskRequest::builder()
+                .condition_id(condition_id)
+                .amounts(vec![yes_units, no_units])
+                .build();
+            let resp = ctf_client
+                .redeem_neg_risk(&req)
+                .await
+                .map_err(|e| anyhow!("redeem-neg-risk failed: {e}"))?;
+            println!("✓ redeem-neg-risk submitted");
             println!("  tx_hash: {:?}", resp.transaction_hash);
             println!("  block:   {}", resp.block_number);
         }
