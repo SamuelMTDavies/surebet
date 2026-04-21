@@ -2317,34 +2317,126 @@ async fn resolve_sell_target(
     state: &AppState,
     req: &SellRequest,
 ) -> Result<(HarvestableMarket, String), String> {
-    let markets = state.markets.read().await;
-    let market = markets
-        .iter()
-        .find(|m| m.condition_id.eq_ignore_ascii_case(&req.condition_id))
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "Market {} not found in loaded set — refresh markets first.",
-                &req.condition_id[..12.min(req.condition_id.len())]
-            )
-        })?;
+    // Fast path: the harvester's scanned market set. Covers
+    // near-expiry binary markets the bot was actively tracking.
+    {
+        let markets = state.markets.read().await;
+        if let Some(m) = markets
+            .iter()
+            .find(|m| m.condition_id.eq_ignore_ascii_case(&req.condition_id))
+            .cloned()
+        {
+            let idx = m
+                .outcomes
+                .iter()
+                .position(|o| o.eq_ignore_ascii_case(&req.outcome))
+                .ok_or_else(|| {
+                    format!(
+                        "Outcome '{}' not in market outcomes {:?}",
+                        req.outcome, m.outcomes
+                    )
+                })?;
+            let token_id = m
+                .clob_token_ids
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| "Token id missing for that outcome".to_string())?;
+            return Ok((m, token_id));
+        }
+    }
 
-    // Token id by outcome label match (case-insensitive).
-    let idx = market
-        .outcomes
+    // Fallback path: the user holds a position in a market outside the
+    // harvester's scan set (weather bracket, old market, etc.). Look
+    // it up directly via the CLOB metadata endpoint, which accepts
+    // condition_id and returns `tokens` with (outcome, token_id) pairs
+    // — exactly what we need.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent(BROWSER_UA)
+        .build()
+        .map_err(|e| format!("http client build failed: {e}"))?;
+    let url = format!("{}/markets/{}", state.clob_url, req.condition_id);
+    let meta: serde_json::Value = match http.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r
+            .json()
+            .await
+            .map_err(|e| format!("CLOB /markets parse failed: {e}"))?,
+        Ok(r) => {
+            return Err(format!(
+                "CLOB /markets/{} returned {} — market may not exist or credentials missing.",
+                &req.condition_id[..12.min(req.condition_id.len())],
+                r.status()
+            ));
+        }
+        Err(e) => {
+            return Err(format!("CLOB /markets fetch failed: {e}"));
+        }
+    };
+
+    let question = meta
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&req.market)
+        .to_string();
+    let neg_risk = meta
+        .get("neg_risk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tokens = meta
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "CLOB market response missing `tokens` array".to_string())?;
+
+    // Build parallel outcomes / token_ids vectors so downstream code
+    // (HarvestableMarket consumers) doesn't have to care which path
+    // produced the market.
+    let mut outcomes: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut clob_token_ids: Vec<String> = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        let outcome = t
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let token_id = t
+            .get("token_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !outcome.is_empty() && !token_id.is_empty() {
+            outcomes.push(outcome);
+            clob_token_ids.push(token_id);
+        }
+    }
+    if outcomes.is_empty() {
+        return Err("CLOB market had no valid tokens".to_string());
+    }
+
+    let idx = outcomes
         .iter()
         .position(|o| o.eq_ignore_ascii_case(&req.outcome))
         .ok_or_else(|| {
             format!(
-                "Outcome '{}' not in market outcomes {:?}",
-                req.outcome, market.outcomes
+                "Outcome '{}' not in CLOB outcomes {:?}",
+                req.outcome, outcomes
             )
         })?;
-    let token_id = market
-        .clob_token_ids
-        .get(idx)
-        .cloned()
-        .ok_or_else(|| "Token id missing for that outcome".to_string())?;
+    let token_id = clob_token_ids[idx].clone();
+
+    let market = HarvestableMarket {
+        market_id: String::new(),
+        condition_id: req.condition_id.clone(),
+        question,
+        outcomes,
+        clob_token_ids,
+        end_date: None,
+        is_neg_risk: neg_risk,
+        category: String::new(),
+        slug: None,
+        accepting_orders: true,
+        volume_24hr: 0.0,
+        liquidity: 0.0,
+    };
     Ok((market, token_id))
 }
 
