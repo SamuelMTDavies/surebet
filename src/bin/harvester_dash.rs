@@ -943,6 +943,8 @@ async fn main() -> Result<()> {
         .route("/api/harvest-preview", post(api_harvest_preview))
         .route("/api/sell", post(api_sell))
         .route("/api/sell-preview", post(api_sell_preview))
+        .route("/api/buy-direct", post(api_buy_direct))
+        .route("/api/buy-direct-preview", post(api_buy_direct_preview))
         .route("/api/activity", get(api_activity))
         .route("/api/merge", post(api_merge))
         .route("/api/redeem", post(api_redeem))
@@ -2591,6 +2593,371 @@ async fn api_sell(
         "filled_shares": filled.to_string(),
         "gross_revenue": revenue.to_string(),
         "avg_price": avg_price.to_string(),
+        "order_id": order_id_opt,
+        "error": if err_msg.is_empty() { None } else { Some(err_msg) },
+    }))
+    .into_response()
+}
+
+// ─── Buy-direct (single-token ladder sweep) ─────────────────────────────────
+//
+// Used by the Observations page to take direct arb shots on dead
+// brackets (buy the NO for a near-guaranteed $1 payout). Decoupled
+// from `state.markets` because weather events live outside the
+// harvester's scan set — we accept a raw `token_id` instead of
+// `(market_idx, winner_idx)`.
+//
+// Walks the ask ladder cheapest-first up to the lesser of
+// `max_cost_usd` (budget) and `limit_price` (caller's per-share cap),
+// mirroring the sell-side slippage-aware floor. The execute uses the
+// worst (highest) level walked as the CLOB limit so every level
+// counted in the preview actually fills.
+
+#[derive(Debug, Clone)]
+struct BuyPlan {
+    filled_shares: Decimal,
+    gross_cost: Decimal,
+    avg_fill_price: Decimal,
+    /// Highest ask price walked — use as the CLOB limit on execute.
+    /// `None` when nothing filled.
+    worst_walked_price: Option<Decimal>,
+    levels_consumed: usize,
+}
+
+fn simulate_buy_walk(
+    book: &surebet::orderbook::OrderBook,
+    max_cost_usd: Decimal,
+    limit_price: Decimal,
+) -> BuyPlan {
+    let mut remaining_budget = max_cost_usd;
+    let mut cost = Decimal::ZERO;
+    let mut filled = Decimal::ZERO;
+    let mut levels = 0usize;
+    let mut worst: Option<Decimal> = None;
+    // BTreeMap iterates asc — that's the direction buys want (cheapest first).
+    for (&price, &size) in book.asks.levels.iter() {
+        if price > limit_price || remaining_budget <= Decimal::ZERO {
+            break;
+        }
+        let level_cost: Decimal = price * size;
+        if level_cost <= remaining_budget {
+            // Take the whole level.
+            cost += level_cost;
+            filled += size;
+            remaining_budget -= level_cost;
+        } else {
+            // Partial fill at this level — take as many shares as
+            // the budget allows.
+            if price > Decimal::ZERO {
+                let frac_shares = remaining_budget / price;
+                cost += remaining_budget;
+                filled += frac_shares;
+                remaining_budget = Decimal::ZERO;
+            }
+        }
+        levels += 1;
+        worst = Some(price);
+        if remaining_budget <= Decimal::ZERO {
+            break;
+        }
+    }
+    let avg = if filled > Decimal::ZERO {
+        cost / filled
+    } else {
+        Decimal::ZERO
+    };
+    BuyPlan {
+        filled_shares: filled,
+        gross_cost: cost,
+        avg_fill_price: avg,
+        worst_walked_price: worst,
+        levels_consumed: levels,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BuyDirectRequest {
+    /// CTF ERC-1155 token id (decimal string). Direct from the
+    /// observations JSON — no state.markets lookup needed.
+    token_id: String,
+    /// Outcome label for logging (e.g. "14°C · NO").
+    label: String,
+    /// Market title for the activity log.
+    market: String,
+    /// Max per-share price we'll pay. Typically the observed best ask
+    /// plus a small tick, or 0.999 for the "buy the certain winner"
+    /// case on dead brackets.
+    limit_price: String,
+    /// Max USDC to deploy on this trade. Defaults to `state.max_trade`
+    /// when unset — same budget rail as Select-Winner harvests.
+    #[serde(default)]
+    max_cost_usd: Option<String>,
+    /// Optional condition_id (hex 0x…) — stored on the activity entry
+    /// so merge/redeem recovery can link back to it.
+    #[serde(default)]
+    condition_id: Option<String>,
+    /// "paper" / "live" override; defaults to server's runtime mode.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+async fn api_buy_direct_preview(
+    State(state): State<AppState>,
+    Json(req): Json<BuyDirectRequest>,
+) -> impl IntoResponse {
+    let limit_price = match Decimal::from_str(&req.limit_price) {
+        Ok(v) if v > Decimal::ZERO => v,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "limit_price must be > 0"})),
+            )
+                .into_response();
+        }
+    };
+    let max_cost = req
+        .max_cost_usd
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(state.max_trade);
+
+    let book = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &req.token_id)
+        .await;
+    let (best_ask, plan) = match book.as_ref() {
+        Some(b) => (
+            b.asks.best(false).map(|(p, _)| p),
+            simulate_buy_walk(b, max_cost, limit_price),
+        ),
+        None => (
+            None,
+            BuyPlan {
+                filled_shares: Decimal::ZERO,
+                gross_cost: Decimal::ZERO,
+                avg_fill_price: Decimal::ZERO,
+                worst_walked_price: None,
+                levels_consumed: 0,
+            },
+        ),
+    };
+
+    let order_limit = plan.worst_walked_price.unwrap_or(limit_price);
+    // Expected profit if this is a "certified winner" buy (shares resolve $1):
+    //   shares − cost.  Caller can use this for the dead-bracket buy-NO case
+    //   where payout is known. For uncertain buys the figure is the upper-
+    //   bound P&L only.
+    let expected_profit = plan.filled_shares - plan.gross_cost;
+    let profit_pct = if plan.gross_cost > Decimal::ZERO {
+        (expected_profit * Decimal::ONE_HUNDRED) / plan.gross_cost
+    } else {
+        Decimal::ZERO
+    };
+
+    Json(serde_json::json!({
+        "token_id": req.token_id,
+        "label": req.label,
+        "market": req.market,
+        "best_ask": best_ask.map(|p| p.to_string()),
+        "limit_price": limit_price.to_string(),
+        "max_cost_usd": max_cost.to_string(),
+        "fillable_shares": plan.filled_shares.to_string(),
+        "gross_cost": plan.gross_cost.to_string(),
+        "avg_fill_price": plan.avg_fill_price.to_string(),
+        "worst_walked_price": plan.worst_walked_price.map(|p| p.to_string()),
+        "order_limit_price": order_limit.to_string(),
+        "levels_consumed": plan.levels_consumed,
+        "expected_profit_if_resolves_winner": expected_profit.to_string(),
+        "expected_profit_pct": format!("{profit_pct:.2}"),
+    }))
+    .into_response()
+}
+
+async fn api_buy_direct(
+    State(state): State<AppState>,
+    Json(req): Json<BuyDirectRequest>,
+) -> impl IntoResponse {
+    let now = Utc::now().format("%H:%M:%S").to_string();
+    let limit_price = match Decimal::from_str(&req.limit_price) {
+        Ok(v) if v > Decimal::ZERO => v,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "limit_price must be > 0"})),
+            )
+                .into_response();
+        }
+    };
+    let max_cost = req
+        .max_cost_usd
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(state.max_trade);
+
+    // Re-walk the book now (book may have moved since preview).
+    let book_opt = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &req.token_id)
+        .await;
+    let plan = match book_opt.as_ref() {
+        Some(b) => simulate_buy_walk(b, max_cost, limit_price),
+        None => BuyPlan {
+            filled_shares: Decimal::ZERO,
+            gross_cost: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: None,
+            levels_consumed: 0,
+        },
+    };
+    if plan.filled_shares <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "No fillable ask ≤ ${limit_price} for this token — top ask may have moved up."
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    // Slippage-aware floor: order limit = worst price walked so every
+    // level counted actually fills when the CLOB matches.
+    let order_limit_price = plan.worst_walked_price.unwrap_or(limit_price);
+
+    // Daily-spend rolling cap (same rail as harvest).
+    let now_utc = Utc::now();
+    let cutoff = now_utc - chrono::Duration::hours(24);
+    {
+        let mut spend_log = state.daily_spend.write().await;
+        spend_log.retain(|(ts, _)| *ts > cutoff);
+        let spent_today: Decimal = spend_log.iter().map(|(_, amt)| amt).sum();
+        let remaining = state.max_daily - spent_today;
+        if remaining <= Decimal::ZERO {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Daily cap reached (${spent_today:.2} of ${max_daily:.2} in last 24h)",
+                        max_daily = state.max_daily
+                    )
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let is_live = match req.mode.as_deref() {
+        Some("live") => true,
+        Some("paper") => false,
+        _ => state.live_mode,
+    };
+
+    // Live balance check.
+    if is_live {
+        if let Some(ref api) = state.api {
+            let balance = api.get_balance_usdc().await;
+            if plan.gross_cost > balance {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Insufficient USDC: need ${:.4} but balance is ${:.4}",
+                            plan.gross_cost, balance
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let (status, order_id_opt, err_msg) = if is_live {
+        if !state.live_mode {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "server not in live mode — restart with --live to buy"
+                })),
+            )
+                .into_response();
+        }
+        let order_client = match state.order_client.as_ref() {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "order_client not initialized"})),
+                )
+                    .into_response();
+            }
+        };
+        match order_client
+            .place_limit(&req.token_id, order_limit_price, plan.filled_shares, OrderSide::Buy)
+            .await
+        {
+            Ok(r) if r.success => (
+                format!("BUY OK: order {}", r.order_id),
+                Some(r.order_id),
+                String::new(),
+            ),
+            Ok(r) => (format!("BUY FAIL: {}", r.error_msg), None, r.error_msg.clone()),
+            Err(e) => (format!("BUY ERR: {e}"), None, format!("{e}")),
+        }
+    } else {
+        (
+            format!(
+                "PAPER BUY: simulated {} sh @ avg ${:.4}",
+                plan.filled_shares, plan.avg_fill_price
+            ),
+            None,
+            String::new(),
+        )
+    };
+
+    // Record cost against daily cap (live only — paper mode doesn't
+    // actually spend).
+    if is_live && err_msg.is_empty() {
+        state
+            .daily_spend
+            .write()
+            .await
+            .push((now_utc, plan.gross_cost));
+    }
+
+    let strategy = if is_live { "BUY" } else { "PAPER BUY" };
+    let entry = ActivityEntry {
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+        time: now,
+        market: req.market.clone(),
+        outcome: req.label.clone(),
+        strategy: strategy.to_string(),
+        buy_shares: plan.filled_shares.to_string(),
+        buy_cost: format!("{:.4}", plan.gross_cost),
+        mint_cost: "0".to_string(),
+        sell_revenue: "0".to_string(),
+        // Expected profit assuming the token resolves at $1. Matches
+        // the harvest handler's `net_profit = shares − cost` convention
+        // for BUY rows so stats aggregate cleanly.
+        net_profit: format!("{:.4}", plan.filled_shares - plan.gross_cost),
+        status: if err_msg.is_empty() {
+            status.clone()
+        } else {
+            format!("{} — order_id={}", status, order_id_opt.as_deref().unwrap_or("none"))
+        },
+        condition_id: req.condition_id.clone().unwrap_or_default(),
+        gas_matic: "0".to_string(),
+    };
+    state.activity.write().await.push(entry.clone());
+    rewrite_activity_file(&state).await;
+
+    Json(serde_json::json!({
+        "ok": err_msg.is_empty(),
+        "entry": entry,
+        "filled_shares": plan.filled_shares.to_string(),
+        "gross_cost": plan.gross_cost.to_string(),
+        "avg_price": plan.avg_fill_price.to_string(),
+        "order_limit_price": order_limit_price.to_string(),
         "order_id": order_id_opt,
         "error": if err_msg.is_empty() { None } else { Some(err_msg) },
     }))
@@ -4384,7 +4751,7 @@ async fn fetch_obs_block_for_event(
                 current: f_to_unit(wu.current_f),
                 last_observation_at: wu.observation_time_utc.to_rfc3339(),
                 timezone: String::new(),
-                source: "Wunderground (fallback)".to_string(),
+                source: "Wunderground".to_string(),
                 station: Some(wu.icao),
                 resolution_url: Some(resolution_url.to_string()),
             });
@@ -5177,7 +5544,7 @@ async fn process_weather_event(
                         current: f_to_unit(wu.current_f),
                         last_observation_at: wu.observation_time_utc.to_rfc3339(),
                         timezone: String::new(),
-                        source: "Wunderground (fallback)".to_string(),
+                        source: "Wunderground".to_string(),
                         station: Some(wu.icao),
                         resolution_url: Some(resolution_url.to_string()),
                     });
@@ -5373,9 +5740,24 @@ async fn observations_html() -> Html<String> {
     .opportunity { color: #7ee2a8; font-weight: 600; }
     .no-obs { color: #8b949e; font-style: italic; }
     .dead-count { color: #ffa198; }
+    .buy-btn { background: #238636; border: 1px solid #2ea043; color: #fff; padding: 0.2em 0.6em; border-radius: 3px; cursor: pointer; font-size: 0.8em; font-family: inherit; }
+    .buy-btn:hover { background: #2ea043; }
+    .buy-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .cancel-btn { background: #30363d; border: 1px solid #484f58; color: #c9d1d9; padding: 0.3em 0.8em; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 0.85em; }
+    .cancel-btn:hover { background: #484f58; }
+    .pnl-pos { color: #7ee2a8; }
+    .pnl-neg { color: #ffa198; }
   </style>
 </head>
 <body>
+  <!-- Dead-bracket buy preview modal. Walks the NO token's real ask
+       ladder so the user sees actual fillable depth before committing.
+       Prevents the "estimate looked great but no real book" trap. -->
+  <div id="buy-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center">
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1.5em;max-width:620px;width:92%;max-height:90vh;overflow-y:auto">
+      <div id="buy-modal-body"></div>
+    </div>
+  </div>
   <nav><a href="/">Markets</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
   <h1>Weather observations · dead bracket scanner</h1>
   <div class="meta" id="meta">Loading…</div>
@@ -5427,6 +5809,20 @@ async function load() {
       const profit = b.profit_per_share != null
         ? `<span class="opportunity">+$${b.profit_per_share.toFixed(4)}</span>`
         : '—';
+
+      // "Buy NO" appears only on DEAD brackets with an estimated NO ask.
+      // The preview endpoint walks the REAL NO ask book and shows actual
+      // fillable depth — so if the estimate is a false positive, the
+      // modal reports 0 fillable and disables Execute. No way to
+      // misfire on a phantom estimate.
+      let action = '';
+      if (b.status === 'DEAD' && b.no_ask_estimate != null && b.no_ask_estimate > 0) {
+        const bidLimit = Math.min(b.no_ask_estimate + 0.01, 0.999);
+        const labelEsc = JSON.stringify(`${b.label} · NO`).replace(/"/g, '&quot;');
+        const marketEsc = JSON.stringify(e.question).replace(/"/g, '&quot;');
+        action = `<button class="buy-btn" onclick="openBuyModal('${b.token_id_no}',${labelEsc},${marketEsc},'${bidLimit.toFixed(4)}')">Buy NO</button>`;
+      }
+
       return `<tr>
         <td>${b.label}</td>
         <td><span class="badge ${cls}">${b.status}</span></td>
@@ -5434,6 +5830,7 @@ async function load() {
         <td>${yesBid}</td>
         <td>${noAsk}</td>
         <td>${profit}</td>
+        <td>${action}</td>
       </tr>`;
     }).join('');
 
@@ -5446,12 +5843,121 @@ async function load() {
       <div class="event-sub">${e.location} · ${e.measure} · resolves ${e.date} <span class="dead-count">${e.dead_count} dead</span>${oppStr}</div>
       ${obsHtml}
       <table>
-        <thead><tr><th>Bracket</th><th>Status</th><th>YES ask</th><th>YES bid</th><th>NO ask (est)</th><th>Buy-NO profit/share</th></tr></thead>
+        <thead><tr><th>Bracket</th><th>Status</th><th>YES ask</th><th>YES bid</th><th>NO ask (est)</th><th>Buy-NO profit/share</th><th>Action</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
   }).join('');
 }
+
+// ── Buy-NO preview / execute (dead-bracket arb) ────────────────────────
+async function openBuyModal(tokenId, label, market, limitPrice) {
+  const resp = await fetch('/api/buy-direct-preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token_id: tokenId,
+      label: label,
+      market: market,
+      limit_price: String(limitPrice),
+    }),
+  });
+  const p = await resp.json();
+  if (p.error) { alert('Preview failed: ' + p.error); return; }
+  showBuyModal(tokenId, label, market, limitPrice, p);
+}
+
+function showBuyModal(tokenId, label, market, limitPrice, p) {
+  const modal = document.getElementById('buy-modal');
+  const body = document.getElementById('buy-modal-body');
+
+  const fillable = parseFloat(p.fillable_shares) || 0;
+  const cost = parseFloat(p.gross_cost) || 0;
+  const avgPx = parseFloat(p.avg_fill_price) || 0;
+  const bestAsk = p.best_ask != null ? parseFloat(p.best_ask) : null;
+  const orderLimit = parseFloat(p.order_limit_price) || 0;
+  const maxCost = parseFloat(p.max_cost_usd) || 0;
+  const expProfit = parseFloat(p.expected_profit_if_resolves_winner) || 0;
+  const expPct = parseFloat(p.expected_profit_pct) || 0;
+  const levels = p.levels_consumed || 0;
+  const dry = fillable <= 0;
+
+  const warn = dry
+    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">
+         ⚠ No asks at or below the limit price — the <b>NO ask (est)</b> on the page was an inversion of the YES bid, not a real ask.
+         Nothing to buy. Consider mint+sell instead (coming in v2).
+       </div>`
+    : '';
+
+  const execBtn = dry
+    ? `<button class="buy-btn" disabled>Execute buy</button>`
+    : `<button class="buy-btn" onclick="executeBuyNo('${tokenId}',${JSON.stringify(label).replace(/"/g,'&quot;')},${JSON.stringify(market).replace(/"/g,'&quot;')},'${orderLimit.toFixed(4)}','${maxCost}')">Execute buy</button>`;
+
+  body.innerHTML = `
+    <div style="margin-bottom:1em">
+      <div style="font-size:1.05em">${market}</div>
+      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">
+        Buying <b>${label}</b> · budget cap <b>$${maxCost}</b>
+      </div>
+    </div>
+    <div style="border:1px solid #30363d;border-radius:6px;padding:1em;font-family:monospace;font-size:0.9em;line-height:1.7em">
+      <div>Best ask (real book): <b>${bestAsk != null ? '$' + bestAsk.toFixed(4) : '—'}</b></div>
+      <div>Fillable shares at budget: <b>${fillable.toFixed(2)}</b> across <b>${levels}</b> level${levels === 1 ? '' : 's'}</div>
+      <div>Avg fill price: <b>$${avgPx.toFixed(4)}</b></div>
+      <div>Total cost: <b>$${cost.toFixed(4)}</b></div>
+      <div>Order limit (worst walked): <b>$${orderLimit.toFixed(4)}</b></div>
+      <div style="margin-top:0.5em">Expected profit if resolves winner: <b class="pnl-pos">+$${expProfit.toFixed(4)}</b> (<b class="pnl-pos">+${expPct.toFixed(2)}%</b>)</div>
+      <div style="color:#8b949e;font-size:0.8em;margin-top:0.3em">
+        Order is a limit buy at the order-limit — fills against any ask ≤ limit.
+        The limit is the worst level walked in the preview, so every ask counted actually fills.
+      </div>
+    </div>
+    ${warn}
+    <div style="margin-top:1em;display:flex;gap:0.5em;justify-content:flex-end">
+      <button class="cancel-btn" onclick="closeBuyModal()">Cancel</button>
+      ${execBtn}
+    </div>
+  `;
+  modal.style.display = 'flex';
+}
+
+function closeBuyModal() {
+  const modal = document.getElementById('buy-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function executeBuyNo(tokenId, label, market, limitPrice, maxCost) {
+  closeBuyModal();
+  try {
+    const resp = await fetch('/api/buy-direct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token_id: tokenId,
+        label: label,
+        market: market,
+        limit_price: String(limitPrice),
+        max_cost_usd: String(maxCost),
+      }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      const e = data.entry;
+      alert(
+        `${e.strategy} OK\n` +
+        `Filled ${parseFloat(data.filled_shares).toFixed(2)} shares of ${label}\n` +
+        `Cost: $${parseFloat(data.gross_cost).toFixed(4)} · avg $${parseFloat(data.avg_price).toFixed(4)}\n\n` +
+        `${e.status}`
+      );
+      load();
+    } else {
+      alert('Buy failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
+    }
+  } catch (err) {
+    alert('Request failed: ' + err);
+  }
+}
+
 load();
 </script>
 </body>
