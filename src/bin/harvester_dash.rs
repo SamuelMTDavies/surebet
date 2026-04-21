@@ -6125,8 +6125,17 @@ async fn api_save_paper_trade(
         let mut order_ids: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
         let mut leg_errors: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
         for leg in &req.legs {
-            let price = Decimal::from_f64_retain(leg.ask_at_buy).unwrap_or(Decimal::ZERO);
-            let size = Decimal::from_f64_retain(leg.shares).unwrap_or(Decimal::ZERO);
+            // f64 → Decimal can carry FP garbage (0.55 becomes 0.55000…444).
+            // The CLOB rejects prices with more decimal places than the
+            // market's minimum tick size. Round to 2 dp — covers every
+            // Polymarket market (tick is 0.01 on weather/sports/elections,
+            // 0.001 only on 5-min crypto; 2 dp is always ≤ tick size).
+            let price = Decimal::from_f64_retain(leg.ask_at_buy)
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(2);
+            let size = Decimal::from_f64_retain(leg.shares)
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(2);
             match order_client
                 .place_limit(&leg.token_id, price, size, OrderSide::Buy)
                 .await
