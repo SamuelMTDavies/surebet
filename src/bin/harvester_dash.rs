@@ -6093,7 +6093,7 @@ async fn observations_html() -> Html<String> {
       <div id="buy-modal-body"></div>
     </div>
   </div>
-  <nav><a href="/">Markets</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
+  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
   <h1>Weather observations · dead bracket scanner</h1>
   <div class="meta" id="meta">Loading…</div>
   <div id="events"></div>
@@ -7306,7 +7306,7 @@ async fn paper_trades_html() -> Html<String> {
       <div id="sell-modal-body"></div>
     </div>
   </div>
-  <nav><a href="/">Markets</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
+  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
   <h1>Paper Trades</h1>
   <div class="meta" id="meta">Loading…</div>
   <div id="last-updated" style="color:#8b949e; font-size:0.85em; margin-bottom:0.75em"></div>
