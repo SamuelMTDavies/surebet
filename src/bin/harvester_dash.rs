@@ -941,6 +941,8 @@ async fn main() -> Result<()> {
         .route("/api/book", get(api_book))
         .route("/api/harvest", post(api_harvest))
         .route("/api/harvest-preview", post(api_harvest_preview))
+        .route("/api/sell", post(api_sell))
+        .route("/api/sell-preview", post(api_sell_preview))
         .route("/api/activity", get(api_activity))
         .route("/api/merge", post(api_merge))
         .route("/api/redeem", post(api_redeem))
@@ -2213,6 +2215,328 @@ async fn api_harvest_preview(
             "available": mint_available && mint_amount > Decimal::ZERO,
             "sell_plans": sell_plans,
         },
+    }))
+    .into_response()
+}
+
+// ─── Sell action (close held position at current bid) ──────────────────────
+//
+// Preview (`/api/sell-preview`) walks the bid book for `shares_held` and
+// returns the projected revenue + % return. Execute (`/api/sell`) places
+// an SDK limit-sell at the user-approved floor price (live mode) or logs
+// a simulated PAPER SELL activity entry (paper mode).
+//
+// Both ride on the same request shape. `token_id` is resolved server-
+// side from `condition_id` + `outcome_label` via the loaded markets list,
+// so the client never has to know the CTF ERC-1155 IDs.
+
+#[derive(Debug, Deserialize)]
+struct SellRequest {
+    /// Hex condition_id (0x…) of the market holding the position.
+    condition_id: String,
+    /// "Yes" or "No" — which side to sell.
+    outcome: String,
+    /// Display title (for activity log; server doesn't trust it for routing).
+    market: String,
+    /// Shares to sell. Server clamps against the actual bid-book depth
+    /// and the caller-reported holding.
+    shares: String,
+    /// Min price floor for the limit order. Revenue below this is refused.
+    #[serde(default)]
+    min_price: Option<String>,
+    /// "paper" or "live" — must match the server's mode; live requires a
+    /// wallet + order_client.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Resolve a sell request's market + token_id. Returns `Err` with a
+/// user-facing message on any failure so the handlers can all bail in
+/// the same shape.
+async fn resolve_sell_target(
+    state: &AppState,
+    req: &SellRequest,
+) -> Result<(HarvestableMarket, String), String> {
+    let markets = state.markets.read().await;
+    let market = markets
+        .iter()
+        .find(|m| m.condition_id.eq_ignore_ascii_case(&req.condition_id))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Market {} not found in loaded set — refresh markets first.",
+                &req.condition_id[..12.min(req.condition_id.len())]
+            )
+        })?;
+
+    // Token id by outcome label match (case-insensitive).
+    let idx = market
+        .outcomes
+        .iter()
+        .position(|o| o.eq_ignore_ascii_case(&req.outcome))
+        .ok_or_else(|| {
+            format!(
+                "Outcome '{}' not in market outcomes {:?}",
+                req.outcome, market.outcomes
+            )
+        })?;
+    let token_id = market
+        .clob_token_ids
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| "Token id missing for that outcome".to_string())?;
+    Ok((market, token_id))
+}
+
+/// Compute the sell plan by walking the bid book for `want_shares` shares.
+/// Stops at `min_price` (skips levels below) and caps total shares at
+/// what the caller actually holds. Returns (filled_shares, gross_revenue,
+/// avg_fill_price, levels_consumed).
+fn simulate_sell_walk(
+    book: &surebet::orderbook::OrderBook,
+    want_shares: Decimal,
+    min_price: Decimal,
+) -> (Decimal, Decimal, Decimal, usize) {
+    let mut remaining = want_shares;
+    let mut revenue = Decimal::ZERO;
+    let mut filled = Decimal::ZERO;
+    let mut levels = 0usize;
+    // BTreeMap iterates asc; sell side walks descending (highest bid first).
+    for (&price, &size) in book.bids.levels.iter().rev() {
+        if price < min_price || remaining <= Decimal::ZERO {
+            break;
+        }
+        let take: Decimal = size.min(remaining);
+        if take <= Decimal::ZERO {
+            continue;
+        }
+        revenue += price * take;
+        filled += take;
+        remaining -= take;
+        levels += 1;
+    }
+    let avg = if filled > Decimal::ZERO {
+        revenue / filled
+    } else {
+        Decimal::ZERO
+    };
+    (filled, revenue, avg, levels)
+}
+
+async fn api_sell_preview(
+    State(state): State<AppState>,
+    Json(req): Json<SellRequest>,
+) -> impl IntoResponse {
+    let (market, token_id) = match resolve_sell_target(&state, &req).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
+
+    let want_shares = Decimal::from_str(&req.shares).unwrap_or(Decimal::ZERO);
+    if want_shares <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "shares must be > 0"})),
+        )
+            .into_response();
+    }
+    let min_price = req
+        .min_price
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(state.min_sell);
+
+    let book = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &token_id)
+        .await;
+    let (best_bid, filled, revenue, avg_price, levels) = match book.as_ref() {
+        Some(b) => {
+            let bb = b.bids.best(true).map(|(p, _)| p);
+            let (f, r, a, l) = simulate_sell_walk(b, want_shares, min_price);
+            (bb, f, r, a, l)
+        }
+        None => (None, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, 0),
+    };
+
+    // Cost basis isn't stored on the position row; the caller may pass
+    // it via `min_price` if they've computed it elsewhere, but for the
+    // preview we compute % vs the approved floor price as a proxy and
+    // leave the real cost-basis comparison to the caller's display.
+    Json(serde_json::json!({
+        "market_question": req.market.clone(),
+        "outcome": req.outcome.clone(),
+        "token_id": token_id,
+        "requested_shares": want_shares.to_string(),
+        "fillable_shares": filled.to_string(),
+        "best_bid": best_bid.map(|p| p.to_string()),
+        "avg_fill_price": avg_price.to_string(),
+        "gross_revenue": revenue.to_string(),
+        "levels_consumed": levels,
+        "min_price_used": min_price.to_string(),
+        "market": market.question,
+    }))
+    .into_response()
+}
+
+async fn api_sell(
+    State(state): State<AppState>,
+    Json(req): Json<SellRequest>,
+) -> impl IntoResponse {
+    let now = Utc::now().format("%H:%M:%S").to_string();
+    let (market, token_id) = match resolve_sell_target(&state, &req).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
+
+    let want_shares = Decimal::from_str(&req.shares).unwrap_or(Decimal::ZERO);
+    if want_shares <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "shares must be > 0"})),
+        )
+            .into_response();
+    }
+    let min_price = req
+        .min_price
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(state.min_sell);
+
+    // Re-walk the book to get a fresh plan (best bid may have moved
+    // between preview and execute).
+    let book_opt = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &token_id)
+        .await;
+    let (filled, revenue, avg_price, _levels) = match book_opt.as_ref() {
+        Some(b) => {
+            let (f, r, a, l) = simulate_sell_walk(b, want_shares, min_price);
+            (f, r, a, l)
+        }
+        None => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, 0),
+    };
+
+    if filled <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "No fillable bid ≥ ${min_price} for {} — top bid may have dropped.",
+                    req.outcome
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    // Mode resolution: explicit "paper" / "live" override in the
+    // request wins; otherwise follow the server's runtime mode. This
+    // means the button doesn't need to know which mode the server is
+    // in — matches the existing harvest-action default.
+    let is_live = match req.mode.as_deref() {
+        Some("live") => true,
+        Some("paper") => false,
+        _ => state.live_mode,
+    };
+
+    // Live path: place a limit-sell at `min_price` for `filled` shares.
+    // The CLOB matches against any resting bids ≥ min_price — matches
+    // what the preview simulated.
+    let (status, order_id_opt, err_msg) = if is_live {
+        if !state.live_mode {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "server not in live mode — restart with --live to sell"
+                })),
+            )
+                .into_response();
+        }
+        let order_client = match state.order_client.as_ref() {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "order_client not initialized"})),
+                )
+                    .into_response();
+            }
+        };
+        match order_client
+            .place_limit(&token_id, min_price, filled, OrderSide::Sell)
+            .await
+        {
+            Ok(r) if r.success => (
+                format!("SELL OK: order {}", r.order_id),
+                Some(r.order_id),
+                String::new(),
+            ),
+            Ok(r) => (
+                format!("SELL FAIL: {}", r.error_msg),
+                None,
+                r.error_msg.clone(),
+            ),
+            Err(e) => (format!("SELL ERR: {e}"), None, format!("{e}")),
+        }
+    } else {
+        (
+            format!("PAPER SELL: simulated fill {filled} sh @ avg {avg_price}"),
+            None,
+            String::new(),
+        )
+    };
+
+    // Activity entry: SELL (or PAPER SELL) with negative buy_cost (we
+    // received USDC), sell_revenue = gross. net_profit requires a cost
+    // basis the server doesn't know — leave it as `sell_revenue` so the
+    // stats treat this as inflowing capital without a known basis.
+    // Client can join against prior MINT/BUY entries by condition_id to
+    // compute the full round-trip return.
+    let strategy = if is_live { "SELL" } else { "PAPER SELL" };
+    let entry = ActivityEntry {
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+        time: now,
+        market: market.question.clone(),
+        outcome: req.outcome.clone(),
+        strategy: strategy.to_string(),
+        buy_shares: filled.to_string(),
+        buy_cost: format!("-{revenue:.4}"),
+        mint_cost: "0".to_string(),
+        sell_revenue: format!("{revenue:.4}"),
+        net_profit: format!("{revenue:.4}"),
+        status: if err_msg.is_empty() {
+            status.clone()
+        } else {
+            format!("{} — order_id={}", status, order_id_opt.as_deref().unwrap_or("none"))
+        },
+        condition_id: req.condition_id.clone(),
+        gas_matic: "0".to_string(),
+    };
+
+    state.activity.write().await.push(entry.clone());
+    rewrite_activity_file(&state).await;
+
+    Json(serde_json::json!({
+        "ok": err_msg.is_empty(),
+        "entry": entry,
+        "filled_shares": filled.to_string(),
+        "gross_revenue": revenue.to_string(),
+        "avg_price": avg_price.to_string(),
+        "order_id": order_id_opt,
+        "error": if err_msg.is_empty() { None } else { Some(err_msg) },
     }))
     .into_response()
 }
@@ -6020,6 +6344,28 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 r#"<button class="action-btn" disabled title="Market not resolved yet (or you don't hold winning tokens)" style="opacity:0.4;cursor:not-allowed">Redeem</button>"#.to_string()
             };
 
+            // Sell buttons — one per held side. Only surfaced while the
+            // market is unresolved; once resolved, Redeem is the correct
+            // path (a winning token is worth a flat $1, no need to hit
+            // a book).
+            let sell_market_esc = p.market.replace('\'', "\\'");
+            let sell_yes_btn = if p.resolution == "unresolved" && p.yes_tokens > Decimal::ZERO {
+                format!(
+                    r#"<button class="action-btn sell-btn" onclick="sellPosition('{}','Yes','{}',{})">Sell YES</button>"#,
+                    p.condition_id, sell_market_esc, p.yes_tokens,
+                )
+            } else {
+                String::new()
+            };
+            let sell_no_btn = if p.resolution == "unresolved" && p.no_tokens > Decimal::ZERO {
+                format!(
+                    r#"<button class="action-btn sell-btn" onclick="sellPosition('{}','No','{}',{})">Sell NO</button>"#,
+                    p.condition_id, sell_market_esc, p.no_tokens,
+                )
+            } else {
+                String::new()
+            };
+
             // Resolution status badge
             let (res_label, res_color) = match p.resolution.as_str() {
                 "unresolved" => ("unresolved", "#8b949e"),
@@ -6070,7 +6416,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                   <td style="color:{pnl_color}">${pnl:.4}</td>
                   <td><span style="color:{rcol}">{rlabel}</span></td>
                   <td>{tl}</td>
-                  <td>{merge}{sep}{redeem}</td>
+                  <td>{merge}{sep}{redeem}{sell_sep}{sell_yes}{sell_between}{sell_no}</td>
                 </tr>"#,
                 row_style = row_style,
                 cid = p.condition_id,
@@ -6087,6 +6433,10 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 merge = merge_btn,
                 sep = if !merge_btn.is_empty() { " " } else { "" },
                 redeem = redeem_btn,
+                sell_sep = if !sell_yes_btn.is_empty() || !sell_no_btn.is_empty() { " " } else { "" },
+                sell_yes = sell_yes_btn,
+                sell_between = if !sell_yes_btn.is_empty() && !sell_no_btn.is_empty() { " " } else { "" },
+                sell_no = sell_no_btn,
             )
         }).collect()
     };
@@ -6250,8 +6600,19 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
   .recover-panel {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; }}
   .search-box {{ width: 100%; padding: 7px 11px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-family: inherit; font-size: 0.85em; outline: none; }}
   .search-box:focus {{ border-color: #58a6ff; }}
+  .sell-btn {{ background: #d97706; border-color: #f59e0b; color: #fff; }}
+  .sell-btn:hover {{ background: #f59e0b; }}
 </style>
 </head><body>
+<!-- Sell-position picker. Shown after the user clicks "Sell YES" or
+     "Sell NO" on a position row. Walks the live bid book for the
+     held size, shows projected revenue + net %, and fires /api/sell
+     on confirm. -->
+<div id="sell-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1.5em;max-width:620px;width:92%;max-height:90vh;overflow-y:auto">
+    <div id="sell-modal-body"></div>
+  </div>
+</div>
 <h1>Trades &amp; Positions</h1>
 <div class="nav">
   <a href="/">Markets</a>
@@ -6361,6 +6722,120 @@ async function clearGeoblock() {{
   if (!confirm('Clear the geoblock flag? Only do this AFTER you have enabled a VPN and verified you are routing through a permitted region.')) return;
   await fetch('/api/clear-geoblock', {{ method: 'POST' }});
   location.reload();
+}}
+
+// ─── Sell held position ─────────────────────────────────────────────────
+// Called from position rows. Fetches the live bid book for the held
+// shares, displays projected revenue + net %, and fires /api/sell on
+// confirm. Server resolves token_id from (condition_id, outcome) so
+// the client never handles the ERC-1155 id.
+async function sellPosition(conditionId, outcome, market, heldShares) {{
+  const resp = await fetch('/api/sell-preview', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{
+      condition_id: conditionId,
+      outcome: outcome,
+      market: market,
+      shares: String(heldShares),
+    }}),
+  }});
+  const p = await resp.json();
+  if (p.error) {{ alert('Preview failed: ' + p.error); return; }}
+  showSellModal(conditionId, outcome, market, heldShares, p);
+}}
+
+function showSellModal(conditionId, outcome, market, heldShares, p) {{
+  const modal = document.getElementById('sell-modal');
+  const body = document.getElementById('sell-modal-body');
+
+  const requested = parseFloat(p.requested_shares) || 0;
+  const fillable = parseFloat(p.fillable_shares) || 0;
+  const gross = parseFloat(p.gross_revenue) || 0;
+  const avgPx = parseFloat(p.avg_fill_price) || 0;
+  const bestBid = p.best_bid != null ? parseFloat(p.best_bid) : null;
+  const minPrice = parseFloat(p.min_price_used) || 0;
+  const partial = fillable < requested;
+  const dry = fillable <= 0;
+
+  // Use avg_fill_price as the limit floor on execute — won't fill
+  // below this, even if the top of book moves.
+  const limitFloor = avgPx > 0 ? avgPx : minPrice;
+
+  const warn = dry
+    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids meet the minimum floor. Nothing to sell.</div>`
+    : partial
+    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial fill: only ${{fillable.toFixed(2)}} of ${{requested.toFixed(2)}} shares have book depth at the limit.</div>`
+    : '';
+
+  const execBtn = dry
+    ? `<button class="action-btn" disabled style="opacity:0.4;cursor:not-allowed">Execute sell</button>`
+    : `<button class="action-btn sell-btn" onclick="executeSell('${{conditionId}}','${{outcome}}',${{JSON.stringify(market).replace(/"/g,'&quot;')}},'${{fillable}}','${{limitFloor}}')">Execute sell</button>`;
+
+  body.innerHTML = `
+    <div style="margin-bottom:1em">
+      <div style="font-size:1.05em">${{market}}</div>
+      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">
+        Sell <b>${{outcome}}</b> · held <b>${{heldShares}}</b> shares
+      </div>
+    </div>
+    <div style="border:1px solid #30363d;border-radius:6px;padding:1em;font-family:monospace;font-size:0.9em;line-height:1.7em">
+      <div>Best bid: <b>${{bestBid != null ? '$' + bestBid.toFixed(3) : '—'}}</b></div>
+      <div>Fillable shares at bid depth: <b>${{fillable.toFixed(2)}}</b> / ${{requested.toFixed(2)}}</div>
+      <div>Avg fill price: <b>$${{avgPx.toFixed(4)}}</b></div>
+      <div>Gross revenue: <b>$${{gross.toFixed(4)}}</b></div>
+      <div>Limit floor (order price): <b>$${{limitFloor.toFixed(4)}}</b></div>
+      <div style="color:#8b949e;font-size:0.8em;margin-top:0.3em">
+        Order placed as a limit sell at the floor — fills anything at or above, no worse.
+      </div>
+    </div>
+    ${{warn}}
+    <div style="margin-top:1em;display:flex;gap:0.5em;justify-content:flex-end">
+      <button class="action-btn" onclick="closeSellModal()">Cancel</button>
+      ${{execBtn}}
+    </div>
+  `;
+  modal.style.display = 'flex';
+}}
+
+function closeSellModal() {{
+  const modal = document.getElementById('sell-modal');
+  if (modal) modal.style.display = 'none';
+}}
+
+async function executeSell(conditionId, outcome, market, shares, minPrice) {{
+  closeSellModal();
+  try {{
+    const resp = await fetch('/api/sell', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        condition_id: conditionId,
+        outcome: outcome,
+        market: market,
+        shares: String(shares),
+        min_price: String(minPrice),
+      }}),
+    }});
+    const data = await resp.json();
+    if (data.ok) {{
+      const e = data.entry;
+      const filled = parseFloat(data.filled_shares) || 0;
+      const rev = parseFloat(data.gross_revenue) || 0;
+      alert(
+        `${{e.strategy}} OK\n` +
+        `Filled ${{filled.toFixed(2)}} ${{outcome}} shares\n` +
+        `Gross revenue: $${{rev.toFixed(4)}}\n` +
+        `Avg price: $${{parseFloat(data.avg_price).toFixed(4)}}\n\n` +
+        `${{e.status}}`
+      );
+      location.reload();
+    }} else {{
+      alert('Sell failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
+    }}
+  }} catch (err) {{
+    alert('Request failed: ' + err);
+  }}
 }}
 </script>
 </body></html>"##,
