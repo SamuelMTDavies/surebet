@@ -35,6 +35,7 @@ use polymarket_client_sdk::types::address;
 use polymarket_client_sdk::POLYGON;
 use std::sync::atomic::{AtomicBool, Ordering};
 use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -631,6 +632,40 @@ struct ActivityEntry {
 
 fn default_zero() -> String {
     "0".to_string()
+}
+
+// ─── CLOB tick-size helpers ─────────────────────────────────────────────────
+//
+// Polymarket's CLOB rejects any price whose decimal-place count exceeds
+// the market's `minimum_tick_size` (0.01 on every market we trade) AND
+// any price outside (0.00, 1.00). Both constraints come from the SDK's
+// order-build validator.
+//
+// Rounding direction matters:
+//  - BUY limit — rounds UP so every ask ≤ input still fills.
+//  - SELL limit — rounds DOWN so every bid ≥ input still fills.
+//
+// Clamping to [0.01, 0.99] catches the corner case where rounding 0.999
+// up produces 1.00 (which the CLOB rejects as out of range).
+
+/// Round + clamp a BUY limit price for CLOB validation. Rounds UP to
+/// 2 dp, then clamps to [0.01, 0.99].
+fn round_buy_price(p: Decimal) -> Decimal {
+    let r = p.round_dp_with_strategy(2, RoundingStrategy::AwayFromZero);
+    r.clamp(Decimal::new(1, 2), Decimal::new(99, 2))
+}
+
+/// Round + clamp a SELL limit price for CLOB validation. Rounds DOWN to
+/// 2 dp, then clamps to [0.01, 0.99].
+fn round_sell_price(p: Decimal) -> Decimal {
+    let r = p.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    r.clamp(Decimal::new(1, 2), Decimal::new(99, 2))
+}
+
+/// Round a share size to 2 dp (Polymarket accepts fractional sizes; we
+/// just strip f64/division precision noise).
+fn round_share_size(s: Decimal) -> Decimal {
+    s.round_dp(2)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2539,8 +2574,8 @@ async fn api_sell(
         match order_client
             .place_limit(
                 &token_id,
-                order_limit_price.round_dp(2),
-                filled.round_dp(2),
+                round_sell_price(order_limit_price),
+                round_share_size(filled),
                 OrderSide::Sell,
             )
             .await
@@ -2906,8 +2941,8 @@ async fn api_buy_direct(
         match order_client
             .place_limit(
                 &req.token_id,
-                order_limit_price.round_dp(2),
-                plan.filled_shares.round_dp(2),
+                round_buy_price(order_limit_price),
+                round_share_size(plan.filled_shares),
                 OrderSide::Buy,
             )
             .await
@@ -3403,8 +3438,8 @@ async fn api_harvest(
                                 let resp = order_client
                                     .place_limit(
                                         loser_token_id,
-                                        best_bid.round_dp(2),
-                                        sell_size.round_dp(2),
+                                        round_sell_price(*best_bid),
+                                        round_share_size(sell_size),
                                         OrderSide::Sell,
                                     )
                                     .await;
@@ -3517,16 +3552,14 @@ async fn api_harvest(
                 return Json(serde_json::json!({"ok": false, "entry": entry})).into_response();
             };
 
-            // Tick-size compliance: Polymarket CLOB rejects any price
-            // whose decimal places exceed the market's `minimum_tick_size`
-            // (0.01 on every market we trade). state.max_buy defaults to
-            // 0.999 (3 dp) which fails — round to 2 dp. Shares similarly
-            // must not carry f64/division noise past 2 dp.
+            // Tick-size + clamp: state.max_buy can be 0.999, which naive
+            // 2dp rounding would bump to 1.00 — rejected by the CLOB.
+            // round_buy_price floors to 0.99, valid.
             let resp = order_client
                 .place_limit(
                     winner_token_id,
-                    state.max_buy.round_dp(2),
-                    buy_shares.round_dp(2),
+                    round_buy_price(state.max_buy),
+                    round_share_size(buy_shares),
                     OrderSide::Buy,
                 )
                 .await;
@@ -3873,10 +3906,10 @@ async fn hoover_task(
 
                 let profit = sweepable_shares - sweepable_cost;
 
-                // Tick-size: max_buy may be 0.999 from config (3 dp);
-                // CLOB requires ≤ tick_size dp (0.01 → 2 dp). Round both.
+                // Tick-size + clamp — see round_buy_price docs. Prevents
+                // 0.999 → 1.00 rejection.
                 let resp = order_client
-                    .place_limit(token_id, max_buy.round_dp(2), sweepable_shares.round_dp(2), OrderSide::Buy)
+                    .place_limit(token_id, round_buy_price(max_buy), round_share_size(sweepable_shares), OrderSide::Buy)
                     .await;
 
                 let status = match resp {
@@ -6152,16 +6185,15 @@ async fn api_save_paper_trade(
         let mut leg_errors: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
         for leg in &req.legs {
             // f64 → Decimal can carry FP garbage (0.55 becomes 0.55000…444).
-            // The CLOB rejects prices with more decimal places than the
-            // market's minimum tick size. Round to 2 dp — covers every
-            // Polymarket market (tick is 0.01 on weather/sports/elections,
-            // 0.001 only on 5-min crypto; 2 dp is always ≤ tick size).
-            let price = Decimal::from_f64_retain(leg.ask_at_buy)
-                .unwrap_or(Decimal::ZERO)
-                .round_dp(2);
-            let size = Decimal::from_f64_retain(leg.shares)
-                .unwrap_or(Decimal::ZERO)
-                .round_dp(2);
+            // Tick-size + direction-aware: BUY rounds up then clamps to
+            // [0.01, 0.99]. Covers both the f64-noise bug and the
+            // 0.999 → 1.00 rejection bug.
+            let price = round_buy_price(
+                Decimal::from_f64_retain(leg.ask_at_buy).unwrap_or(Decimal::ZERO),
+            );
+            let size = round_share_size(
+                Decimal::from_f64_retain(leg.shares).unwrap_or(Decimal::ZERO),
+            );
             match order_client
                 .place_limit(&leg.token_id, price, size, OrderSide::Buy)
                 .await
@@ -6528,9 +6560,13 @@ async fn api_close_paper_trade(
                     continue;
                 }
             };
-            // Round for tick-size compliance (0.5500000…044 mess fix).
-            let limit = plan.worst_walked_price.unwrap_or(state.min_sell).round_dp(2);
-            let size = plan.filled_shares.round_dp(2);
+            // Tick-size + direction-aware: SELL rounds down and clamps
+            // to [0.01, 0.99]. Prevents rounding the floor up above
+            // any actual bid level (which would leave everything unfilled).
+            let limit = round_sell_price(
+                plan.worst_walked_price.unwrap_or(state.min_sell),
+            );
+            let size = round_share_size(plan.filled_shares);
             match order_client
                 .place_limit(&leg.token_id, limit, size, OrderSide::Sell)
                 .await
