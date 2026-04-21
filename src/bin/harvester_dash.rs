@@ -2288,19 +2288,35 @@ async fn resolve_sell_target(
     Ok((market, token_id))
 }
 
-/// Compute the sell plan by walking the bid book for `want_shares` shares.
-/// Stops at `min_price` (skips levels below) and caps total shares at
-/// what the caller actually holds. Returns (filled_shares, gross_revenue,
-/// avg_fill_price, levels_consumed).
+/// Plan result from walking the bid book for a sell.
+#[derive(Debug, Clone)]
+struct SellPlan {
+    filled_shares: Decimal,
+    gross_revenue: Decimal,
+    avg_fill_price: Decimal,
+    /// The lowest price level we counted — i.e. the price we need the
+    /// limit order set to so that *every* level walked actually fills.
+    /// None when nothing filled. This is the "slippage-aware floor":
+    /// using this as the limit guarantees the preview numbers match
+    /// the actual fill (avg_fill as a floor under-fills on multi-level
+    /// books because mid-priced levels sit below their own average).
+    worst_walked_price: Option<Decimal>,
+    levels_consumed: usize,
+}
+
+/// Walk the bid book top-down up to `want_shares` and compute the sell
+/// plan. Stops at `min_price` (skips levels strictly below) and caps
+/// total shares at what the caller actually holds.
 fn simulate_sell_walk(
     book: &surebet::orderbook::OrderBook,
     want_shares: Decimal,
     min_price: Decimal,
-) -> (Decimal, Decimal, Decimal, usize) {
+) -> SellPlan {
     let mut remaining = want_shares;
     let mut revenue = Decimal::ZERO;
     let mut filled = Decimal::ZERO;
     let mut levels = 0usize;
+    let mut worst: Option<Decimal> = None;
     // BTreeMap iterates asc; sell side walks descending (highest bid first).
     for (&price, &size) in book.bids.levels.iter().rev() {
         if price < min_price || remaining <= Decimal::ZERO {
@@ -2314,13 +2330,22 @@ fn simulate_sell_walk(
         filled += take;
         remaining -= take;
         levels += 1;
+        // Each loop iteration's price is monotonically <= previous, so
+        // the last iteration's price is the lowest we walked.
+        worst = Some(price);
     }
     let avg = if filled > Decimal::ZERO {
         revenue / filled
     } else {
         Decimal::ZERO
     };
-    (filled, revenue, avg, levels)
+    SellPlan {
+        filled_shares: filled,
+        gross_revenue: revenue,
+        avg_fill_price: avg,
+        worst_walked_price: worst,
+        levels_consumed: levels,
+    }
 }
 
 async fn api_sell_preview(
@@ -2356,29 +2381,42 @@ async fn api_sell_preview(
         .book_store
         .fetch_rest_book(&state.clob_url, &token_id)
         .await;
-    let (best_bid, filled, revenue, avg_price, levels) = match book.as_ref() {
-        Some(b) => {
-            let bb = b.bids.best(true).map(|(p, _)| p);
-            let (f, r, a, l) = simulate_sell_walk(b, want_shares, min_price);
-            (bb, f, r, a, l)
-        }
-        None => (None, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, 0),
+    let (best_bid, plan) = match book.as_ref() {
+        Some(b) => (
+            b.bids.best(true).map(|(p, _)| p),
+            simulate_sell_walk(b, want_shares, min_price),
+        ),
+        None => (
+            None,
+            SellPlan {
+                filled_shares: Decimal::ZERO,
+                gross_revenue: Decimal::ZERO,
+                avg_fill_price: Decimal::ZERO,
+                worst_walked_price: None,
+                levels_consumed: 0,
+            },
+        ),
     };
 
-    // Cost basis isn't stored on the position row; the caller may pass
-    // it via `min_price` if they've computed it elsewhere, but for the
-    // preview we compute % vs the approved floor price as a proxy and
-    // leave the real cost-basis comparison to the caller's display.
+    // The limit we'll use on execute is the *worst* level walked, not
+    // the average — using the average leaves mid-priced levels unfilled
+    // on multi-level books (classic slippage bug). Falls back to
+    // `min_price` when nothing filled (preview will just show the
+    // "no bids" warning).
+    let limit_floor = plan.worst_walked_price.unwrap_or(min_price);
+
     Json(serde_json::json!({
         "market_question": req.market.clone(),
         "outcome": req.outcome.clone(),
         "token_id": token_id,
         "requested_shares": want_shares.to_string(),
-        "fillable_shares": filled.to_string(),
+        "fillable_shares": plan.filled_shares.to_string(),
         "best_bid": best_bid.map(|p| p.to_string()),
-        "avg_fill_price": avg_price.to_string(),
-        "gross_revenue": revenue.to_string(),
-        "levels_consumed": levels,
+        "avg_fill_price": plan.avg_fill_price.to_string(),
+        "worst_walked_price": plan.worst_walked_price.map(|p| p.to_string()),
+        "limit_floor_price": limit_floor.to_string(),
+        "gross_revenue": plan.gross_revenue.to_string(),
+        "levels_consumed": plan.levels_consumed,
         "min_price_used": min_price.to_string(),
         "market": market.question,
     }))
@@ -2421,13 +2459,19 @@ async fn api_sell(
         .book_store
         .fetch_rest_book(&state.clob_url, &token_id)
         .await;
-    let (filled, revenue, avg_price, _levels) = match book_opt.as_ref() {
-        Some(b) => {
-            let (f, r, a, l) = simulate_sell_walk(b, want_shares, min_price);
-            (f, r, a, l)
-        }
-        None => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, 0),
+    let plan = match book_opt.as_ref() {
+        Some(b) => simulate_sell_walk(b, want_shares, min_price),
+        None => SellPlan {
+            filled_shares: Decimal::ZERO,
+            gross_revenue: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: None,
+            levels_consumed: 0,
+        },
     };
+    let filled = plan.filled_shares;
+    let revenue = plan.gross_revenue;
+    let avg_price = plan.avg_fill_price;
 
     if filled <= Decimal::ZERO {
         return (
@@ -2442,6 +2486,17 @@ async fn api_sell(
             .into_response();
     }
 
+    // Slippage-aware floor: the SDK order limit is the *worst* price we
+    // walked, not the average. Using the average caused mid-priced
+    // levels to sit unfilled on multi-level books.
+    //
+    // NOTE: for neg-risk events the per-bucket books are usually thin
+    // and single-level, so this nearly always resolves to the best
+    // bid. The bigger v2 concern for neg-risk is the rebalance flow
+    // (see plans/sell_action.md §"Follow-ups") which this doesn't
+    // touch — that's a separate feature.
+    let order_limit_price = plan.worst_walked_price.unwrap_or(min_price);
+
     // Mode resolution: explicit "paper" / "live" override in the
     // request wins; otherwise follow the server's runtime mode. This
     // means the button doesn't need to know which mode the server is
@@ -2452,9 +2507,10 @@ async fn api_sell(
         _ => state.live_mode,
     };
 
-    // Live path: place a limit-sell at `min_price` for `filled` shares.
-    // The CLOB matches against any resting bids ≥ min_price — matches
-    // what the preview simulated.
+    // Live path: place a limit-sell at `order_limit_price` for `filled`
+    // shares. The CLOB matches any resting bid ≥ limit — and since our
+    // limit is the worst price we counted, every level walked in the
+    // preview settles in this order.
     let (status, order_id_opt, err_msg) = if is_live {
         if !state.live_mode {
             return (
@@ -2476,7 +2532,7 @@ async fn api_sell(
             }
         };
         match order_client
-            .place_limit(&token_id, min_price, filled, OrderSide::Sell)
+            .place_limit(&token_id, order_limit_price, filled, OrderSide::Sell)
             .await
         {
             Ok(r) if r.success => (
@@ -6758,9 +6814,14 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
   const partial = fillable < requested;
   const dry = fillable <= 0;
 
-  // Use avg_fill_price as the limit floor on execute — won't fill
-  // below this, even if the top of book moves.
-  const limitFloor = avgPx > 0 ? avgPx : minPrice;
+  // The server now returns a slippage-aware floor = the worst level
+  // we walked. Using this as the CLOB limit guarantees every level
+  // counted in `fillable_shares` / `gross_revenue` actually settles —
+  // the old avg-price floor left mid-priced levels unfilled on
+  // multi-level books.
+  const limitFloor = p.limit_floor_price != null
+    ? parseFloat(p.limit_floor_price)
+    : (avgPx > 0 ? avgPx : minPrice);
 
   const warn = dry
     ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids meet the minimum floor. Nothing to sell.</div>`
@@ -6784,9 +6845,11 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
       <div>Fillable shares at bid depth: <b>${{fillable.toFixed(2)}}</b> / ${{requested.toFixed(2)}}</div>
       <div>Avg fill price: <b>$${{avgPx.toFixed(4)}}</b></div>
       <div>Gross revenue: <b>$${{gross.toFixed(4)}}</b></div>
-      <div>Limit floor (order price): <b>$${{limitFloor.toFixed(4)}}</b></div>
+      <div>Limit price (order floor): <b>$${{limitFloor.toFixed(4)}}</b> <span style="color:#8b949e;font-size:0.8em">— worst level walked</span></div>
       <div style="color:#8b949e;font-size:0.8em;margin-top:0.3em">
-        Order placed as a limit sell at the floor — fills anything at or above, no worse.
+        Order is a limit sell at the floor. The CLOB matches any bid ≥ floor,
+        so every level in the preview settles in this one order. If the book
+        moves up between preview and execute, fills are better than shown.
       </div>
     </div>
     ${{warn}}
