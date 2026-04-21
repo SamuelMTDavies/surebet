@@ -174,6 +174,13 @@ trait CtfSplitTrait: Send + Sync {
     /// transaction (and waste gas) when the user has already sold one side.
     async fn balance_for(&self, condition_id: B256) -> anyhow::Result<(U256, U256)>;
 
+    /// Returns the wallet's raw ERC-1155 balance for a specific CTF position
+    /// token (the `token_id` you get from Polymarket's CLOB — a decimal-string
+    /// uint256). Used by sell paths to cap order size at actual on-chain
+    /// holdings — prevents "not enough balance" rejections when the saved
+    /// trade record's `shares` value drifts from what really filled.
+    async fn balance_for_token_id(&self, token_id: U256) -> anyhow::Result<U256>;
+
     /// Returns the resolution status for a condition. Free read-only call.
     /// - `denominator == 0` → the market has not been resolved yet
     /// - `denominator > 0`  → resolved; `(yes_payout, no_payout)` indicates
@@ -412,6 +419,21 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
         let no_fut = self.balance_for_side(condition_id, U256::from(2u64));
         let (yes, no) = tokio::try_join!(yes_fut, no_fut)?;
         Ok((yes, no))
+    }
+
+    async fn balance_for_token_id(&self, token_id: U256) -> anyhow::Result<U256> {
+        // CTF position tokens are standard ERC-1155 under the CTF contract,
+        // with the token_id being the position_id directly. No need to
+        // derive via collection_id/position_id like `balance_for_side` —
+        // the CLOB already hands us the position_id as the token_id.
+        let provider = self.client.provider().clone();
+        let erc1155 = IConditionalTokensView::new(CTF_CONTRACT, provider);
+        let bal = erc1155
+            .balanceOf(self.wallet, token_id)
+            .call()
+            .await
+            .map_err(|e| anyhow::anyhow!("balanceOf(token_id) failed: {e}"))?;
+        Ok(bal)
     }
 
     async fn current_gas_price_wei(&self) -> anyhow::Result<u128> {
@@ -2477,8 +2499,8 @@ async fn api_sell(
         }
     };
 
-    let want_shares = Decimal::from_str(&req.shares).unwrap_or(Decimal::ZERO);
-    if want_shares <= Decimal::ZERO {
+    let requested_shares = Decimal::from_str(&req.shares).unwrap_or(Decimal::ZERO);
+    if requested_shares <= Decimal::ZERO {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "shares must be > 0"})),
@@ -2490,6 +2512,49 @@ async fn api_sell(
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(state.min_sell);
+
+    // Cap at actual on-chain balance. The request's `shares` came from
+    // the Open Positions row which is Data-API-sourced — that can drift
+    // vs chain state (stale cache, mid-flow mint, prior partial sell).
+    // Reading the ERC-1155 directly is the source of truth.
+    let want_shares = match (state.ctf.as_ref(), U256::from_str(&token_id)) {
+        (Some(ctf), Ok(tid)) => match ctf.inner.balance_for_token_id(tid).await {
+            Ok(bal) => {
+                let on_chain = (Decimal::from_str(&bal.to_string()).unwrap_or(Decimal::ZERO)
+                    / Decimal::from(1_000_000i64))
+                .round_dp(2);
+                if on_chain < requested_shares {
+                    tracing::info!(
+                        token = %token_id,
+                        requested = %requested_shares,
+                        on_chain = %on_chain,
+                        "capping sell size at on-chain balance"
+                    );
+                    on_chain
+                } else {
+                    requested_shares
+                }
+            }
+            Err(e) => {
+                tracing::warn!(token = %token_id, error = %e, "balance_for_token_id failed — using requested size");
+                requested_shares
+            }
+        },
+        _ => requested_shares,
+    };
+
+    if want_shares <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Nothing held on-chain for {} — can't sell (position may already be closed).",
+                    req.outcome
+                ),
+            })),
+        )
+            .into_response();
+    }
 
     // Re-walk the book to get a fresh plan (best bid may have moved
     // between preview and execute).
@@ -6518,9 +6583,44 @@ async fn api_close_paper_trade(
             .book_store
             .fetch_rest_book(&state.clob_url, &leg.token_id)
             .await;
-        let want_shares = Decimal::from_f64_retain(leg.shares)
+        let record_shares = Decimal::from_f64_retain(leg.shares)
             .unwrap_or(Decimal::ZERO)
             .round_dp(2);
+
+        // Live-mode: cap `want_shares` at the actual ERC-1155 balance on
+        // chain. The saved `leg.shares` is the *intended* size — if the
+        // original BUY only partially filled (or never filled), we hold
+        // less than recorded. Without this cap the SDK rejects the sell
+        // with "not enough balance / allowance".
+        //
+        // Paper-mode: skip the chain query, trust the record.
+        let want_shares = if is_live {
+            let on_chain = match (state.ctf.as_ref(), U256::from_str(&leg.token_id)) {
+                (Some(ctf), Ok(tid)) => match ctf.inner.balance_for_token_id(tid).await {
+                    Ok(bal) => {
+                        // Raw is at 1e6 scale — convert to share Decimal.
+                        // `format!("{bal}")` gives the integer string; divide
+                        // by 1e6 via Decimal math to keep precision.
+                        let bal_dec = Decimal::from_str(&bal.to_string())
+                            .unwrap_or(Decimal::ZERO)
+                            / Decimal::from(1_000_000i64);
+                        Some(bal_dec.round_dp(2))
+                    }
+                    Err(e) => {
+                        tracing::warn!(token = %leg.token_id, error = %e, "balance_for_token_id failed, falling back to record");
+                        None
+                    }
+                },
+                _ => None,
+            };
+            match on_chain {
+                Some(on) if on < record_shares => on,
+                _ => record_shares,
+            }
+        } else {
+            record_shares
+        };
+
         let plan = match book.as_ref() {
             Some(b) => simulate_sell_walk(b, want_shares, state.min_sell),
             None => SellPlan {
@@ -6538,6 +6638,17 @@ async fn api_close_paper_trade(
                 if let Ok(r) = plan.gross_revenue.to_string().parse::<f64>() {
                     exit_revenue += r;
                 }
+            }
+
+            // Zero want_shares ⇒ we hold none of this leg (original buy
+            // likely never filled or was already sold). Skip cleanly
+            // instead of letting the CLOB reject with an opaque error.
+            if want_shares <= Decimal::ZERO {
+                per_leg.push(serde_json::json!({
+                    "leg": leg.bracket_label,
+                    "skipped": "zero on-chain balance — nothing held for this leg",
+                }));
+                continue;
             }
 
             if plan.filled_shares <= Decimal::ZERO {
