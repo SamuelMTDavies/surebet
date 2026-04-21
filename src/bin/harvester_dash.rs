@@ -684,10 +684,13 @@ fn round_sell_price(p: Decimal) -> Decimal {
     r.clamp(Decimal::new(1, 2), Decimal::new(99, 2))
 }
 
-/// Round a share size to 2 dp (Polymarket accepts fractional sizes; we
-/// just strip f64/division precision noise).
+/// Round a share size to 2 dp — always **down** so we never order more
+/// than we can afford / hold. Using nearest-round overshot an on-chain
+/// holding of 0.535 shares up to 0.54 and the CLOB rejected with
+/// "not enough balance". Floor is the safe universal choice for both
+/// buy sizing (never over-spend) and sell sizing (never oversell).
 fn round_share_size(s: Decimal) -> Decimal {
-    s.round_dp(2)
+    s.round_dp_with_strategy(2, RoundingStrategy::ToZero)
 }
 
 /// Default price-floor for sell orders: **max(best_bid × 0.90, state.min_sell)**.
@@ -2654,9 +2657,12 @@ async fn api_sell(
     let want_shares = match (state.ctf.as_ref(), U256::from_str(&token_id)) {
         (Some(ctf), Ok(tid)) => match ctf.inner.balance_for_token_id(tid).await {
             Ok(bal) => {
+                // Floor, not nearest — 0.535 shares on-chain must NOT round
+                // up to 0.54 (would make us oversell by 5,000 raw units
+                // and hit "not enough balance").
                 let on_chain = (Decimal::from_str(&bal.to_string()).unwrap_or(Decimal::ZERO)
                     / Decimal::from(1_000_000i64))
-                .round_dp(2);
+                .round_dp_with_strategy(2, RoundingStrategy::ToZero);
                 if on_chain < requested_shares {
                     tracing::info!(
                         token = %token_id,
@@ -6724,13 +6730,12 @@ async fn api_close_paper_trade(
             let on_chain = match (state.ctf.as_ref(), U256::from_str(&leg.token_id)) {
                 (Some(ctf), Ok(tid)) => match ctf.inner.balance_for_token_id(tid).await {
                     Ok(bal) => {
-                        // Raw is at 1e6 scale — convert to share Decimal.
-                        // `format!("{bal}")` gives the integer string; divide
-                        // by 1e6 via Decimal math to keep precision.
+                        // Raw is at 1e6 scale. Floor (ToZero) — never
+                        // over-report what we hold, or the CLOB rejects.
                         let bal_dec = Decimal::from_str(&bal.to_string())
                             .unwrap_or(Decimal::ZERO)
                             / Decimal::from(1_000_000i64);
-                        Some(bal_dec.round_dp(2))
+                        Some(bal_dec.round_dp_with_strategy(2, RoundingStrategy::ToZero))
                     }
                     Err(e) => {
                         tracing::warn!(token = %leg.token_id, error = %e, "balance_for_token_id failed, falling back to record");
