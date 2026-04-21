@@ -690,6 +690,24 @@ fn round_share_size(s: Decimal) -> Decimal {
     s.round_dp(2)
 }
 
+/// Default price-floor for sell orders: **max(best_bid × 0.90, state.min_sell)**.
+/// Cap the walk at this floor AND use it as the CLOB limit — that way the
+/// order never fills below a reasonable slippage band from the current top
+/// bid. A blank or thin bid book returns `state.min_sell` as the floor,
+/// which the caller should check (filled_shares will be 0 if nothing clears
+/// the floor).
+///
+/// 10% slippage is the default safety margin. The caller can override via
+/// an explicit `min_price` on the request — the modal UI exposes this.
+fn default_sell_floor(best_bid: Decimal, min_sell: Decimal) -> Decimal {
+    let slippage = best_bid * Decimal::new(9, 1); // 0.9
+    // Round DOWN to keep the fill-radius slightly wider than the exact
+    // 90% figure, so we don't shave off the last penny of top-of-book
+    // due to tick-rounding.
+    let floored = slippage.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    floored.max(min_sell).max(Decimal::new(1, 2))
+}
+
 #[derive(Debug, Deserialize)]
 struct HarvestRequest {
     market_idx: usize,      // index into markets list
@@ -2523,39 +2541,47 @@ async fn api_sell_preview(
         )
             .into_response();
     }
-    let min_price = req
-        .min_price
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(state.min_sell);
 
+    // Fetch book first — we need best_bid to compute a default floor.
     let book = state
         .book_store
         .fetch_rest_book(&state.clob_url, &token_id)
         .await;
-    let (best_bid, plan) = match book.as_ref() {
-        Some(b) => (
-            b.bids.best(true).map(|(p, _)| p),
-            simulate_sell_walk(b, want_shares, min_price),
-        ),
-        None => (
-            None,
-            SellPlan {
-                filled_shares: Decimal::ZERO,
-                gross_revenue: Decimal::ZERO,
-                avg_fill_price: Decimal::ZERO,
-                worst_walked_price: None,
-                levels_consumed: 0,
-            },
-        ),
+    let best_bid = book
+        .as_ref()
+        .and_then(|b| b.bids.best(true).map(|(p, _)| p));
+
+    // Size-aware + price-aware: the walk fills requested shares but
+    // STOPS when the next bid would be below the floor. The floor is
+    // also what we hand the CLOB as the limit — the matcher fills
+    // best-first (good prices get priority) but never below `min_price`.
+    //
+    // Default floor = 10% slippage band off best bid. Caller can
+    // override via `req.min_price` (the modal surfaces this for the
+    // user to tighten or loosen).
+    let min_price = match req.min_price.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(p) => p.max(state.min_sell),
+        None => best_bid
+            .map(|bb| default_sell_floor(bb, state.min_sell))
+            .unwrap_or(state.min_sell),
     };
 
-    // The limit we'll use on execute is the *worst* level walked, not
-    // the average — using the average leaves mid-priced levels unfilled
-    // on multi-level books (classic slippage bug). Falls back to
-    // `min_price` when nothing filled (preview will just show the
-    // "no bids" warning).
-    let limit_floor = plan.worst_walked_price.unwrap_or(min_price);
+    let plan = match book.as_ref() {
+        Some(b) => simulate_sell_walk(b, want_shares, min_price),
+        None => SellPlan {
+            filled_shares: Decimal::ZERO,
+            gross_revenue: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: None,
+            levels_consumed: 0,
+        },
+    };
+
+    // CLOB limit is the floor, NOT the worst level walked. That way
+    // the order can never match below the floor — even if the book
+    // moves between preview and execute, or the matcher behaves in an
+    // unexpected price-improvement order.
+    let limit_floor = min_price;
 
     Json(serde_json::json!({
         "market_question": req.market.clone(),
@@ -2599,11 +2625,27 @@ async fn api_sell(
         )
             .into_response();
     }
-    let min_price = req
-        .min_price
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(state.min_sell);
+
+    // Fetch the book early — we need best_bid to resolve a sane
+    // default floor if the caller didn't supply one.
+    let book_opt = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &token_id)
+        .await;
+    let best_bid = book_opt
+        .as_ref()
+        .and_then(|b| b.bids.best(true).map(|(p, _)| p));
+
+    // The floor is the hard SELL limit — the walk stops here AND the
+    // CLOB limit is set to this, so no fill can land below it. Default
+    // is 90% of best bid (10% slippage band). The preview modal
+    // surfaces this so the user can tighten/loosen before confirm.
+    let min_price = match req.min_price.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(p) => p.max(state.min_sell),
+        None => best_bid
+            .map(|bb| default_sell_floor(bb, state.min_sell))
+            .unwrap_or(state.min_sell),
+    };
 
     // Cap at actual on-chain balance. The request's `shares` came from
     // the Open Positions row which is Data-API-sourced — that can drift
@@ -2648,12 +2690,7 @@ async fn api_sell(
             .into_response();
     }
 
-    // Re-walk the book to get a fresh plan (best bid may have moved
-    // between preview and execute).
-    let book_opt = state
-        .book_store
-        .fetch_rest_book(&state.clob_url, &token_id)
-        .await;
+    // Walk the (already-fetched) book for the size-capped sell plan.
     let plan = match book_opt.as_ref() {
         Some(b) => simulate_sell_walk(b, want_shares, min_price),
         None => SellPlan {
@@ -2681,16 +2718,13 @@ async fn api_sell(
             .into_response();
     }
 
-    // Slippage-aware floor: the SDK order limit is the *worst* price we
-    // walked, not the average. Using the average caused mid-priced
-    // levels to sit unfilled on multi-level books.
-    //
-    // NOTE: for neg-risk events the per-bucket books are usually thin
-    // and single-level, so this nearly always resolves to the best
-    // bid. The bigger v2 concern for neg-risk is the rebalance flow
-    // (see plans/sell_action.md §"Follow-ups") which this doesn't
-    // touch — that's a separate feature.
-    let order_limit_price = plan.worst_walked_price.unwrap_or(min_price);
+    // CLOB limit = the FLOOR (min_price), not the worst level walked.
+    // This is the critical protection: the matcher fills best-first,
+    // but will never match a bid below our limit. Previous code set
+    // the limit to `worst_walked_price` which let the CLOB fill us
+    // anywhere above rock-bottom. The walk is size-aware (stops at
+    // want_shares); the floor is price-aware (stops at min_price).
+    let order_limit_price = min_price;
 
     // Mode resolution: explicit "paper" / "live" override in the
     // request wins; otherwise follow the server's runtime mode. This
@@ -6713,8 +6747,19 @@ async fn api_close_paper_trade(
             record_shares
         };
 
+        // Size-aware + price-aware per leg. Default floor = 90% of
+        // best bid on THIS leg's book (10% slippage band), floored at
+        // state.min_sell. The walk stops here and the CLOB limit is
+        // set to this — no leg's fill can drop below its own floor.
+        let leg_best_bid = book
+            .as_ref()
+            .and_then(|b| b.bids.best(true).map(|(p, _)| p));
+        let leg_floor = leg_best_bid
+            .map(|bb| default_sell_floor(bb, state.min_sell))
+            .unwrap_or(state.min_sell);
+
         let plan = match book.as_ref() {
-            Some(b) => simulate_sell_walk(b, want_shares, state.min_sell),
+            Some(b) => simulate_sell_walk(b, want_shares, leg_floor),
             None => SellPlan {
                 filled_shares: Decimal::ZERO,
                 gross_revenue: Decimal::ZERO,
@@ -6746,7 +6791,10 @@ async fn api_close_paper_trade(
             if plan.filled_shares <= Decimal::ZERO {
                 per_leg.push(serde_json::json!({
                     "leg": leg.bracket_label,
-                    "skipped": "no bids — nothing to sell right now",
+                    "skipped": format!(
+                        "no bids ≥ ${} (floor = 90% of best bid) — too illiquid to sell without dumping",
+                        leg_floor
+                    ),
                 }));
                 any_failed = true;
                 continue;
@@ -6763,12 +6811,10 @@ async fn api_close_paper_trade(
                     continue;
                 }
             };
-            // Tick-size + direction-aware: SELL rounds down and clamps
-            // to [0.01, 0.99]. Prevents rounding the floor up above
-            // any actual bid level (which would leave everything unfilled).
-            let limit = round_sell_price(
-                plan.worst_walked_price.unwrap_or(state.min_sell),
-            );
+            // CLOB limit = the leg's price floor. Won't match below it
+            // even if the book moves. Tick-safe rounding + clamp keep
+            // the SDK validator happy.
+            let limit = round_sell_price(leg_floor);
             let size = round_share_size(plan.filled_shares);
             match order_client
                 .place_limit(&leg.token_id, limit, size, OrderSide::Sell)
@@ -7835,15 +7881,22 @@ async function clearGeoblock() {{
 // confirm. Server resolves token_id from (condition_id, outcome) so
 // the client never handles the ERC-1155 id.
 async function sellPosition(conditionId, outcome, market, heldShares) {{
+  // First preview with server-default floor (90% of best bid).
+  await refreshSellPreview(conditionId, outcome, market, heldShares, null);
+}}
+
+async function refreshSellPreview(conditionId, outcome, market, heldShares, minPriceOverride) {{
+  const body = {{
+    condition_id: conditionId,
+    outcome: outcome,
+    market: market,
+    shares: String(heldShares),
+  }};
+  if (minPriceOverride != null) body.min_price = String(minPriceOverride);
   const resp = await fetch('/api/sell-preview', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{
-      condition_id: conditionId,
-      outcome: outcome,
-      market: market,
-      shares: String(heldShares),
-    }}),
+    body: JSON.stringify(body),
   }});
   const p = await resp.json();
   if (p.error) {{ alert('Preview failed: ' + p.error); return; }}
@@ -7863,19 +7916,20 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
   const partial = fillable < requested;
   const dry = fillable <= 0;
 
-  // The server now returns a slippage-aware floor = the worst level
-  // we walked. Using this as the CLOB limit guarantees every level
-  // counted in `fillable_shares` / `gross_revenue` actually settles —
-  // the old avg-price floor left mid-priced levels unfilled on
-  // multi-level books.
-  const limitFloor = p.limit_floor_price != null
-    ? parseFloat(p.limit_floor_price)
-    : (avgPx > 0 ? avgPx : minPrice);
+  // The CLOB limit is the MIN PRICE FLOOR (not worst walked). The
+  // matcher fills best-first but can never match below this floor.
+  // Server default = max(best_bid × 0.9, min_sell). User can tighten
+  // via the input below.
+  const limitFloor = minPrice;
+
+  const slippagePct = bestBid && bestBid > 0
+    ? ((1 - (limitFloor / bestBid)) * 100).toFixed(1)
+    : '—';
 
   const warn = dry
-    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids meet the minimum floor. Nothing to sell.</div>`
+    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids ≥ $${{limitFloor.toFixed(4)}} — the book is too thin to sell without dumping. Lower the floor at your own risk.</div>`
     : partial
-    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial fill: only ${{fillable.toFixed(2)}} of ${{requested.toFixed(2)}} shares have book depth at the limit.</div>`
+    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial fill: only ${{fillable.toFixed(2)}} of ${{requested.toFixed(2)}} shares clear the floor. The rest would require selling below $${{limitFloor.toFixed(4)}}.</div>`
     : '';
 
   const execBtn = dry
@@ -7891,14 +7945,23 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
     </div>
     <div style="border:1px solid #30363d;border-radius:6px;padding:1em;font-family:monospace;font-size:0.9em;line-height:1.7em">
       <div>Best bid: <b>${{bestBid != null ? '$' + bestBid.toFixed(3) : '—'}}</b></div>
-      <div>Fillable shares at bid depth: <b>${{fillable.toFixed(2)}}</b> / ${{requested.toFixed(2)}}</div>
-      <div>Avg fill price: <b>$${{avgPx.toFixed(4)}}</b></div>
+      <div style="background:#1f2d3d;padding:0.4em 0.6em;border-radius:3px;margin:0.3em 0">
+        <span style="color:#c9d1d9">Minimum price floor: </span>
+        <input id="sell-floor-input" type="number" min="0.01" max="0.99" step="0.01"
+               value="${{limitFloor.toFixed(2)}}"
+               style="width:5em;padding:0.2em 0.3em;background:#0d1117;color:#58a6ff;border:1px solid #30363d;border-radius:3px;font-family:inherit;font-weight:600">
+        <button class="action-btn" style="padding:0.15em 0.5em;margin-left:0.3em;font-size:0.8em"
+                onclick="applySellFloor('${{conditionId}}','${{outcome}}',${{JSON.stringify(market).replace(/"/g,'&quot;')}},${{heldShares}})">Apply</button>
+        <span style="color:#8b949e;font-size:0.8em"> — slippage from best bid: ${{slippagePct}}%</span>
+      </div>
+      <div>Fillable at floor: <b>${{fillable.toFixed(2)}}</b> / ${{requested.toFixed(2)}} shares</div>
+      <div>Avg fill price (on walk): <b>$${{avgPx.toFixed(4)}}</b></div>
       <div>Gross revenue: <b>$${{gross.toFixed(4)}}</b></div>
-      <div>Limit price (order floor): <b>$${{limitFloor.toFixed(4)}}</b> <span style="color:#8b949e;font-size:0.8em">— worst level walked</span></div>
-      <div style="color:#8b949e;font-size:0.8em;margin-top:0.3em">
-        Order is a limit sell at the floor. The CLOB matches any bid ≥ floor,
-        so every level in the preview settles in this one order. If the book
-        moves up between preview and execute, fills are better than shown.
+      <div style="color:#8b949e;font-size:0.8em;margin-top:0.4em">
+        CLOB limit = floor. The matcher fills against best bids first and
+        stops when it would need to match below the floor — so you never
+        sell below $${{limitFloor.toFixed(4)}} even if the book moves.
+        Tighten the floor to refuse any slippage; loosen to fill more.
       </div>
     </div>
     ${{warn}}
@@ -7908,6 +7971,17 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
     </div>
   `;
   modal.style.display = 'flex';
+}}
+
+function applySellFloor(conditionId, outcome, market, heldShares) {{
+  const el = document.getElementById('sell-floor-input');
+  if (!el) return;
+  const v = parseFloat(el.value);
+  if (!Number.isFinite(v) || v <= 0 || v >= 1) {{
+    alert('Floor must be between 0.01 and 0.99');
+    return;
+  }}
+  refreshSellPreview(conditionId, outcome, market, heldShares, v);
 }}
 
 function closeSellModal() {{
