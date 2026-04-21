@@ -961,6 +961,7 @@ async fn main() -> Result<()> {
         .route("/api/paper-trade", post(api_save_paper_trade))
         .route("/api/paper-trades", get(api_paper_trades))
         .route("/api/paper-trade/close", post(api_close_paper_trade))
+        .route("/api/paper-trade/reopen", post(api_reopen_paper_trade))
         .route("/ws/book", get(ws_book_handler))
         .with_state(state.clone());
 
@@ -2533,8 +2534,15 @@ async fn api_sell(
                     .into_response();
             }
         };
+        // Tick-size safe: book-sourced price but round defensively for
+        // f64 noise; shares can carry division precision.
         match order_client
-            .place_limit(&token_id, order_limit_price, filled, OrderSide::Sell)
+            .place_limit(
+                &token_id,
+                order_limit_price.round_dp(2),
+                filled.round_dp(2),
+                OrderSide::Sell,
+            )
             .await
         {
             Ok(r) if r.success => (
@@ -2892,8 +2900,16 @@ async fn api_buy_direct(
                     .into_response();
             }
         };
+        // Tick-size: 2 dp covers every Polymarket tick_size (0.01 default,
+        // 0.001 on 5-min crypto which we don't trade here). filled_shares
+        // can carry division precision from budget/price — round to 2 dp.
         match order_client
-            .place_limit(&req.token_id, order_limit_price, plan.filled_shares, OrderSide::Buy)
+            .place_limit(
+                &req.token_id,
+                order_limit_price.round_dp(2),
+                plan.filled_shares.round_dp(2),
+                OrderSide::Buy,
+            )
             .await
         {
             Ok(r) if r.success => (
@@ -3381,11 +3397,14 @@ async fn api_harvest(
                                 if attempt > 0 {
                                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 }
+                                // Tick-size safe: best_bid comes from the
+                                // book (already valid) but we still round
+                                // defensively in case of f64 noise.
                                 let resp = order_client
                                     .place_limit(
                                         loser_token_id,
-                                        *best_bid,
-                                        sell_size,
+                                        best_bid.round_dp(2),
+                                        sell_size.round_dp(2),
                                         OrderSide::Sell,
                                     )
                                     .await;
@@ -3498,11 +3517,16 @@ async fn api_harvest(
                 return Json(serde_json::json!({"ok": false, "entry": entry})).into_response();
             };
 
+            // Tick-size compliance: Polymarket CLOB rejects any price
+            // whose decimal places exceed the market's `minimum_tick_size`
+            // (0.01 on every market we trade). state.max_buy defaults to
+            // 0.999 (3 dp) which fails — round to 2 dp. Shares similarly
+            // must not carry f64/division noise past 2 dp.
             let resp = order_client
                 .place_limit(
                     winner_token_id,
-                    state.max_buy,
-                    buy_shares,
+                    state.max_buy.round_dp(2),
+                    buy_shares.round_dp(2),
                     OrderSide::Buy,
                 )
                 .await;
@@ -3849,8 +3873,10 @@ async fn hoover_task(
 
                 let profit = sweepable_shares - sweepable_cost;
 
+                // Tick-size: max_buy may be 0.999 from config (3 dp);
+                // CLOB requires ≤ tick_size dp (0.01 → 2 dp). Round both.
                 let resp = order_client
-                    .place_limit(token_id, max_buy, sweepable_shares, OrderSide::Buy)
+                    .place_limit(token_id, max_buy.round_dp(2), sweepable_shares.round_dp(2), OrderSide::Buy)
                     .await;
 
                 let status = match resp {
@@ -6306,6 +6332,93 @@ struct CloseTradeRequest {
 /// Mark a paper trade as closed, snapshot current exit revenue, and rewrite
 /// the JSONL. Load-modify-rewrite is fine for a local file with small trade
 /// counts; if this ever grows we'd move to a real store.
+/// POST /api/paper-trade/reopen
+/// Flip a trade's status back to "open". Used when an earlier Close
+/// click ran under the old snapshot-only logic that didn't actually
+/// sell any legs — the on-chain shares are still held, so the user
+/// wants the trade row back in the "open" list so they can re-click
+/// Close under the new live-sell logic.
+async fn api_reopen_paper_trade(
+    State(_state): State<AppState>,
+    Json(req): Json<CloseTradeRequest>,
+) -> impl IntoResponse {
+    let contents = match tokio::fs::read_to_string(PAPER_TRADES_FILE).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("no paper trades file: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let mut trades: Vec<PaperTrade> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<PaperTrade>(l).ok())
+        .collect();
+    let idx = match trades.iter().position(|t| t.id == req.id) {
+        Some(i) => i,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "trade not found"})),
+            )
+                .into_response();
+        }
+    };
+    // Only reopen if it's currently in a closed-but-not-sold-on-chain
+    // state. Resolved/redeemed trades are terminal.
+    let was = trades[idx].status.clone();
+    match was.as_str() {
+        "closed_manual" | "sold_partial" => {}
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("trade status is '{was}' — can only reopen closed_manual or sold_partial")
+                })),
+            )
+                .into_response();
+        }
+    }
+    trades[idx].status = "open".to_string();
+    trades[idx].closed_at = None;
+    trades[idx].close_sell_revenue = None;
+    trades[idx].realized_pnl = None;
+
+    // Atomic rewrite via tmp+rename.
+    let tmp_path = format!("{}.tmp", PAPER_TRADES_FILE);
+    let mut out = String::new();
+    for t in &trades {
+        if let Ok(s) = serde_json::to_string(t) {
+            out.push_str(&s);
+            out.push('\n');
+        }
+    }
+    if let Err(e) = tokio::fs::write(&tmp_path, out).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("write failed: {e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, PAPER_TRADES_FILE).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("rename failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "reopened": true,
+        "id": req.id,
+        "was": was,
+    }))
+    .into_response()
+}
+
 async fn api_close_paper_trade(
     State(state): State<AppState>,
     Json(req): Json<CloseTradeRequest>,
@@ -6861,6 +6974,14 @@ async function load() {
       ? `<button onclick="closeTrade('${t.id}','${t.mode}')" style="background:${t.mode === 'live' ? '#d97706' : '#21262d'};color:${t.mode === 'live' ? '#fff' : '#c9d1d9'};border:1px solid ${t.mode === 'live' ? '#f59e0b' : '#30363d'};padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">${t.mode === 'live' ? 'Close (sell legs on CLOB)' : 'Close (snapshot at current bids)'}</button>`
       : '';
 
+    // Reopen button: visible for trades that were marked closed but
+    // whose on-chain legs are likely still held (the old Close path
+    // snapshotted without selling). Flips status back to "open" so
+    // the now-correct Close button can actually sell them.
+    const reopenBtn = (t.mode === 'live' && (t.status === 'closed_manual' || t.status === 'sold_partial'))
+      ? `<button onclick="reopenTrade('${t.id}')" style="background:#58a6ff;color:#fff;border:1px solid #1f6feb;padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">Reopen (legs may still be live)</button>`
+      : '';
+
     const modeTag = (t.mode === 'live')
       ? `<span style="background:#da3633;color:white;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em;font-weight:600">LIVE</span>`
       : `<span style="background:#1f2933;color:#8b949e;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">PAPER</span>`;
@@ -6897,6 +7018,7 @@ async function load() {
         <span class="regime-badge">${t.regime}</span>
         ${statusBadge}
         ${closeBtn}
+        ${reopenBtn}
       </div>
       <div class="trade-sub">Entered ${created} · Model P(win at entry) ${modelProb}</div>
       ${closedBlock}
@@ -6925,6 +7047,25 @@ function tickAge() {
   if (!lastFetch) return;
   const s = Math.round((Date.now() - lastFetch) / 1000);
   document.getElementById('last-updated').textContent = `updated ${s}s ago · auto-refresh every 15s`;
+}
+
+async function reopenTrade(id) {
+  if (!confirm('Reopen this trade? Flips it back to "open" so you can retry the Close flow (which now actually places sell orders on the CLOB for live legs). No orders are placed by this action itself — it just restores the trade to the open list.')) return;
+  try {
+    const r = await fetch('/api/paper-trade/reopen', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id}),
+    });
+    const j = await r.json();
+    if (j.reopened) {
+      await load();
+    } else {
+      alert(`Reopen failed: ${j.error || 'unknown'}`);
+    }
+  } catch (e) {
+    alert(`Reopen failed: ${e}`);
+  }
 }
 
 async function closeTrade(id, mode) {
