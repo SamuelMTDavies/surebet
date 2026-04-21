@@ -1636,12 +1636,34 @@ fn compute_stats(activity: &[ActivityEntry], matic_usd: Decimal) -> TradeStats {
     let mut s = TradeStats::default();
     s.total_entries = activity.len();
     for a in activity {
-        // Sum gas regardless of success
+        // Classify first so we know whether this entry represents a
+        // real fill vs. a failed attempt. Failed orders still burn gas
+        // (rare but possible on chain-side ops like split/merge) so we
+        // sum gas unconditionally.
         if let Ok(g) = Decimal::from_str(&a.gas_matic) {
             s.total_gas_matic += g;
         }
-        // Skip paper-mode entries from monetary totals
-        if a.strategy.starts_with("PAPER") {
+
+        let is_err = a.status.contains("ERR") || a.status.contains("FAIL");
+        let is_ok = a.status.contains("OK");
+        let is_stuck = a.status.contains("MINT OK")
+            && (a.status.contains("SELL ERR") || a.status.contains("SELL FAIL"))
+            && !a.status.contains("RECOVERED");
+        if is_stuck {
+            s.stuck_trades += 1;
+        }
+        if is_err {
+            s.failed_trades += 1;
+        } else if is_ok {
+            s.successful_trades += 1;
+        }
+
+        // Monetary totals: ONLY from successful, non-paper entries.
+        // A failed HOOVER or BUY shouldn't inflate "Total Buy" — the
+        // money never left the wallet. This was previously summing
+        // across every entry, producing wildly wrong totals after a
+        // run of failed background fires.
+        if a.strategy.starts_with("PAPER") || !is_ok || is_err {
             continue;
         }
         if let Ok(v) = Decimal::from_str(&a.buy_cost) {
@@ -1655,18 +1677,6 @@ fn compute_stats(activity: &[ActivityEntry], matic_usd: Decimal) -> TradeStats {
         }
         if let Ok(v) = Decimal::from_str(&a.net_profit) {
             s.realized_pnl += v;
-        }
-        // Classify
-        let is_stuck = a.status.contains("MINT OK")
-            && (a.status.contains("SELL ERR") || a.status.contains("SELL FAIL"))
-            && !a.status.contains("RECOVERED");
-        if is_stuck {
-            s.stuck_trades += 1;
-        }
-        if a.status.contains("ERR") || a.status.contains("FAIL") {
-            s.failed_trades += 1;
-        } else if a.status.contains("OK") {
-            s.successful_trades += 1;
         }
     }
     s.total_gas_usdc = (s.total_gas_matic * matic_usd).round_dp(6);
@@ -2314,8 +2324,12 @@ async fn api_harvest_preview(
 #[derive(Debug, Deserialize)]
 struct SellRequest {
     /// Hex condition_id (0x…) of the market holding the position.
+    /// Ignored when `token_id` is supplied directly.
+    #[serde(default)]
     condition_id: String,
-    /// "Yes" or "No" — which side to sell.
+    /// "Yes" or "No" — which side to sell. Ignored when `token_id` is
+    /// supplied directly.
+    #[serde(default)]
     outcome: String,
     /// Display title (for activity log; server doesn't trust it for routing).
     market: String,
@@ -2329,6 +2343,16 @@ struct SellRequest {
     /// wallet + order_client.
     #[serde(default)]
     mode: Option<String>,
+    /// Direct CTF ERC-1155 token_id (decimal string). Skips the
+    /// condition_id → market → token lookup when the caller already
+    /// has the token id (e.g. paper-trade leg sell, where each leg
+    /// stores its own token_id).
+    #[serde(default)]
+    token_id: Option<String>,
+    /// Optional label for activity log when token_id is used directly
+    /// (e.g. "15°C · exit"). Falls back to `outcome` when blank.
+    #[serde(default)]
+    label: Option<String>,
 }
 
 /// Resolve a sell request's market + token_id. Returns `Err` with a
@@ -2525,14 +2549,41 @@ async fn api_sell_preview(
     State(state): State<AppState>,
     Json(req): Json<SellRequest>,
 ) -> impl IntoResponse {
-    let (market, token_id) = match resolve_sell_target(&state, &req).await {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e})),
-            )
-                .into_response();
+    // If the caller supplied a token_id directly (paper-trade leg sell),
+    // skip the condition_id/outcome → market resolution. Saves a Gamma
+    // round-trip and handles cases where we only know the raw token.
+    let (market, token_id) = if let Some(tid) = req.token_id.as_deref().filter(|s| !s.is_empty()) {
+        (
+            HarvestableMarket {
+                market_id: String::new(),
+                condition_id: req.condition_id.clone(),
+                question: req.market.clone(),
+                outcomes: vec![req
+                    .label
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| req.outcome.clone())],
+                clob_token_ids: vec![tid.to_string()],
+                end_date: None,
+                is_neg_risk: false,
+                category: String::new(),
+                slug: None,
+                accepting_orders: true,
+                volume_24hr: 0.0,
+                liquidity: 0.0,
+            },
+            tid.to_string(),
+        )
+    } else {
+        match resolve_sell_target(&state, &req).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -2609,14 +2660,41 @@ async fn api_sell(
     Json(req): Json<SellRequest>,
 ) -> impl IntoResponse {
     let now = Utc::now().format("%H:%M:%S").to_string();
-    let (market, token_id) = match resolve_sell_target(&state, &req).await {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e})),
-            )
-                .into_response();
+    // If the caller supplied a token_id directly (paper-trade leg sell),
+    // skip the condition_id/outcome → market resolution. Saves a Gamma
+    // round-trip and handles cases where we only know the raw token.
+    let (market, token_id) = if let Some(tid) = req.token_id.as_deref().filter(|s| !s.is_empty()) {
+        (
+            HarvestableMarket {
+                market_id: String::new(),
+                condition_id: req.condition_id.clone(),
+                question: req.market.clone(),
+                outcomes: vec![req
+                    .label
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| req.outcome.clone())],
+                clob_token_ids: vec![tid.to_string()],
+                end_date: None,
+                is_neg_risk: false,
+                category: String::new(),
+                slug: None,
+                accepting_orders: true,
+                volume_24hr: 0.0,
+                liquidity: 0.0,
+            },
+            tid.to_string(),
+        )
+    } else {
+        match resolve_sell_target(&state, &req).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -3770,24 +3848,20 @@ async fn api_harvest(
                     }
                     status_parts.push(format!("BUY OK id={}", r.order_id));
 
-                    // Start hoover in background for additional shares
-                    let book_store = state.book_store.clone();
-                    let token_id = winner_token_id.clone();
-                    let label = req.label.clone();
-                    let max_buy = state.max_buy;
-                    let order_client_clone = order_client.clone();
-                    let activity = state.activity.clone();
-                    tokio::spawn(async move {
-                        hoover_task(
-                            &book_store,
-                            &token_id,
-                            &label,
-                            max_buy,
-                            &order_client_clone,
-                            &activity,
-                        )
-                        .await;
-                    });
+                    // HOOVER spawn INTENTIONALLY DISABLED.
+                    //
+                    // Previously a `hoover_task` was spawned here to keep a
+                    // WebSocket open and fire more BUY orders every time
+                    // fresh ask depth appeared under `max_buy` (0.99). It
+                    // had no per-trade budget, no daily cap awareness, and
+                    // no visibility — resulting in dozens of failed log
+                    // entries per click.
+                    //
+                    // Planned v2 (see plans/hoover_v2_silly_low_sniper.md):
+                    // repurpose as an opportunistic "silly-low ask sniper"
+                    // capped at ~$0.01 per share with real budget rails and
+                    // a UI surface. Not wired in yet — manual BUY is a
+                    // one-shot trade with no background spawn.
                 }
                 Ok(r) => status_parts.push(format!("BUY FAIL: {}", r.error_msg)),
                 Err(e) => {
@@ -4046,6 +4120,11 @@ fn build_book_payload_from_store(
 
 // ─── Hoover background task ─────────────────────────────────────────────────
 
+// Kept around for reference / v2 repurpose (see
+// plans/hoover_v2_silly_low_sniper.md). Not currently called anywhere —
+// the spawn in api_harvest was removed after it caused runaway failed
+// buy attempts with no budget rails.
+#[allow(dead_code)]
 async fn hoover_task(
     book_store: &Arc<OrderBookStore>,
     token_id: &str,
@@ -6355,15 +6434,64 @@ async fn api_save_paper_trade(
             )
                 .into_response();
         };
-        // Balance check before committing
+        // Position-rail checks — same caps as the harvest handler
+        // uses. Previously the paper-trade save only did a USDC balance
+        // check, which meant a single weather combo could blow past
+        // the $10/trade and $30/day limits the user set in config.
+        let needed: Decimal = req
+            .legs
+            .iter()
+            .map(|l| {
+                Decimal::from_f64_retain(l.ask_at_buy * l.shares).unwrap_or(Decimal::ZERO)
+            })
+            .sum();
+
+        // Per-trade cap
+        if needed > state.max_trade {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Trade cost ${:.4} exceeds per-trade cap ${:.2}. \
+                         Lower share count or raise `harvester.max_trade_usd` in config.",
+                        needed, state.max_trade
+                    )
+                })),
+            )
+                .into_response();
+        }
+
+        // Rolling 24h cap — reuses the same daily_spend log the harvest
+        // flow writes to, so weather + harvest + buy-direct all count
+        // against one shared daily budget.
+        {
+            let now_utc = Utc::now();
+            let cutoff = now_utc - chrono::Duration::hours(24);
+            let mut spend_log = state.daily_spend.write().await;
+            spend_log.retain(|(ts, _)| *ts > cutoff);
+            let spent_today: Decimal = spend_log.iter().map(|(_, amt)| amt).sum();
+            let remaining = state.max_daily - spent_today;
+            if needed > remaining {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Trade cost ${:.4} exceeds remaining daily budget ${:.2} \
+                             (${:.2} spent of ${:.2} in last 24h).",
+                            needed, remaining, spent_today, state.max_daily
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+            // Reserve the full `needed` up front. If any legs fail the
+            // user can ask for a refund path later; undercounting is
+            // worse than overcounting for cap safety.
+            spend_log.push((now_utc, needed));
+        }
+
+        // USDC balance check (on top of the caps above)
         if let Some(api) = state.api.as_ref() {
-            let needed: Decimal = req
-                .legs
-                .iter()
-                .map(|l| {
-                    Decimal::from_f64_retain(l.ask_at_buy * l.shares).unwrap_or(Decimal::ZERO)
-                })
-                .sum();
             let balance = api.get_balance_usdc().await;
             if needed > balance {
                 return (
@@ -7170,6 +7298,14 @@ async fn paper_trades_html() -> Html<String> {
   </style>
 </head>
 <body>
+  <!-- Per-leg sell modal. Same flow as /trades Open Positions Sell:
+       fetch preview at 90%-of-bid floor, let user tighten/loosen the
+       floor, then POST /api/sell with token_id override. -->
+  <div id="sell-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center">
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1.5em;max-width:620px;width:92%;max-height:90vh;overflow-y:auto">
+      <div id="sell-modal-body"></div>
+    </div>
+  </div>
   <nav><a href="/">Markets</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
   <h1>Paper Trades</h1>
   <div class="meta" id="meta">Loading…</div>
@@ -7218,6 +7354,13 @@ async function load() {
       const legSign = legPnl >= 0 ? '+' : '';
       const legCls = legPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
       const probStr = leg.model_prob_at_buy != null ? `${(leg.model_prob_at_buy*100).toFixed(1)}%` : '—';
+      // Per-leg Sell button — only for live open trades with a bid on
+      // this leg. Uses the same sell modal as Open Positions (with the
+      // 90%-of-best-bid floor + slippage input). Routes through
+      // /api/sell with token_id override so no market lookup needed.
+      const legSellBtn = (t.mode === 'live' && t.status === 'open' && leg.shares > 0)
+        ? `<button class="sell-btn" style="padding:0.15em 0.5em;font-size:0.8em" onclick="sellLeg('${leg.token_id}',${JSON.stringify(leg.bracket_label).replace(/"/g,'&quot;')},${JSON.stringify(t.market_question).replace(/"/g,'&quot;')},'${leg.shares}')">Sell</button>`
+        : '';
       return `<tr>
         <td>${leg.bracket_label}</td>
         <td>${leg.shares}</td>
@@ -7226,6 +7369,7 @@ async function load() {
         <td>$${leg_cost.toFixed(2)}</td>
         <td>${bidStr}</td>
         <td class="${legCls}">${legSign}$${legPnl.toFixed(2)}</td>
+        <td>${legSellBtn}</td>
       </tr>`;
     }).join('');
     const modelProb = t.model_win_prob_at_buy != null ? `${(t.model_win_prob_at_buy*100).toFixed(1)}%` : '—';
@@ -7395,8 +7539,160 @@ async function closeTrade(id, mode) {
   }
 }
 
+// ─── Per-leg Sell (shared modal with /trades Open Positions) ────────────
+// Same server path — POST /api/sell-preview then /api/sell — but we pass
+// `token_id` + `label` directly so the server skips the condition_id
+// → outcome → market_id lookup (the paper-trade record already has the
+// exact token we want to sell).
+async function sellLeg(tokenId, label, market, heldShares) {
+  await refreshSellLegPreview(tokenId, label, market, heldShares, null);
+}
+
+async function refreshSellLegPreview(tokenId, label, market, heldShares, minPriceOverride) {
+  const body = {
+    condition_id: '',
+    token_id: tokenId,
+    outcome: label,
+    label: label,
+    market: market,
+    shares: String(heldShares),
+  };
+  if (minPriceOverride != null) body.min_price = String(minPriceOverride);
+  const resp = await fetch('/api/sell-preview', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const p = await resp.json();
+  if (p.error) { alert('Preview failed: ' + p.error); return; }
+  showSellLegModal(tokenId, label, market, heldShares, p);
+}
+
+function showSellLegModal(tokenId, label, market, heldShares, p) {
+  const modal = document.getElementById('sell-modal');
+  const body = document.getElementById('sell-modal-body');
+
+  const requested = parseFloat(p.requested_shares) || 0;
+  const fillable = parseFloat(p.fillable_shares) || 0;
+  const gross = parseFloat(p.gross_revenue) || 0;
+  const avgPx = parseFloat(p.avg_fill_price) || 0;
+  const bestBid = p.best_bid != null ? parseFloat(p.best_bid) : null;
+  const minPrice = parseFloat(p.min_price_used) || 0;
+  const partial = fillable < requested;
+  const dry = fillable <= 0;
+  const limitFloor = minPrice;
+
+  const slippagePct = bestBid && bestBid > 0
+    ? ((1 - (limitFloor / bestBid)) * 100).toFixed(1)
+    : '—';
+
+  const warn = dry
+    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids ≥ $${limitFloor.toFixed(4)} — book too thin to sell at floor. Lower the floor at your own risk.</div>`
+    : partial
+    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial fill: only ${fillable.toFixed(2)} of ${requested.toFixed(2)} shares clear the floor. The rest would require selling below $${limitFloor.toFixed(4)}.</div>`
+    : '';
+
+  const execBtn = dry
+    ? `<button disabled style="padding:0.3em 0.8em;border-radius:4px;background:#30363d;color:#8b949e;border:1px solid #30363d;opacity:0.5;cursor:not-allowed">Execute sell</button>`
+    : `<button style="padding:0.3em 0.8em;border-radius:4px;background:#d97706;color:#fff;border:1px solid #f59e0b;cursor:pointer;font-weight:600" onclick="executeSellLeg('${tokenId}',${JSON.stringify(label).replace(/"/g,'&quot;')},${JSON.stringify(market).replace(/"/g,'&quot;')},'${fillable}','${limitFloor}')">Execute sell</button>`;
+
+  body.innerHTML = `
+    <div style="margin-bottom:1em">
+      <div style="font-size:1.05em">${market}</div>
+      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">
+        Sell leg <b>${label}</b> · held <b>${heldShares}</b> shares
+      </div>
+    </div>
+    <div style="border:1px solid #30363d;border-radius:6px;padding:1em;font-family:monospace;font-size:0.9em;line-height:1.7em">
+      <div>Best bid: <b>${bestBid != null ? '$' + bestBid.toFixed(3) : '—'}</b></div>
+      <div style="background:#1f2d3d;padding:0.4em 0.6em;border-radius:3px;margin:0.3em 0">
+        <span style="color:#c9d1d9">Minimum price floor: </span>
+        <input id="sell-floor-input" type="number" min="0.01" max="0.99" step="0.01"
+               value="${limitFloor.toFixed(2)}"
+               style="width:5em;padding:0.2em 0.3em;background:#0d1117;color:#58a6ff;border:1px solid #30363d;border-radius:3px;font-family:inherit;font-weight:600">
+        <button style="padding:0.15em 0.5em;margin-left:0.3em;font-size:0.8em;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:3px;cursor:pointer"
+                onclick="applySellLegFloor('${tokenId}',${JSON.stringify(label).replace(/"/g,'&quot;')},${JSON.stringify(market).replace(/"/g,'&quot;')},'${heldShares}')">Apply</button>
+        <span style="color:#8b949e;font-size:0.8em"> — slippage from best bid: ${slippagePct}%</span>
+      </div>
+      <div>Fillable at floor: <b>${fillable.toFixed(2)}</b> / ${requested.toFixed(2)} shares</div>
+      <div>Avg fill price (on walk): <b>$${avgPx.toFixed(4)}</b></div>
+      <div>Gross revenue: <b>$${gross.toFixed(4)}</b></div>
+      <div style="color:#8b949e;font-size:0.8em;margin-top:0.4em">
+        CLOB limit = floor. Matcher fills best-first and stops if it
+        would need to match below the floor — so you never sell below
+        $${limitFloor.toFixed(4)} even if the book moves.
+      </div>
+    </div>
+    ${warn}
+    <div style="margin-top:1em;display:flex;gap:0.5em;justify-content:flex-end">
+      <button style="padding:0.3em 0.8em;border-radius:4px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;cursor:pointer" onclick="closeSellLegModal()">Cancel</button>
+      ${execBtn}
+    </div>
+  `;
+  modal.style.display = 'flex';
+}
+
+function applySellLegFloor(tokenId, label, market, heldShares) {
+  const el = document.getElementById('sell-floor-input');
+  if (!el) return;
+  const v = parseFloat(el.value);
+  if (!Number.isFinite(v) || v <= 0 || v >= 1) {
+    alert('Floor must be between 0.01 and 0.99');
+    return;
+  }
+  refreshSellLegPreview(tokenId, label, market, heldShares, v);
+}
+
+function closeSellLegModal() {
+  const modal = document.getElementById('sell-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function executeSellLeg(tokenId, label, market, shares, minPrice) {
+  closeSellLegModal();
+  try {
+    const resp = await fetch('/api/sell', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        condition_id: '',
+        token_id: tokenId,
+        outcome: label,
+        label: label,
+        market: market,
+        shares: String(shares),
+        min_price: String(minPrice),
+      }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      const e = data.entry;
+      const filled = parseFloat(data.filled_shares) || 0;
+      const rev = parseFloat(data.gross_revenue) || 0;
+      alert(
+        `${e.strategy} OK\n` +
+        `Filled ${filled.toFixed(2)} ${label} shares\n` +
+        `Gross revenue: $${rev.toFixed(4)}\n` +
+        `Avg price: $${parseFloat(data.avg_price).toFixed(4)}\n\n` +
+        `${e.status}`
+      );
+      await load();
+    } else {
+      alert('Sell failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
+    }
+  } catch (err) {
+    alert('Request failed: ' + err);
+  }
+}
+
 load();
-setInterval(load, 15000);
+// Skip auto-refresh while the sell modal is open so we don't wipe an
+// in-progress confirmation.
+setInterval(() => {
+  const m = document.getElementById('sell-modal');
+  if (m && m.style.display !== 'none') return;
+  load();
+}, 15000);
 setInterval(tickAge, 1000);
 </script>
 </body>
@@ -7465,7 +7761,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
     // ALL holdings (CLOB buys + mints + neg-risk markets), not just locally
     // tracked mints.
     let positions_rows: String = if positions.is_empty() {
-        r#"<tr><td colspan="10" style="text-align:center;color:#666">No open positions for this wallet (or wallet not configured — needs --live + POLYMARKET_PRIVATE_KEY)</td></tr>"#.to_string()
+        r#"<tr><td colspan="11" style="text-align:center;color:#666">No open positions for this wallet (or wallet not configured — needs --live + POLYMARKET_PRIVATE_KEY)</td></tr>"#.to_string()
     } else {
         positions.iter().map(|p| {
             // ── Action buttons ───────────────────────────────────────────
@@ -7562,6 +7858,23 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 "#8b949e"
             };
 
+            // P&L % — `cash_pnl / (avg_price × shares) × 100`.
+            // cost_basis = current_value − cash_pnl (the Data API already
+            // reports both), which equals `avg_price × shares` by
+            // definition. If cost_basis ≤ 0 we can't compute a
+            // meaningful return — show a dash.
+            let cost_basis = p.current_value - p.cash_pnl;
+            let pnl_pct_cell = if cost_basis > Decimal::ZERO {
+                let pct = (p.cash_pnl / cost_basis) * Decimal::ONE_HUNDRED;
+                let sign = if p.cash_pnl >= Decimal::ZERO { "+" } else { "" };
+                format!(
+                    r#"<td style="color:{pnl_color}">{sign}{:.2}%</td>"#,
+                    pct.round_dp(2)
+                )
+            } else {
+                r#"<td style="color:#8b949e">—</td>"#.to_string()
+            };
+
             format!(
                 r#"<tr{row_style}>
                   <td class="pos-market-cell" title="{cid}">{market}</td>
@@ -7570,6 +7883,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                   <td>{no}</td>
                   <td>${value:.4}</td>
                   <td style="color:{pnl_color}">${pnl:.4}</td>
+                  {pnl_pct_cell}
                   <td><span style="color:{rcol}">{rlabel}</span></td>
                   <td>{tl}</td>
                   <td>{merge}{sep}{redeem}{sell_sep}{sell_yes}{sell_between}{sell_no}</td>
@@ -7583,6 +7897,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 value = p.current_value,
                 pnl = p.cash_pnl,
                 pnl_color = pnl_color,
+                pnl_pct_cell = pnl_pct_cell,
                 rcol = res_color,
                 rlabel = res_label,
                 tl = p.time_left,
@@ -7785,7 +8100,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
 
 <h2>Open Positions <span style="color:#666;font-size:0.8em">(Polymarket Data API — covers CLOB buys, mints, and neg-risk markets)</span></h2>
 <table>
-  <tr><th>Market</th><th>Type</th><th>YES</th><th>NO</th><th>Value</th><th>P&amp;L</th><th>Resolution</th><th>Time Left</th><th>Actions</th></tr>
+  <tr><th>Market</th><th>Type</th><th>YES</th><th>NO</th><th>Value</th><th>P&amp;L</th><th title="cash_pnl / (avg_price × shares) × 100">P&amp;L %</th><th>Resolution</th><th>Time Left</th><th>Actions</th></tr>
   {positions_rows}
 </table>
 
@@ -7879,6 +8194,19 @@ async function clearGeoblock() {{
   await fetch('/api/clear-geoblock', {{ method: 'POST' }});
   location.reload();
 }}
+
+// Auto-refresh the /trades page every 30s so the Open Positions table
+// reflects current Data API state (P&L, live bids, resolution flips).
+// Skip the reload while a modal is open — don't want to interrupt a
+// sell/close confirmation dialog mid-input.
+(function scheduleAutoRefresh() {{
+  setInterval(() => {{
+    const sellModal = document.getElementById('sell-modal');
+    const busy = sellModal && sellModal.style.display !== 'none';
+    if (busy) return;
+    location.reload();
+  }}, 30000);
+}})();
 
 // ─── Sell held position ─────────────────────────────────────────────────
 // Called from position rows. Fetches the live bid book for the held
