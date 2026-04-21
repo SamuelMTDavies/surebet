@@ -6345,22 +6345,155 @@ async fn api_close_paper_trade(
             .into_response();
     }
 
-    // Snapshot current exit revenue by refetching each leg's best bid.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .user_agent(BROWSER_UA)
-        .build()
-        .unwrap_or_default();
     let trade = trades[idx].clone();
+    let is_live = trade.mode == "live";
+
+    // Paper-mode: snapshot only. No on-chain shares to sell.
+    // Live-mode: walk each leg's bid book and place a real SDK
+    // limit-sell for the held size. Slippage-aware floor = worst level
+    // walked (mirrors /api/sell). Track per-leg results so the user
+    // sees exactly which legs cleared and which didn't.
     let mut exit_revenue = 0.0_f64;
-    for leg in &trade.legs {
-        if let Some(b) = fetch_best_bid(&http, &state.clob_url, &leg.token_id).await {
-            exit_revenue += b * leg.shares;
+    let mut per_leg: Vec<serde_json::Value> = Vec::with_capacity(trade.legs.len());
+    let mut any_failed = false;
+    let mut any_sold = false;
+
+    for (i, leg) in trade.legs.iter().enumerate() {
+        // Skip legs where the original BUY failed — we don't hold
+        // those shares.
+        if let Some(Some(err)) = trade.leg_errors.get(i) {
+            per_leg.push(serde_json::json!({
+                "leg": leg.bracket_label,
+                "skipped": format!("original buy failed: {err}"),
+            }));
+            continue;
+        }
+
+        let book = state
+            .book_store
+            .fetch_rest_book(&state.clob_url, &leg.token_id)
+            .await;
+        let want_shares = Decimal::from_f64_retain(leg.shares)
+            .unwrap_or(Decimal::ZERO)
+            .round_dp(2);
+        let plan = match book.as_ref() {
+            Some(b) => simulate_sell_walk(b, want_shares, state.min_sell),
+            None => SellPlan {
+                filled_shares: Decimal::ZERO,
+                gross_revenue: Decimal::ZERO,
+                avg_fill_price: Decimal::ZERO,
+                worst_walked_price: None,
+                levels_consumed: 0,
+            },
+        };
+
+        if is_live {
+            // Always update the snapshot revenue, even if we can't sell.
+            if plan.filled_shares > Decimal::ZERO {
+                if let Ok(r) = plan.gross_revenue.to_string().parse::<f64>() {
+                    exit_revenue += r;
+                }
+            }
+
+            if plan.filled_shares <= Decimal::ZERO {
+                per_leg.push(serde_json::json!({
+                    "leg": leg.bracket_label,
+                    "skipped": "no bids — nothing to sell right now",
+                }));
+                any_failed = true;
+                continue;
+            }
+
+            let order_client = match state.order_client.as_ref() {
+                Some(c) => c,
+                None => {
+                    per_leg.push(serde_json::json!({
+                        "leg": leg.bracket_label,
+                        "skipped": "order_client not initialized",
+                    }));
+                    any_failed = true;
+                    continue;
+                }
+            };
+            // Round for tick-size compliance (0.5500000…044 mess fix).
+            let limit = plan.worst_walked_price.unwrap_or(state.min_sell).round_dp(2);
+            let size = plan.filled_shares.round_dp(2);
+            match order_client
+                .place_limit(&leg.token_id, limit, size, OrderSide::Sell)
+                .await
+            {
+                Ok(r) if r.success => {
+                    any_sold = true;
+                    per_leg.push(serde_json::json!({
+                        "leg": leg.bracket_label,
+                        "order_id": r.order_id,
+                        "shares": size.to_string(),
+                        "limit": limit.to_string(),
+                        "avg_price": plan.avg_fill_price.to_string(),
+                    }));
+                    // Per-leg activity entry so realized P&L rolls into stats.
+                    let entry = ActivityEntry {
+                        date: Utc::now().format("%Y-%m-%d").to_string(),
+                        time: Utc::now().format("%H:%M:%S").to_string(),
+                        market: trade.market_question.clone(),
+                        outcome: format!("{} · exit", leg.bracket_label),
+                        strategy: "SELL".to_string(),
+                        buy_shares: size.to_string(),
+                        buy_cost: format!("-{:.4}", plan.gross_revenue),
+                        mint_cost: "0".to_string(),
+                        sell_revenue: format!("{:.4}", plan.gross_revenue),
+                        net_profit: format!("{:.4}", plan.gross_revenue),
+                        status: format!("SELL OK: order {} (paper-trade close)", r.order_id),
+                        condition_id: String::new(),
+                        gas_matic: "0".to_string(),
+                    };
+                    state.activity.write().await.push(entry);
+                    rewrite_activity_file(&state).await;
+                }
+                Ok(r) => {
+                    any_failed = true;
+                    per_leg.push(serde_json::json!({
+                        "leg": leg.bracket_label,
+                        "error": format!("place_limit rejected: {}", r.error_msg),
+                    }));
+                }
+                Err(e) => {
+                    any_failed = true;
+                    per_leg.push(serde_json::json!({
+                        "leg": leg.bracket_label,
+                        "error": format!("place_limit error: {e}"),
+                    }));
+                }
+            }
+        } else {
+            // Paper-mode: snapshot revenue + per-leg info, no order.
+            if let Ok(r) = plan.gross_revenue.to_string().parse::<f64>() {
+                exit_revenue += r;
+            }
+            per_leg.push(serde_json::json!({
+                "leg": leg.bracket_label,
+                "paper": true,
+                "shares": want_shares.to_string(),
+                "projected_revenue": plan.gross_revenue.to_string(),
+            }));
         }
     }
 
     let realized = exit_revenue - trade.total_cost;
-    trades[idx].status = "closed_manual".to_string();
+    // New status values: "sold_live" (all legs sold), "sold_partial"
+    // (some succeeded, some didn't), "closed_manual" (paper snapshot
+    // or live trade where nothing could sell).
+    trades[idx].status = if is_live {
+        if any_sold && !any_failed {
+            "sold_live".to_string()
+        } else if any_sold {
+            "sold_partial".to_string()
+        } else {
+            "closed_manual".to_string()
+        }
+    } else {
+        "closed_manual".to_string()
+    };
     trades[idx].close_sell_revenue = Some(exit_revenue);
     trades[idx].realized_pnl = Some(realized);
     trades[idx].closed_at = Some(chrono::Utc::now().to_rfc3339());
@@ -6401,6 +6534,9 @@ async fn api_close_paper_trade(
     Json(serde_json::json!({
         "closed": true,
         "id": req.id,
+        "mode": trade.mode,
+        "status": trades[idx].status,
+        "per_leg": per_leg,
         "exit_revenue": exit_revenue,
         "realized_pnl": realized,
     }))
@@ -6722,7 +6858,7 @@ async function load() {
     }
 
     const closeBtn = isOpen
-      ? `<button onclick="closeTrade('${t.id}')" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">Close (snapshot at current bids)</button>`
+      ? `<button onclick="closeTrade('${t.id}','${t.mode}')" style="background:${t.mode === 'live' ? '#d97706' : '#21262d'};color:${t.mode === 'live' ? '#fff' : '#c9d1d9'};border:1px solid ${t.mode === 'live' ? '#f59e0b' : '#30363d'};padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">${t.mode === 'live' ? 'Close (sell legs on CLOB)' : 'Close (snapshot at current bids)'}</button>`
       : '';
 
     const modeTag = (t.mode === 'live')
@@ -6791,8 +6927,11 @@ function tickAge() {
   document.getElementById('last-updated').textContent = `updated ${s}s ago · auto-refresh every 15s`;
 }
 
-async function closeTrade(id) {
-  if (!confirm('Close this trade at current bids? This snapshots the exit P&L and marks it closed (cannot be undone).')) return;
+async function closeTrade(id, mode) {
+  const msg = mode === 'live'
+    ? '⚠️ This will place REAL sell orders for every held leg of this trade at the current best bid. Proceed?'
+    : 'Close this paper trade at current bids? This snapshots the exit P&L and marks it closed.';
+  if (!confirm(msg)) return;
   try {
     const r = await fetch('/api/paper-trade/close', {
       method: 'POST',
@@ -6801,6 +6940,21 @@ async function closeTrade(id) {
     });
     const j = await r.json();
     if (j.closed) {
+      if (j.mode === 'live') {
+        // Show per-leg breakdown so the user sees which legs actually sold.
+        const legs = (j.per_leg || []).map(l => {
+          if (l.order_id) return `✓ ${l.leg}: sold ${l.shares} @ ${l.limit} (order ${l.order_id})`;
+          if (l.skipped) return `⊘ ${l.leg}: skipped — ${l.skipped}`;
+          if (l.error) return `✗ ${l.leg}: ${l.error}`;
+          return `? ${l.leg}`;
+        }).join('\n');
+        alert(
+          `Close status: ${j.status}\n` +
+          `Exit revenue: $${j.exit_revenue.toFixed(4)}\n` +
+          `Realized P&L: $${(j.realized_pnl ?? 0).toFixed ? (j.realized_pnl).toFixed(4) : j.realized_pnl}\n\n` +
+          `Per-leg:\n${legs}`
+        );
+      }
       await load();
     } else {
       alert(`Close failed: ${j.error || 'unknown'}`);
