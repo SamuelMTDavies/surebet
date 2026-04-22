@@ -231,11 +231,23 @@ impl OrderBookStore {
         };
 
         if !resp.status().is_success() {
-            warn!(
-                token = %&token_id[..16.min(token_id.len())],
-                status = resp.status().as_u16(),
-                "REST book fetch returned error"
-            );
+            // 404 = CLOB doesn't host a book for this token. Normal for
+            // resolved markets, deregistered tokens, or tokens we query
+            // speculatively (e.g. METAR alerts hydrating stale NO legs).
+            // Log at debug to avoid spamming; other non-2xx stays at warn.
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                tracing::debug!(
+                    token = %&token_id[..16.min(token_id.len())],
+                    "REST book: 404 (no CLOB book for this token)"
+                );
+            } else {
+                warn!(
+                    token = %&token_id[..16.min(token_id.len())],
+                    status = status.as_u16(),
+                    "REST book fetch returned error"
+                );
+            }
             return None;
         }
 

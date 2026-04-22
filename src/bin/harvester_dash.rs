@@ -5834,15 +5834,40 @@ async fn api_observations(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
-    // Fan out per-event processing concurrently. Each event does up to 3 HTTP
-    // calls (METAR → Wunderground → Open-Meteo); doing them sequentially for
-    // 150 events takes ~30 seconds. Bounded concurrency = 20 keeps the host
-    // honest without hammering remote APIs.
+    // Pre-extract the set of ICAOs across all events so we can do a
+    // SINGLE batched METAR request for all of them. Avoids the old
+    // approach of one METAR call per event (~150 per page load), which
+    // flaked occasionally on individual stations ("error sending
+    // request" on LTAC/ZGSZ/WIHH etc.) and burned rate-limit budget.
+    let mut distinct_icaos: Vec<String> = raw_events
+        .iter()
+        .filter_map(|ev| {
+            ev.get("resolutionSource")
+                .and_then(|v| v.as_str())
+                .and_then(surebet::weather::wunderground::icao_from_resolution_url)
+        })
+        .collect();
+    distinct_icaos.sort();
+    distinct_icaos.dedup();
+    let all_reports = fetch_metar_batch(&http, &distinct_icaos).await;
+
+    // Group reports by station once, then each event consumes its slice.
+    let mut reports_by_icao: std::collections::HashMap<
+        String,
+        Vec<surebet::weather::metar::MetarReport>,
+    > = std::collections::HashMap::new();
+    for r in all_reports {
+        reports_by_icao.entry(r.icao_id.clone()).or_default().push(r);
+    }
+    let reports_by_icao = Arc::new(reports_by_icao);
+
+    // Fan out per-event processing concurrently. Each event now needs
+    // ZERO outgoing HTTP calls (reports are pre-fetched); we still
+    // buffer_unordered so any CPU-bound parsing across 150 events
+    // parallelises.
     let per_event_futures = raw_events.into_iter().map(|event| {
-        let http = http.clone();
-        async move {
-            process_weather_event(&http, event, now).await
-        }
+        let reports_by_icao = reports_by_icao.clone();
+        async move { process_weather_event(event, now, &reports_by_icao) }
     });
     let collected: Vec<Option<ObservationEventJson>> = futures_util::stream::iter(per_event_futures)
         .buffer_unordered(20)
@@ -5864,15 +5889,22 @@ async fn api_observations(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// Process one weather event: fetch observations (METAR → Wunderground →
-/// Open-Meteo), classify each bracket, return the JSON row the UI will render.
+/// Process one weather event: classify each bracket using pre-fetched
+/// METAR reports, return the JSON row the UI will render.
+///
+/// `reports_by_icao` is the batched METAR fetch from the caller (one
+/// request for every station across all events). Sync + non-fetching
+/// keeps per-event cost to pure CPU work.
 ///
 /// Returns `None` for events that aren't temperature-bracket markets or have
 /// no parseable brackets.
-async fn process_weather_event(
-    http: &reqwest::Client,
+fn process_weather_event(
     event: serde_json::Value,
     now: chrono::DateTime<chrono::Utc>,
+    reports_by_icao: &std::collections::HashMap<
+        String,
+        Vec<surebet::weather::metar::MetarReport>,
+    >,
 ) -> Option<ObservationEventJson> {
     let title = event.get("title").and_then(|v| v.as_str()).unwrap_or("");
     let (measure, city) = parse_weather_event_title(title)?;
@@ -5942,33 +5974,28 @@ async fn process_weather_event(
             surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
         };
 
-        // METAR only. Wunderground's scraped aggregates (temperatureMaxSince7Am,
-        // temperatureMin24Hour) are rolling windows that cross local midnight
-        // and silently carry yesterday's extremes into today — unusable for
-        // "today's max/min" which is what these markets resolve against.
-        // Open-Meteo is gridded, not station-grade. If METAR is unavailable,
-        // surface "no data" rather than substitute.
+        // METAR only. Reports are pre-fetched in batch by the caller;
+        // per-event work is aggregate-only.
         if let (Some(icao_code), Some(date)) = (&icao, target_date) {
-            match surebet::weather::metar::fetch_metar_reports(http, icao_code, 36).await {
-                Ok(reports) => {
-                    let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
-                    if let Some(agg) =
-                        surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)
-                    {
-                        result = Some(ObservationsBlock {
-                            max_so_far: c_to_market_unit(agg.max_c),
-                            min_so_far: c_to_market_unit(agg.min_c),
-                            current: c_to_market_unit(agg.current_c),
-                            last_observation_at: agg.latest_obs_utc.to_rfc3339(),
-                            timezone: format!("UTC{:+}", tz / 3600),
-                            source: format!("METAR ({} reports)", agg.report_count),
-                            station: Some(agg.icao),
-                            resolution_url: Some(resolution_url.to_string()),
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(icao = %icao_code, error = %e, "METAR fetch failed");
+            let empty_vec: Vec<surebet::weather::metar::MetarReport> = Vec::new();
+            let station_reports = reports_by_icao.get(icao_code).unwrap_or(&empty_vec);
+            if !station_reports.is_empty() {
+                let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+                if let Some(agg) = surebet::weather::metar::aggregate_by_local_day(
+                    station_reports,
+                    date,
+                    tz,
+                ) {
+                    result = Some(ObservationsBlock {
+                        max_so_far: c_to_market_unit(agg.max_c),
+                        min_so_far: c_to_market_unit(agg.min_c),
+                        current: c_to_market_unit(agg.current_c),
+                        last_observation_at: agg.latest_obs_utc.to_rfc3339(),
+                        timezone: format!("UTC{:+}", tz / 3600),
+                        source: format!("METAR ({} reports)", agg.report_count),
+                        station: Some(agg.icao),
+                        resolution_url: Some(resolution_url.to_string()),
+                    });
                 }
             }
         }
