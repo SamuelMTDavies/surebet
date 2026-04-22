@@ -622,7 +622,97 @@ struct AppState {
     resolution_window_ahead_hours: i64,
     min_volume_usd: f64,
     min_depth_usd: f64,
+    /// METAR frontrun state — background poller detects extreme flips
+    /// and writes alerts here. See `plans/metar_frontrun.md`.
+    metar: Arc<MetarState>,
 }
+
+/// Per-alert immutable record emitted when a new METAR reading flips a
+/// bracket from LIVE → DEAD. `best_ask_current` and `depth_current` are
+/// refreshed at API-call time, not frozen at alert detection.
+#[derive(Clone, Debug, Serialize)]
+struct MetarAlert {
+    id: String,
+    detected_at: String,
+    station: String,
+    market_question: String,
+    condition_id: String,
+    measure: String,       // "High" | "Low"
+    bracket_label: String,
+    bracket_lower: Option<f64>,
+    bracket_upper: Option<f64>,
+    token_id_no: String,
+    unit_sym: String,      // "°F" | "°C"
+    old_extreme: f64,      // in market units
+    new_extreme: f64,      // in market units
+}
+
+/// Per-station cache of the previous aggregate — used to detect *new*
+/// extreme events. Rebuilt on each poll from the shared METAR call.
+#[derive(Clone, Debug)]
+struct StationAgg {
+    max_c: f64,
+    min_c: f64,
+    reports_seen: usize,
+    last_local_date: chrono::NaiveDate,
+}
+
+/// What the poller watches — one entry per today-local temperature
+/// bracket event. Rebuilt on each poll from Gamma.
+#[derive(Clone, Debug)]
+struct MetarWatchEntry {
+    icao: String,
+    tz_offset_secs: i64,
+    local_date: chrono::NaiveDate,
+    condition_id: String,
+    market_question: String,
+    measure: TemperatureMeasure,
+    unit: surebet::weather::TemperatureUnit,
+    unit_sym: &'static str,
+    brackets: Vec<MetarWatchBracket>,
+}
+
+#[derive(Clone, Debug)]
+struct MetarWatchBracket {
+    label: String,
+    lower: Option<f64>, // in market units
+    upper: Option<f64>, // in market units
+    token_id_no: String,
+}
+
+struct MetarState {
+    alerts: RwLock<std::collections::VecDeque<MetarAlert>>,
+    cache: RwLock<std::collections::HashMap<String, StationAgg>>,
+    /// Every bracket already flagged DEAD on the prior poll. Keyed by
+    /// `token_id_no` — scoped to the alert system, not to the rest of
+    /// the observations code. Prevents duplicate alerts per poll.
+    flagged_dead: RwLock<std::collections::HashSet<String>>,
+    last_poll_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    last_poll_status: RwLock<String>,
+}
+
+impl MetarState {
+    fn new() -> Self {
+        Self {
+            alerts: RwLock::new(std::collections::VecDeque::with_capacity(128)),
+            cache: RwLock::new(std::collections::HashMap::new()),
+            flagged_dead: RwLock::new(std::collections::HashSet::new()),
+            last_poll_at: RwLock::new(None),
+            last_poll_status: RwLock::new("not yet polled".to_string()),
+        }
+    }
+}
+
+/// Maximum in-memory alert retention.
+const METAR_ALERT_RING_SIZE: usize = 100;
+/// Poll cadence in seconds. At 120s and one multi-station request per
+/// poll, we use ≤1 req/min against aviationweather.gov's 100/min limit.
+const METAR_POLL_INTERVAL_SECS: u64 = 120;
+/// Hard cap per capture in USDC.
+const METAR_CAPTURE_USD_CAP: &str = "10";
+/// Default "don't bother if NO ask above this" ceiling. Guards against
+/// manipulated or stale high asks on dead brackets.
+const METAR_DEFAULT_ASK_CEILING: &str = "0.50";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActivityEntry {
@@ -1010,6 +1100,7 @@ async fn main() -> Result<()> {
         resolution_window_ahead_hours: harvester.resolution_window_ahead_hours,
         min_volume_usd: harvester.min_volume_usd,
         min_depth_usd: harvester.min_depth_usd,
+        metar: Arc::new(MetarState::new()),
     };
 
     let app = Router::new()
@@ -1043,6 +1134,8 @@ async fn main() -> Result<()> {
         .route("/arb", get(arb_html))
         .route("/api/arb", get(api_arb))
         .route("/api/arb-paper-fire", post(api_arb_paper_fire))
+        .route("/api/metar-alerts", get(api_metar_alerts))
+        .route("/api/metar-capture", post(api_metar_capture))
         .route("/ws/book", get(ws_book_handler))
         .with_state(state.clone());
 
@@ -1079,6 +1172,17 @@ async fn main() -> Result<()> {
                 }
             }
             scanning_ref.store(false, Ordering::Relaxed);
+        });
+    }
+
+    // Spawn METAR frontrun poller. Watches today-local temperature
+    // bracket events, diffs new readings against cached aggregates,
+    // emits an alert when a bracket flips DEAD. See
+    // plans/metar_frontrun.md.
+    {
+        let metar_state = state.clone();
+        tokio::spawn(async move {
+            metar_poller(metar_state).await;
         });
     }
 
@@ -3830,14 +3934,65 @@ async fn api_harvest(
                 return Json(serde_json::json!({"ok": false, "entry": entry})).into_response();
             };
 
-            // Tick-size + clamp: state.max_buy can be 0.999, which naive
-            // 2dp rounding would bump to 1.00 — rejected by the CLOB.
-            // round_buy_price floors to 0.99, valid.
+            // Re-walk the live book right before placing so the limit
+            // price is TIGHT to the current ask ladder, not max_buy.
+            // Rule: max_buy (0.999) is the HOOVER safety cap — for a
+            // distinct BUY event the CLOB limit must be the worst
+            // level actually walked. If book moved up, we'd rather
+            // miss/partial-fill than pay an inflated $0.99.
+            let live_book = state
+                .book_store
+                .fetch_rest_book(&state.clob_url, winner_token_id)
+                .await;
+            let fresh_plan = live_book.as_ref().map(|b| {
+                simulate_buy_walk(b, buy_shares, state.max_buy)
+            });
+            let (limit_for_buy, actual_buy_shares) = match fresh_plan.as_ref() {
+                Some(p) if p.filled_shares > Decimal::ZERO => (
+                    p.worst_walked_price.unwrap_or(state.max_buy),
+                    p.filled_shares,
+                ),
+                _ => {
+                    status_parts.push(
+                        "BUY SKIP: no live ask at time of order".to_string(),
+                    );
+                    // Fall through to entry-write below. Treat as no-fill.
+                    (Decimal::ZERO, Decimal::ZERO)
+                }
+            };
+
+            if actual_buy_shares <= Decimal::ZERO {
+                // Write a FAIL entry and return — nothing to place.
+                let entry = ActivityEntry {
+                    time: now,
+                    market: req.market_question,
+                    outcome: req.label.clone(),
+                    strategy,
+                    buy_shares: buy_shares.to_string(),
+                    buy_cost: format!("{:.4}", buy_cost),
+                    mint_cost: format!("{:.4}", actual_mint_cost),
+                    sell_revenue: format!("{:.4}", actual_sell_revenue),
+                    net_profit: "0.0000".to_string(),
+                    status: status_parts.join(" | "),
+                    condition_id: market.condition_id.clone(),
+                    gas_matic: format!("{}", total_gas_matic),
+                    date: Utc::now().format("%Y-%m-%d").to_string(),
+                };
+                match provisional_idx {
+                    Some(idx) => {
+                        let to_write = entry.clone();
+                        update_entry_at(&state, idx, move |e| *e = to_write).await;
+                    }
+                    None => persist_and_record(&state, entry.clone()).await,
+                }
+                return Json(serde_json::json!({"ok": false, "entry": entry})).into_response();
+            }
+
             let resp = order_client
                 .place_limit(
                     winner_token_id,
-                    round_buy_price(state.max_buy),
-                    round_share_size(buy_shares),
+                    round_buy_price(limit_for_buy),
+                    round_share_size(actual_buy_shares),
                     OrderSide::Buy,
                 )
                 .await;
@@ -5949,6 +6104,657 @@ fn classify_bracket(
     }
 }
 
+// ─── METAR frontrun: poller + alert pipeline + capture endpoint ──────────
+//
+// Watches active today-local temperature-bracket events, polls METAR
+// directly on a 2-minute cadence, and emits an alert whenever a new
+// reading flips a bracket from LIVE → DEAD (i.e., today's max jumped
+// past the bracket's upper, or min dropped past the bracket's lower).
+//
+// The alert structure carries the token_id_no + bracket metadata so the
+// UI's Capture flow can fire a tight-limit BUY on the NO side (pays $1
+// at resolution) at the snapshot best ask — see `api_metar_capture`.
+//
+// See plans/metar_frontrun.md for the full design and the deferred
+// Phase 2 (auto-capture while armed).
+
+/// Rebuild the watch-list from live Gamma. One request per poll.
+/// Drops events whose target_date isn't today-local at the station.
+async fn fetch_metar_watch(
+    http: &reqwest::Client,
+    gamma_url: &str,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Vec<MetarWatchEntry> {
+    let url = format!(
+        "{}/events?tag_slug=weather&active=true&closed=false&limit=200",
+        gamma_url
+    );
+    let raw: Vec<serde_json::Value> = match http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        _ => return Vec::new(),
+    };
+
+    let mut out: Vec<MetarWatchEntry> = Vec::new();
+    for event in &raw {
+        let title = event.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let Some((measure, _city)) = parse_weather_event_title(title) else {
+            continue;
+        };
+        let resolution_url = event
+            .get("resolutionSource")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let Some(icao) = surebet::weather::wunderground::icao_from_resolution_url(resolution_url)
+        else {
+            continue;
+        };
+
+        let end_date_utc = event
+            .get("endDate")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let Some(target_date) = end_date_utc.map(|d| d.date_naive()) else {
+            continue;
+        };
+
+        let tz = surebet::weather::metar::tz_offset_for_icao(&icao);
+        let local_today = (now_utc + chrono::Duration::seconds(tz)).date_naive();
+        if target_date != local_today {
+            continue; // only watch events resolving today-local
+        }
+
+        let condition_id = event
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_default();
+
+        let Some(children) = event.get("markets").and_then(|v| v.as_array()) else {
+            continue;
+        };
+
+        // Detect unit from the first parseable child label.
+        let unit = children
+            .iter()
+            .find_map(|m| {
+                let label = m
+                    .get("groupItemTitle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if label.contains("°F") {
+                    Some(surebet::weather::TemperatureUnit::Fahrenheit)
+                } else if label.contains("°C") {
+                    Some(surebet::weather::TemperatureUnit::Celsius)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(surebet::weather::TemperatureUnit::Celsius);
+        let unit_sym = match unit {
+            surebet::weather::TemperatureUnit::Fahrenheit => "°F",
+            surebet::weather::TemperatureUnit::Celsius => "°C",
+        };
+
+        let mut brackets: Vec<MetarWatchBracket> = Vec::new();
+        for m in children {
+            let label = m
+                .get("groupItemTitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if label.is_empty() {
+                continue;
+            }
+            let Some((lower, upper)) = parse_bracket_label(&label) else {
+                continue;
+            };
+
+            // clobTokenIds comes as a JSON-string or array; index 1 = NO.
+            let token_ids_raw = m.get("clobTokenIds");
+            let token_ids: Vec<String> = match token_ids_raw {
+                Some(v) if v.is_string() => serde_json::from_str(v.as_str().unwrap_or(""))
+                    .ok()
+                    .unwrap_or_default(),
+                Some(v) if v.is_array() => v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if token_ids.len() < 2 {
+                continue;
+            }
+            brackets.push(MetarWatchBracket {
+                label,
+                lower,
+                upper,
+                token_id_no: token_ids[1].clone(),
+            });
+        }
+        if brackets.is_empty() {
+            continue;
+        }
+
+        out.push(MetarWatchEntry {
+            icao,
+            tz_offset_secs: tz,
+            local_date: target_date,
+            condition_id,
+            market_question: title.to_string(),
+            measure,
+            unit,
+            unit_sym,
+            brackets,
+        });
+    }
+    out
+}
+
+/// Fetch METAR for every distinct ICAO in one comma-joined request.
+/// aviationweather.gov accepts `ids=A,B,C,…`.
+async fn fetch_metar_batch(
+    http: &reqwest::Client,
+    icaos: &[String],
+) -> Vec<surebet::weather::metar::MetarReport> {
+    if icaos.is_empty() {
+        return Vec::new();
+    }
+    let joined = icaos.join(",");
+    let url = format!(
+        "https://aviationweather.gov/api/data/metar?ids={}&format=json&hours=2",
+        joined
+    );
+    match http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// One poll cycle: rebuild watch, fetch METAR, diff per-station, emit
+/// alerts. Updates MetarState in place.
+async fn metar_poll_once(state: &AppState, http: &reqwest::Client) {
+    let now_utc = Utc::now();
+    let entries = fetch_metar_watch(http, &state.gamma_url, now_utc).await;
+    if entries.is_empty() {
+        *state.metar.last_poll_at.write().await = Some(now_utc);
+        *state.metar.last_poll_status.write().await =
+            "no today-local events to watch".to_string();
+        return;
+    }
+
+    // One METAR call for every distinct ICAO.
+    let mut distinct_icaos: Vec<String> = entries
+        .iter()
+        .map(|e| e.icao.clone())
+        .collect();
+    distinct_icaos.sort();
+    distinct_icaos.dedup();
+    let reports = fetch_metar_batch(http, &distinct_icaos).await;
+
+    // Group reports by station.
+    let mut by_station: std::collections::HashMap<
+        String,
+        Vec<&surebet::weather::metar::MetarReport>,
+    > = std::collections::HashMap::new();
+    for r in &reports {
+        by_station
+            .entry(r.icao_id.clone())
+            .or_default()
+            .push(r);
+    }
+
+    let c_to_unit = |c: f64, u: surebet::weather::TemperatureUnit| match u {
+        surebet::weather::TemperatureUnit::Celsius => c,
+        surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
+    };
+
+    let mut new_alerts: Vec<MetarAlert> = Vec::new();
+    let mut cache_updates: Vec<(String, StationAgg)> = Vec::new();
+    let prior_cache = state.metar.cache.read().await.clone();
+    let mut prior_flagged = state.metar.flagged_dead.read().await.clone();
+
+    for entry in &entries {
+        // Per-station filter — `aggregate_by_local_day` doesn't discriminate
+        // ICAO, so on a multi-station payload we compute the aggregate
+        // manually for this station's reports over today-local.
+        let station_reports = by_station.get(&entry.icao).cloned().unwrap_or_default();
+        if station_reports.is_empty() {
+            continue;
+        }
+        let local_start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            entry.local_date.and_hms_opt(0, 0, 0).unwrap(),
+            chrono::Utc,
+        )
+        .timestamp()
+            - entry.tz_offset_secs;
+        let local_end = local_start + 86_400;
+        let in_day: Vec<f64> = station_reports
+            .iter()
+            .filter_map(|r| {
+                r.temp.and_then(|t| {
+                    if r.obs_time >= local_start && r.obs_time < local_end {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        if in_day.is_empty() {
+            continue;
+        }
+        let max_c = in_day.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min_c = in_day.iter().copied().fold(f64::INFINITY, f64::min);
+
+        let cache_key = format!("{}:{}", entry.icao, entry.local_date);
+        let prev = prior_cache.get(&cache_key);
+
+        // Bootstrap guard: on the FIRST poll for a given (icao, date),
+        // we have no prior extreme to diff against — every already-
+        // dead bracket would look "newly dead" and flood the alert
+        // ring. Instead, silently seed the cache + flagged_dead set
+        // with current state and emit no alerts. Subsequent polls
+        // then see real transitions only.
+        let is_first_poll_for_key = prev.is_none();
+
+        let old_max_c = prev.map(|p| p.max_c).unwrap_or(f64::NEG_INFINITY);
+        let old_min_c = prev.map(|p| p.min_c).unwrap_or(f64::INFINITY);
+
+        let old_max_u = c_to_unit(old_max_c, entry.unit);
+        let new_max_u = c_to_unit(max_c, entry.unit);
+        let old_min_u = c_to_unit(old_min_c, entry.unit);
+        let new_min_u = c_to_unit(min_c, entry.unit);
+
+        for b in &entry.brackets {
+            let (was_dead_before, is_dead_now) = match entry.measure {
+                TemperatureMeasure::High => {
+                    // Dead iff upper ≤ max_so_far (market unit).
+                    let Some(upper) = b.upper else {
+                        // Unbounded-upper bracket ("60°F or above"): can never go dead from a max — only from time running out.
+                        continue;
+                    };
+                    (upper <= old_max_u, upper <= new_max_u)
+                }
+                TemperatureMeasure::Low => {
+                    // Dead iff lower ≥ min_so_far (market unit).
+                    let Some(lower) = b.lower else {
+                        continue;
+                    };
+                    (lower >= old_min_u, lower >= new_min_u)
+                }
+            };
+
+            if is_first_poll_for_key {
+                // Bootstrap: seed flagged set without emitting.
+                if is_dead_now {
+                    prior_flagged.insert(b.token_id_no.clone());
+                }
+                continue;
+            }
+
+            let newly_dead = is_dead_now
+                && !was_dead_before
+                && !prior_flagged.contains(&b.token_id_no);
+            if !newly_dead {
+                if is_dead_now {
+                    prior_flagged.insert(b.token_id_no.clone());
+                }
+                continue;
+            }
+
+            let (old_extreme, new_extreme) = match entry.measure {
+                TemperatureMeasure::High => (old_max_u, new_max_u),
+                TemperatureMeasure::Low => (old_min_u, new_min_u),
+            };
+
+            new_alerts.push(MetarAlert {
+                id: format!("{}-{}-{}", now_utc.timestamp_millis(), entry.icao, b.label),
+                detected_at: now_utc.to_rfc3339(),
+                station: entry.icao.clone(),
+                market_question: entry.market_question.clone(),
+                condition_id: entry.condition_id.clone(),
+                measure: match entry.measure {
+                    TemperatureMeasure::High => "High".to_string(),
+                    TemperatureMeasure::Low => "Low".to_string(),
+                },
+                bracket_label: b.label.clone(),
+                bracket_lower: b.lower,
+                bracket_upper: b.upper,
+                token_id_no: b.token_id_no.clone(),
+                unit_sym: entry.unit_sym.to_string(),
+                old_extreme,
+                new_extreme,
+            });
+            prior_flagged.insert(b.token_id_no.clone());
+        }
+
+        cache_updates.push((
+            cache_key,
+            StationAgg {
+                max_c,
+                min_c,
+                reports_seen: in_day.len(),
+                last_local_date: entry.local_date,
+            },
+        ));
+    }
+
+    // Persist the new cache + flagged set + alerts.
+    {
+        let mut cache = state.metar.cache.write().await;
+        for (k, v) in cache_updates {
+            cache.insert(k, v);
+        }
+        // Evict entries for dates older than yesterday to keep the map bounded.
+        let cutoff = now_utc.date_naive() - chrono::Duration::days(2);
+        cache.retain(|_, v| v.last_local_date >= cutoff);
+    }
+    *state.metar.flagged_dead.write().await = prior_flagged;
+
+    if !new_alerts.is_empty() {
+        let mut alerts = state.metar.alerts.write().await;
+        for a in new_alerts {
+            alerts.push_front(a);
+        }
+        while alerts.len() > METAR_ALERT_RING_SIZE {
+            alerts.pop_back();
+        }
+    }
+
+    *state.metar.last_poll_at.write().await = Some(now_utc);
+    *state.metar.last_poll_status.write().await = format!(
+        "polled {} stations, {} reports",
+        distinct_icaos.len(),
+        reports.len()
+    );
+}
+
+/// Background poller. Spawned once from `main`.
+async fn metar_poller(state: AppState) {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+
+    // Small initial delay so the primary market scan settles first.
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+    loop {
+        metar_poll_once(&state, &http).await;
+        tokio::time::sleep(std::time::Duration::from_secs(METAR_POLL_INTERVAL_SECS)).await;
+    }
+}
+
+/// GET /api/metar-alerts — returns the current ring buffer plus live
+/// book state per alert so the UI can render "capturable?" flags.
+async fn api_metar_alerts(State(state): State<AppState>) -> impl IntoResponse {
+    let alerts_snap: Vec<MetarAlert> = state.metar.alerts.read().await.iter().cloned().collect();
+    let last_poll_at = state
+        .metar
+        .last_poll_at
+        .read()
+        .await
+        .map(|t| t.to_rfc3339());
+    let last_poll_status = state.metar.last_poll_status.read().await.clone();
+    let ceiling = Decimal::from_str(METAR_DEFAULT_ASK_CEILING).unwrap_or(Decimal::ZERO);
+    let cap_usd = Decimal::from_str(METAR_CAPTURE_USD_CAP).unwrap_or(Decimal::ZERO);
+
+    // Fetch live book for each alert's NO token concurrently.
+    let per_alert = alerts_snap.clone().into_iter().map(|a| {
+        let book_store = state.book_store.clone();
+        let clob_url = state.clob_url.clone();
+        async move {
+            let book = book_store.fetch_rest_book(&clob_url, &a.token_id_no).await;
+            let (best_ask, depth, _best_bid) = book
+                .as_ref()
+                .map(book_top)
+                .unwrap_or((None, None, None));
+            (a, best_ask, depth)
+        }
+    });
+    let hydrated: Vec<(MetarAlert, Option<Decimal>, Option<Decimal>)> =
+        futures_util::stream::iter(per_alert)
+            .buffer_unordered(10)
+            .collect()
+            .await;
+
+    let rows: Vec<serde_json::Value> = hydrated
+        .into_iter()
+        .map(|(a, ask, depth)| {
+            let cheap_enough = ask.map(|p| p <= ceiling).unwrap_or(false);
+            let size = match (ask, depth) {
+                (Some(p), Some(d)) if p > Decimal::ZERO => {
+                    let max_by_cap = (cap_usd / p).round_dp_with_strategy(2, RoundingStrategy::ToZero);
+                    let shares = max_by_cap.min(d).round_dp_with_strategy(2, RoundingStrategy::ToZero);
+                    Some(shares)
+                }
+                _ => None,
+            };
+            let cost = match (ask, size) {
+                (Some(p), Some(s)) => Some((p * s).round_dp(4)),
+                _ => None,
+            };
+            let capturable = cheap_enough && size.map(|s| s > Decimal::ZERO).unwrap_or(false);
+
+            serde_json::json!({
+                "alert": a,
+                "current_best_ask": ask.map(|p| p.to_string()),
+                "current_depth": depth.map(|d| d.to_string()),
+                "capture_size": size.map(|s| s.to_string()),
+                "capture_cost": cost.map(|c| c.to_string()),
+                "capturable": capturable,
+                "ask_ceiling": ceiling.to_string(),
+                "usd_cap": cap_usd.to_string(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "alerts": rows,
+        "last_poll_at": last_poll_at,
+        "last_poll_status": last_poll_status,
+        "ask_ceiling_default": ceiling.to_string(),
+        "usd_cap": cap_usd.to_string(),
+    }))
+    .into_response()
+}
+
+// ─── Capture endpoint ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct MetarCaptureRequest {
+    token_id_no: String,
+    market: String,
+    bracket_label: String,
+    condition_id: String,
+    /// Optional override; defaults to METAR_CAPTURE_USD_CAP.
+    #[serde(default)]
+    max_usd: Option<String>,
+    /// Optional override; defaults to METAR_DEFAULT_ASK_CEILING.
+    #[serde(default)]
+    max_ask: Option<String>,
+}
+
+async fn api_metar_capture(
+    State(state): State<AppState>,
+    Json(req): Json<MetarCaptureRequest>,
+) -> impl IntoResponse {
+    let cap_usd = req
+        .max_usd
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or_else(|| Decimal::from_str(METAR_CAPTURE_USD_CAP).unwrap());
+    let max_ask = req
+        .max_ask
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or_else(|| Decimal::from_str(METAR_DEFAULT_ASK_CEILING).unwrap());
+
+    if cap_usd <= Decimal::ZERO || max_ask <= Decimal::ZERO || max_ask >= Decimal::ONE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "max_usd > 0 and max_ask in (0,1) required"})),
+        )
+            .into_response();
+    }
+
+    let book = state
+        .book_store
+        .fetch_rest_book(&state.clob_url, &req.token_id_no)
+        .await;
+    let Some(book_ref) = book.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "no book for token"})),
+        )
+            .into_response();
+    };
+    let Some((best_ask, depth)) = book_ref.asks.best(false) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "no best ask"})),
+        )
+            .into_response();
+    };
+
+    if best_ask > max_ask {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("best ask ${} above ceiling ${}", best_ask, max_ask),
+                "best_ask": best_ask.to_string(),
+                "ceiling": max_ask.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    // Limit price = snapshot best ask. No room for slippage — if the
+    // book moves up between our read and the matcher, we get zero fill
+    // rather than an inflated fill.
+    let limit_price = round_buy_price(best_ask);
+    // Shares = min(cap_usd / best_ask, depth@best_ask). Floor to 2dp.
+    let shares_by_cap = (cap_usd / best_ask).round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    let shares = shares_by_cap
+        .min(depth)
+        .round_dp_with_strategy(2, RoundingStrategy::ToZero);
+
+    if shares <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "no fillable size at or below ceiling"})),
+        )
+            .into_response();
+    }
+
+    let cost = (limit_price * shares).round_dp(4);
+    let expected_payout = shares.round_dp(4);
+    let expected_profit = (expected_payout - cost).round_dp(4);
+
+    let now = Utc::now();
+    let is_live = state.live_mode && state.order_client.is_some();
+
+    // Rolling 24h spend check (shared with every other buy path).
+    {
+        let cutoff = now - chrono::Duration::hours(24);
+        let mut spend_log = state.daily_spend.write().await;
+        spend_log.retain(|(ts, _)| *ts > cutoff);
+        let spent_today: Decimal = spend_log.iter().map(|(_, amt)| amt).sum();
+        let remaining = state.max_daily - spent_today;
+        if cost > remaining {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "capture cost ${:.4} exceeds remaining daily budget ${:.2}",
+                        cost, remaining
+                    )
+                })),
+            )
+                .into_response();
+        }
+        spend_log.push((now, cost));
+    }
+
+    let mut status_parts: Vec<String> = Vec::new();
+    let mut err_msg = String::new();
+    let mut order_id: Option<String> = None;
+    if is_live {
+        let oc = state.order_client.as_ref().unwrap();
+        match oc
+            .place_limit(
+                &req.token_id_no,
+                limit_price,
+                shares,
+                surebet::auth::OrderSide::Buy,
+            )
+            .await
+        {
+            Ok(r) if r.success => {
+                status_parts.push(format!("METAR CAPTURE OK id={}", r.order_id));
+                order_id = Some(r.order_id);
+            }
+            Ok(r) => {
+                err_msg = format!("order rejected: {}", r.error_msg);
+                status_parts.push(format!("METAR CAPTURE FAIL: {}", r.error_msg));
+            }
+            Err(e) => {
+                err_msg = format!("SDK error: {e}");
+                status_parts.push(format!("METAR CAPTURE ERR: {e}"));
+            }
+        }
+    } else {
+        status_parts.push("PAPER METAR CAPTURE (no order placed)".to_string());
+    }
+
+    let strategy = if is_live {
+        "METAR CAPTURE".to_string()
+    } else {
+        "PAPER METAR CAPTURE".to_string()
+    };
+
+    let entry = ActivityEntry {
+        date: now.format("%Y-%m-%d").to_string(),
+        time: now.format("%H:%M:%S").to_string(),
+        market: format!("{} · bracket {}", req.market, req.bracket_label),
+        outcome: format!("NO @ {}", req.bracket_label),
+        strategy,
+        buy_shares: shares.to_string(),
+        buy_cost: cost.to_string(),
+        mint_cost: "0".to_string(),
+        sell_revenue: expected_payout.to_string(),
+        net_profit: expected_profit.to_string(),
+        status: status_parts.join(" · "),
+        condition_id: req.condition_id.clone(),
+        gas_matic: "0".to_string(),
+    };
+    state.activity.write().await.push(entry.clone());
+    rewrite_activity_file(&state).await;
+
+    let ok = err_msg.is_empty();
+    Json(serde_json::json!({
+        "ok": ok,
+        "entry": entry,
+        "limit_price": limit_price.to_string(),
+        "shares": shares.to_string(),
+        "cost": cost.to_string(),
+        "expected_payout": expected_payout.to_string(),
+        "expected_profit": expected_profit.to_string(),
+        "order_id": order_id,
+        "error": if ok { None } else { Some(err_msg) },
+    }))
+    .into_response()
+}
+
 async fn observations_html() -> Html<String> {
     Html(r##"<!DOCTYPE html>
 <html>
@@ -5996,9 +6802,143 @@ async fn observations_html() -> Html<String> {
   </div>
   <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a> <a href="/arb">Arb</a></nav>
   <h1>Weather observations · dead bracket scanner</h1>
+
+  <!-- METAR frontrun alerts. Background poller (every 2 min) diffs new METAR
+       readings against cached aggregates; when a new extreme flips a bracket
+       LIVE → DEAD, an alert lands here with the NO-side capture option. -->
+  <div id="metar-panel" style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:0.75em 1em;margin-bottom:1em">
+    <div style="display:flex;align-items:center;gap:0.8em;margin-bottom:0.4em">
+      <b>METAR frontrun alerts</b>
+      <span id="metar-status" style="color:#8b949e;font-size:0.85em">loading…</span>
+    </div>
+    <div id="metar-alerts"></div>
+  </div>
+
+  <!-- Confirmation modal for Capture -->
+  <div id="capture-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center">
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1.5em;max-width:560px;width:92%">
+      <div id="capture-modal-body"></div>
+    </div>
+  </div>
+
   <div class="meta" id="meta">Loading…</div>
   <div id="events"></div>
 <script>
+// ─── METAR alerts panel ────────────────────────────────────────────────
+async function loadMetarAlerts() {
+  let d;
+  try {
+    const r = await fetch('/api/metar-alerts');
+    d = await r.json();
+  } catch (e) {
+    document.getElementById('metar-status').textContent = 'fetch failed: ' + e;
+    return;
+  }
+  const statusEl = document.getElementById('metar-status');
+  const last = d.last_poll_at ? new Date(d.last_poll_at).toLocaleTimeString() : '—';
+  const n = (d.alerts || []).length;
+  statusEl.textContent = `${n} alert${n===1?'':'s'} · last poll ${last} · ${d.last_poll_status || ''} · ceiling $${d.ask_ceiling_default} · cap $${d.usd_cap}`;
+
+  const el = document.getElementById('metar-alerts');
+  if (!n) {
+    el.innerHTML = '<div style="color:#8b949e;font-size:0.9em">No flipped brackets yet. Poller runs every 2 minutes.</div>';
+    return;
+  }
+
+  el.innerHTML = (d.alerts).map(row => {
+    const a = row.alert;
+    const detected = new Date(a.detected_at).toLocaleTimeString();
+    const bestAsk = row.current_best_ask ? '$' + parseFloat(row.current_best_ask).toFixed(4) : '—';
+    const depth = row.current_depth ? parseFloat(row.current_depth).toFixed(0) : '—';
+    const sz = row.capture_size ? parseFloat(row.capture_size).toFixed(2) : '—';
+    const cost = row.capture_cost ? '$' + parseFloat(row.capture_cost).toFixed(2) : '—';
+    const label = a.bracket_label + ' · ' + a.measure;
+    const flipNote = a.measure === 'High'
+      ? `max jumped ${a.old_extreme.toFixed(1)} → <b>${a.new_extreme.toFixed(1)}${a.unit_sym}</b>`
+      : `min dropped ${a.old_extreme.toFixed(1)} → <b>${a.new_extreme.toFixed(1)}${a.unit_sym}</b>`;
+
+    const btnStyle = row.capturable
+      ? 'padding:0.25em 0.7em;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:4px;cursor:pointer;font-weight:600'
+      : 'padding:0.25em 0.7em;background:#30363d;color:#8b949e;border:1px solid #30363d;border-radius:4px;cursor:not-allowed;opacity:0.6';
+    const btnLabel = row.capturable
+      ? `Capture · buy ${sz}NO @ ${bestAsk} (${cost})`
+      : (row.current_best_ask ? `NO ask ${bestAsk} > ceiling` : 'no book');
+    const onclick = row.capturable ? `onclick='captureMetarAlert(${JSON.stringify(row).replace(/\'/g,"&apos;")})'` : '';
+
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:0.8em;padding:0.5em 0.6em;border-top:1px solid #21262d">
+      <div>
+        <div><b>${a.market_question}</b> · <span style="color:#fce28e">${label}</span></div>
+        <div style="color:#8b949e;font-size:0.82em">${detected} · station ${a.station} · ${flipNote} · current NO ${bestAsk} (${depth}sh)</div>
+      </div>
+      <button style="${btnStyle}" ${onclick} ${row.capturable ? '' : 'disabled'}>${btnLabel}</button>
+    </div>`;
+  }).join('');
+}
+
+async function captureMetarAlert(row) {
+  const a = row.alert;
+  const sz = parseFloat(row.capture_size);
+  const cost = parseFloat(row.capture_cost);
+  const ask = parseFloat(row.current_best_ask);
+  const payout = sz;
+  const profit = sz - cost;
+  const modal = document.getElementById('capture-modal');
+  const body = document.getElementById('capture-modal-body');
+  body.innerHTML = `
+    <div style="margin-bottom:0.6em">
+      <div style="font-size:1.05em"><b>${a.market_question}</b></div>
+      <div style="color:#8b949e;font-size:0.85em">Bracket ${a.bracket_label} · just flipped DEAD (${a.measure} ${a.new_extreme.toFixed(1)}${a.unit_sym})</div>
+    </div>
+    <div style="border:1px solid #30363d;border-radius:6px;padding:1em;font-family:monospace;font-size:0.9em;line-height:1.7em">
+      <div>Order: BUY <b>${sz.toFixed(2)}</b> NO shares</div>
+      <div>Limit price: <b>$${ask.toFixed(4)}</b> <span style="color:#8b949e">(snapshot best ask — no slippage above this)</span></div>
+      <div>Cost: <b>$${cost.toFixed(4)}</b></div>
+      <div>Expected payout at resolution: <b>$${payout.toFixed(4)}</b> <span style="color:#8b949e">(NO pays $1/share on dead bracket)</span></div>
+      <div>Expected profit: <b style="color:#7ee2a8">+$${profit.toFixed(4)}</b></div>
+      <div style="color:#8b949e;font-size:0.8em;margin-top:0.4em">
+        If best ask moves above $${ask.toFixed(4)} before the matcher sees our order, we get zero fill — we never fill above snapshot.
+      </div>
+    </div>
+    <div style="margin-top:1em;display:flex;gap:0.5em;justify-content:flex-end">
+      <button style="padding:0.3em 0.8em;border-radius:4px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;cursor:pointer" onclick="closeCaptureModal()">Cancel</button>
+      <button style="padding:0.3em 0.8em;border-radius:4px;background:#238636;color:#fff;border:1px solid #2ea043;cursor:pointer;font-weight:600" onclick='executeCapture(${JSON.stringify(a).replace(/\'/g,"&apos;")})'>Execute</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+}
+
+function closeCaptureModal() {
+  document.getElementById('capture-modal').style.display = 'none';
+}
+
+async function executeCapture(a) {
+  closeCaptureModal();
+  try {
+    const resp = await fetch('/api/metar-capture', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        token_id_no: a.token_id_no,
+        market: a.market_question,
+        bracket_label: a.bracket_label,
+        condition_id: a.condition_id,
+      }),
+    });
+    const j = await resp.json();
+    if (j.ok) {
+      alert(`${j.entry.strategy} OK\n\nFilled size: ${j.shares}\nLimit: $${parseFloat(j.limit_price).toFixed(4)}\nCost: $${parseFloat(j.cost).toFixed(4)}\nExpected profit: $${parseFloat(j.expected_profit).toFixed(4)}\n\n${j.entry.status}`);
+      await loadMetarAlerts();
+    } else {
+      alert('Capture failed: ' + (j.error || (j.entry ? j.entry.status : 'unknown')));
+    }
+  } catch (e) {
+    alert('Request failed: ' + e);
+  }
+}
+
+loadMetarAlerts();
+setInterval(loadMetarAlerts, 15000);
+
 async function load() {
   const r = await fetch('/api/observations');
   const d = await r.json();
