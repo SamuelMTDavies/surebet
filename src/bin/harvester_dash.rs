@@ -1040,6 +1040,9 @@ async fn main() -> Result<()> {
         .route("/api/paper-trades", get(api_paper_trades))
         .route("/api/paper-trade/close", post(api_close_paper_trade))
         .route("/api/paper-trade/reopen", post(api_reopen_paper_trade))
+        .route("/arb", get(arb_html))
+        .route("/api/arb", get(api_arb))
+        .route("/api/arb-paper-fire", post(api_arb_paper_fire))
         .route("/ws/book", get(ws_book_handler))
         .with_state(state.clone());
 
@@ -5252,6 +5255,7 @@ async fn weather_html() -> Html<String> {
   <a href="/weather" class="active">Weather</a>
   <a href="/observations">Observations</a>
   <a href="/paper-trades">Paper Trades</a>
+  <a href="/arb">Arb</a>
 </div>
 
 <div id="content">
@@ -6093,7 +6097,7 @@ async fn observations_html() -> Html<String> {
       <div id="buy-modal-body"></div>
     </div>
   </div>
-  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
+  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a> <a href="/arb">Arb</a></nav>
   <h1>Weather observations · dead bracket scanner</h1>
   <div class="meta" id="meta">Loading…</div>
   <div id="events"></div>
@@ -7274,6 +7278,735 @@ async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({ "trades": enriched }))
 }
 
+// ─── Football 3-way arbitrage scanner ────────────────────────────────────
+//
+// Phase 1 (read-only): find football matches on Polymarket exposed as 3
+// separate binary neg_risk markets (home-win / draw / away-win), fetch
+// top-of-book for all 3 legs, and compute the Dutch-book edge = 1 -
+// (ask_home + ask_draw + ask_away). Display on /arb. No orders.
+//
+// Phase 2 (paper-fire): button per arb row writes a PAPER ARB entry to
+// the activity log with the simulated cost + projected P&L. Still no
+// real orders.
+//
+// See plans/football_arb_engine.md for the full defensive design and
+// the deferred Phase 3 (FOK execution + manual partial-fill recovery).
+
+#[derive(Serialize, Clone)]
+struct ArbLeg {
+    /// "Home" | "Draw" | "Away"
+    label: String,
+    /// Team name for home/away; "Draw" for the draw leg.
+    team_or_label: String,
+    market_title: String,
+    condition_id: String,
+    token_id_yes: String,
+    /// Best ask (string Decimal for JSON stability).
+    best_ask: Option<String>,
+    /// Size available at best ask (shares).
+    ask_depth_shares: Option<String>,
+    best_bid: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ArbCandidate {
+    event_id: String,
+    match_title: String,
+    kickoff: Option<String>,
+    legs: Vec<ArbLeg>, // always length 3: home, draw, away
+    sum_asks: Option<String>,
+    net_cost_per_share: Option<String>,
+    edge_per_share: Option<String>,
+    edge_pct: Option<String>,
+    max_fillable_shares: Option<String>,
+    /// True iff every defensive gate passes (edge ≥ 2%, depth present,
+    /// all 3 asks present). Independent of arm switch.
+    arms: bool,
+    blockers: Vec<String>,
+}
+
+/// Minimum edge (as fraction, i.e. 0.02 = 2%) before we'd consider
+/// firing. Below this, inter-book slippage between preview and fill
+/// eats the profit.
+const ARB_MIN_EDGE_FRAC: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
+
+/// Depth headroom multiplier: require this many times the target size
+/// available at best ask before we consider a leg fillable. 1.5 gives
+/// slack for minor top-of-book flicker during order submission.
+const ARB_DEPTH_HEADROOM: Decimal = Decimal::from_parts(15, 0, 0, false, 1); // 1.5
+
+/// Minimum viable share count per leg. CLOB minimum order is $5 per
+/// leg; at typical football odds (0.2 - 0.6 per share) that's 10-25
+/// shares. Setting 10 as a conservative floor.
+const ARB_MIN_SHARES: Decimal = Decimal::from_parts(10, 0, 0, false, 0);
+
+/// Parse "Will <Team> win on YYYY-MM-DD?" → team name.
+fn parse_win_question(q: &str) -> Option<String> {
+    let prefix = "Will ";
+    let q = q.strip_prefix(prefix)?;
+    // strip trailing "?" then " on <date>"
+    let q = q.strip_suffix('?').unwrap_or(q);
+    // find " win on "
+    let idx = q.rfind(" win on ")?;
+    let team = &q[..idx];
+    if team.is_empty() {
+        None
+    } else {
+        Some(team.to_string())
+    }
+}
+
+/// Parse "Will <Team A> vs. <Team B> end in a draw?" → (team_a, team_b).
+fn parse_draw_question(q: &str) -> Option<(String, String)> {
+    let q = q.strip_prefix("Will ")?;
+    let q = q.strip_suffix(" end in a draw?").unwrap_or(q);
+    // accept "vs." and "vs"
+    let (a, b) = if let Some((a, b)) = q.split_once(" vs. ") {
+        (a, b)
+    } else if let Some((a, b)) = q.split_once(" vs ") {
+        (a, b)
+    } else {
+        return None;
+    };
+    if a.is_empty() || b.is_empty() {
+        None
+    } else {
+        Some((a.to_string(), b.to_string()))
+    }
+}
+
+/// Pick the YES token id from a market JSON object. Polymarket encodes
+/// `clobTokenIds` as either an array or a JSON-stringified array of
+/// exactly 2 ids; index 0 is YES.
+fn extract_yes_token_id(market: &serde_json::Value) -> Option<String> {
+    let raw = market.get("clobTokenIds")?;
+    let ids: Vec<serde_json::Value> = if let Some(s) = raw.as_str() {
+        serde_json::from_str(s).ok()?
+    } else if let Some(arr) = raw.as_array() {
+        arr.clone()
+    } else {
+        return None;
+    };
+    let first = ids.first()?;
+    first
+        .as_str()
+        .map(String::from)
+        .or_else(|| first.as_u64().map(|n| n.to_string()))
+}
+
+/// Pull best bid/ask and depth directly from a CLOB REST book. Returns
+/// (best_ask, depth_at_best_ask, best_bid). All optional because thin
+/// books frequently miss one side.
+fn book_top(book: &surebet::orderbook::OrderBook) -> (Option<Decimal>, Option<Decimal>, Option<Decimal>) {
+    let ask = book.asks.best(false);
+    let bid = book.bids.best(true);
+    (
+        ask.map(|(p, _)| p),
+        ask.map(|(_, s)| s),
+        bid.map(|(p, _)| p),
+    )
+}
+
+/// Scan a single Gamma event for a 3-way arb candidate. Returns Some
+/// iff the event's `markets` array contains exactly one "Will X win"
+/// market for each of two teams plus one "end in a draw" market
+/// linking those same two teams.
+async fn extract_arb_candidate(
+    http: &reqwest::Client,
+    clob_url: &str,
+    book_store: &Arc<OrderBookStore>,
+    event: &serde_json::Value,
+) -> Option<ArbCandidate> {
+    let markets = event.get("markets")?.as_array()?;
+    if markets.len() < 3 {
+        return None;
+    }
+
+    // Classify each market by title pattern and collect.
+    let mut win_markets: Vec<(String, &serde_json::Value)> = Vec::new(); // (team, market)
+    let mut draw_market: Option<(String, String, &serde_json::Value)> = None; // (teamA, teamB, market)
+    for m in markets {
+        let q = m.get("question").and_then(|v| v.as_str()).unwrap_or("");
+        // Only accept neg_risk binary markets (the actual football arb shape).
+        let is_neg = m.get("negRisk").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !is_neg {
+            continue;
+        }
+        if let Some((a, b)) = parse_draw_question(q) {
+            draw_market = Some((a, b, m));
+        } else if let Some(team) = parse_win_question(q) {
+            win_markets.push((team, m));
+        }
+    }
+
+    if win_markets.len() != 2 {
+        return None;
+    }
+    let (team_a_draw, team_b_draw, draw_m) = draw_market?;
+
+    // Confirm the two "win" teams match the draw's team pair.
+    let (team_a_win, win_a_m) = &win_markets[0];
+    let (team_b_win, win_b_m) = &win_markets[1];
+    let teams_match = (*team_a_win == team_a_draw && *team_b_win == team_b_draw)
+        || (*team_a_win == team_b_draw && *team_b_win == team_a_draw);
+    if !teams_match {
+        return None;
+    }
+
+    // Preserve "home" = the team listed first in the draw question. The
+    // win_markets order from iteration isn't guaranteed, so re-order.
+    let (home_team, away_team) = (team_a_draw.clone(), team_b_draw.clone());
+    let home_win_m = if *team_a_win == home_team { win_a_m } else { win_b_m };
+    let away_win_m = if *team_a_win == away_team { win_a_m } else { win_b_m };
+
+    // Extract token ids (YES side = index 0 on a binary neg_risk).
+    let home_token = extract_yes_token_id(home_win_m)?;
+    let draw_token = extract_yes_token_id(draw_m)?;
+    let away_token = extract_yes_token_id(away_win_m)?;
+
+    let cid_of = |m: &serde_json::Value| -> String {
+        m.get("conditionId")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_default()
+    };
+    let home_cid = cid_of(home_win_m);
+    let draw_cid = cid_of(draw_m);
+    let away_cid = cid_of(away_win_m);
+    let title_of = |m: &serde_json::Value| -> String {
+        m.get("question")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_default()
+    };
+
+    // Fetch all 3 books in parallel.
+    let (b_home, b_draw, b_away) = tokio::join!(
+        book_store.fetch_rest_book(clob_url, &home_token),
+        book_store.fetch_rest_book(clob_url, &draw_token),
+        book_store.fetch_rest_book(clob_url, &away_token),
+    );
+
+    let (home_ask, home_depth, home_bid) = b_home.as_ref().map(book_top).unwrap_or((None, None, None));
+    let (draw_ask, draw_depth, draw_bid) = b_draw.as_ref().map(book_top).unwrap_or((None, None, None));
+    let (away_ask, away_depth, away_bid) = b_away.as_ref().map(book_top).unwrap_or((None, None, None));
+
+    let legs = vec![
+        ArbLeg {
+            label: "Home".to_string(),
+            team_or_label: home_team.clone(),
+            market_title: title_of(home_win_m),
+            condition_id: home_cid,
+            token_id_yes: home_token,
+            best_ask: home_ask.map(|p| p.to_string()),
+            ask_depth_shares: home_depth.map(|s| s.to_string()),
+            best_bid: home_bid.map(|p| p.to_string()),
+        },
+        ArbLeg {
+            label: "Draw".to_string(),
+            team_or_label: "Draw".to_string(),
+            market_title: title_of(draw_m),
+            condition_id: draw_cid,
+            token_id_yes: draw_token,
+            best_ask: draw_ask.map(|p| p.to_string()),
+            ask_depth_shares: draw_depth.map(|s| s.to_string()),
+            best_bid: draw_bid.map(|p| p.to_string()),
+        },
+        ArbLeg {
+            label: "Away".to_string(),
+            team_or_label: away_team.clone(),
+            market_title: title_of(away_win_m),
+            condition_id: away_cid,
+            token_id_yes: away_token,
+            best_ask: away_ask.map(|p| p.to_string()),
+            ask_depth_shares: away_depth.map(|s| s.to_string()),
+            best_bid: away_bid.map(|p| p.to_string()),
+        },
+    ];
+
+    // Compute edge + blockers.
+    let mut blockers: Vec<String> = Vec::new();
+    let mut sum_asks: Option<Decimal> = None;
+    let mut max_fillable: Option<Decimal> = None;
+    if let (Some(a), Some(d), Some(w)) = (home_ask, draw_ask, away_ask) {
+        let s = a + d + w;
+        sum_asks = Some(s);
+        if let (Some(dh), Some(dd), Some(dw)) = (home_depth, draw_depth, away_depth) {
+            let min_depth = dh.min(dd).min(dw);
+            let headroom_limited = min_depth / ARB_DEPTH_HEADROOM;
+            max_fillable = Some(headroom_limited.round_dp_with_strategy(2, RoundingStrategy::ToZero));
+        }
+    } else {
+        blockers.push("missing best ask on one or more legs".to_string());
+    }
+
+    let net_cost = sum_asks; // Phase 1: assume zero fees. Phase 2 pulls per-leg fees.
+    let edge_per_share = net_cost.map(|c| Decimal::ONE - c);
+    let edge_pct = edge_per_share
+        .zip(net_cost)
+        .and_then(|(e, c)| if c > Decimal::ZERO { Some(e / c) } else { None });
+
+    if let Some(e) = edge_pct {
+        if e < ARB_MIN_EDGE_FRAC {
+            blockers.push(format!("edge {:.2}% below 2% min", e * Decimal::ONE_HUNDRED));
+        }
+    }
+    if let Some(f) = max_fillable {
+        if f < ARB_MIN_SHARES {
+            blockers.push(format!("only {f} shares fillable (need ≥ {ARB_MIN_SHARES})"));
+        }
+    } else if blockers.iter().all(|b| !b.contains("depth")) {
+        blockers.push("depth data unavailable".to_string());
+    }
+
+    let arms = blockers.is_empty() && edge_pct.is_some();
+
+    let event_id = event
+        .get("id")
+        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string())))
+        .unwrap_or_default();
+    let match_title = event
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{home_team} vs. {away_team}"));
+    let kickoff = event
+        .get("endDate")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Suppress unused-var warning when http isn't consumed here. Kept
+    // in the signature for when Phase 2 adds per-leg fee fetches via
+    // the CLOB /markets endpoint.
+    let _ = http;
+
+    Some(ArbCandidate {
+        event_id,
+        match_title,
+        kickoff,
+        legs,
+        sum_asks: sum_asks.map(|s| s.to_string()),
+        net_cost_per_share: net_cost.map(|c| c.to_string()),
+        edge_per_share: edge_per_share.map(|e| e.to_string()),
+        edge_pct: edge_pct.map(|e| (e * Decimal::ONE_HUNDRED).round_dp(3).to_string()),
+        max_fillable_shares: max_fillable.map(|f| f.to_string()),
+        arms,
+        blockers,
+    })
+}
+
+async fn api_arb(State(state): State<AppState>) -> impl IntoResponse {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(BROWSER_UA)
+        .build()
+        .unwrap_or_default();
+
+    // Polymarket tag slug for football / soccer. The site uses
+    // "soccer" as the canonical slug. If empty, fall back to
+    // "football".
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for slug in &["soccer", "football"] {
+        let url = format!(
+            "{}/events?tag_slug={}&active=true&closed=false&limit=200",
+            state.gamma_url, slug
+        );
+        match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(v) = resp.json::<Vec<serde_json::Value>>().await {
+                    if !v.is_empty() {
+                        events = v;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if events.is_empty() {
+        return Json(serde_json::json!({
+            "candidates": [],
+            "fetched_at": Utc::now().to_rfc3339(),
+            "note": "no events returned for tag_slug=soccer or tag_slug=football",
+        }))
+        .into_response();
+    }
+
+    // Process events in parallel; each does up to 3 CLOB book fetches.
+    let per_event = events.into_iter().map(|ev| {
+        let http = http.clone();
+        let clob_url = state.clob_url.clone();
+        let book_store = state.book_store.clone();
+        async move { extract_arb_candidate(&http, &clob_url, &book_store, &ev).await }
+    });
+    let candidates: Vec<ArbCandidate> = futures_util::stream::iter(per_event)
+        .buffer_unordered(10)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // Sort arms-first, then by edge %.
+    let mut ranked = candidates;
+    ranked.sort_by(|a, b| {
+        b.arms
+            .cmp(&a.arms)
+            .then_with(|| {
+                let a_edge = a
+                    .edge_pct
+                    .as_deref()
+                    .and_then(|s| Decimal::from_str(s).ok())
+                    .unwrap_or(Decimal::from(-999));
+                let b_edge = b
+                    .edge_pct
+                    .as_deref()
+                    .and_then(|s| Decimal::from_str(s).ok())
+                    .unwrap_or(Decimal::from(-999));
+                b_edge.cmp(&a_edge)
+            })
+    });
+
+    Json(serde_json::json!({
+        "candidates": ranked,
+        "fetched_at": Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
+// ─── Phase 2: paper-fire ──────────────────────────────────────────────────
+//
+// Simulate buying N shares of each leg at current best ask. Writes a
+// single PAPER ARB entry to the activity log — one per match, not one
+// per leg, because the three buys are a single logical transaction.
+// compute_stats skips PAPER entries so this doesn't pollute realized
+// P&L totals.
+
+#[derive(Debug, Deserialize)]
+struct ArbPaperFireRequest {
+    match_title: String,
+    kickoff: Option<String>,
+    /// Shares per leg (integer or decimal string). Phase 2 accepts the
+    /// user's chosen size and caps at max_fillable server-side.
+    shares: String,
+    legs: Vec<ArbPaperLegRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArbPaperLegRequest {
+    label: String,
+    market_title: String,
+    condition_id: String,
+    token_id_yes: String,
+    best_ask: String,
+    ask_depth_shares: String,
+}
+
+async fn api_arb_paper_fire(
+    State(state): State<AppState>,
+    Json(req): Json<ArbPaperFireRequest>,
+) -> impl IntoResponse {
+    if req.legs.len() != 3 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "arb must have exactly 3 legs"})),
+        )
+            .into_response();
+    }
+
+    let want_shares = match Decimal::from_str(&req.shares) {
+        Ok(s) if s > Decimal::ZERO => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "shares must be > 0"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Re-fetch every leg's live book so we don't trust client-sent
+    // prices. Phase 3 will also require the book not to have moved vs
+    // snapshot — here we just take whatever's on top now.
+    let mut fresh_asks: Vec<(Decimal, Decimal)> = Vec::with_capacity(3); // (ask, depth)
+    for leg in &req.legs {
+        let book = state
+            .book_store
+            .fetch_rest_book(&state.clob_url, &leg.token_id_yes)
+            .await;
+        let (ask, depth, _) = match book.as_ref().map(book_top) {
+            Some(t) => t,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("no book for leg '{}'", leg.label)
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        match (ask, depth) {
+            (Some(a), Some(d)) => fresh_asks.push((a, d)),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("no best ask on leg '{}'", leg.label)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Cap requested shares by every leg's depth ÷ headroom. Matches the
+    // Phase 1 scanner's max_fillable computation.
+    let min_depth = fresh_asks.iter().map(|(_, d)| *d).min().unwrap_or(Decimal::ZERO);
+    let cap = (min_depth / ARB_DEPTH_HEADROOM).round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    let shares = want_shares.min(cap);
+
+    if shares < ARB_MIN_SHARES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "effective size {shares} below min {ARB_MIN_SHARES} (depth ÷ headroom cap)",
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // Per-leg cost + total.
+    let sum_asks: Decimal = fresh_asks.iter().map(|(a, _)| *a).sum();
+    let total_cost = (sum_asks * shares).round_dp(4);
+    let payout = shares.round_dp(4); // exactly one leg resolves $1/share
+    let net_profit = (payout - total_cost).round_dp(4);
+
+    // Log one activity entry per match. `buy_shares` = shares-per-leg
+    // (not the sum across legs), `buy_cost` = total USDC cost across
+    // all 3 legs, `sell_revenue` = payout assumption, `net_profit` =
+    // payout − cost. Stats computation skips PAPER entries, so this
+    // doesn't affect realized totals.
+    let now_utc = Utc::now();
+    let leg_breakdown = req
+        .legs
+        .iter()
+        .zip(fresh_asks.iter())
+        .map(|(l, (a, _))| format!("{}={} @ ${:.3}", l.label, shares, a))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let status = format!(
+        "PAPER ARB OK @ current asks — {} — cost ${:.4} → payout ${:.4} = profit ${:.4}",
+        leg_breakdown, total_cost, payout, net_profit,
+    );
+
+    let entry = ActivityEntry {
+        date: now_utc.format("%Y-%m-%d").to_string(),
+        time: now_utc.format("%H:%M:%S").to_string(),
+        market: req.match_title.clone(),
+        outcome: "3-way arb basket".to_string(),
+        strategy: "PAPER ARB".to_string(),
+        buy_shares: shares.to_string(),
+        buy_cost: total_cost.to_string(),
+        mint_cost: "0".to_string(),
+        sell_revenue: payout.to_string(),
+        net_profit: net_profit.to_string(),
+        status,
+        condition_id: req.legs[0].condition_id.clone(),
+        gas_matic: "0".to_string(),
+    };
+
+    state.activity.write().await.push(entry.clone());
+    rewrite_activity_file(&state).await;
+
+    // Kickoff is informational for the log — we don't fail if missing.
+    let _ = req.kickoff;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "entry": entry,
+        "shares": shares.to_string(),
+        "total_cost": total_cost.to_string(),
+        "net_profit": net_profit.to_string(),
+    }))
+    .into_response()
+}
+
+async fn arb_html() -> Html<String> {
+    Html(r##"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>3-way arbitrage scanner</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 1em; background: #0d1117; color: #c9d1d9; }
+    h1 { margin: 0 0 0.5em; }
+    nav a { color: #58a6ff; margin-right: 1em; text-decoration: none; }
+    .meta { color: #8b949e; font-size: 0.9em; margin: 0.5em 0 1em; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.9em; margin-top: 0.5em; }
+    th, td { padding: 0.4em 0.6em; text-align: right; border-bottom: 1px solid #21262d; }
+    th { color: #8b949e; font-weight: normal; background: #161b22; position: sticky; top: 0; }
+    th:first-child, td:first-child { text-align: left; }
+    tr.arms { background: #0d2818; }
+    tr.arms td { border-bottom-color: #1a4d2e; }
+    .edge-pos { color: #7ee2a8; font-weight: 600; }
+    .edge-neg { color: #8b949e; }
+    .blocker { color: #fce28e; font-size: 0.8em; }
+    .ask-cell { font-family: monospace; }
+    .fire-btn { padding: 0.3em 0.8em; border-radius: 4px; background: #d97706; color: #fff; border: 1px solid #f59e0b; cursor: pointer; font-weight: 600; font-size: 0.85em; }
+    .fire-btn:disabled { background: #30363d; color: #8b949e; border-color: #30363d; opacity: 0.5; cursor: not-allowed; }
+    .phase-badge { background: #1f6feb; color: #fff; padding: 0.1em 0.5em; border-radius: 3px; font-size: 0.75em; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a>
+    <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a>
+    <a href="/arb" style="font-weight:600">Arb</a>
+  </nav>
+  <h1>3-Way Arbitrage Scanner <span class="phase-badge">Phase 1+2</span></h1>
+  <div class="meta" id="meta">Loading…</div>
+  <div class="meta" style="color:#8b949e">
+    Scans football events for home / draw / away 3-way Dutch-book arbs.
+    Green rows = all defensive gates pass (≥2% edge, ≥10 shares fillable at 1.5× depth headroom, all asks present).
+    Paper-fire simulates the 3-leg buy and logs a <code>PAPER ARB</code> entry to the activity log.
+    Live execution is deferred to Phase 3.
+  </div>
+  <table id="arb-table">
+    <thead>
+      <tr>
+        <th>Match</th>
+        <th>Kickoff</th>
+        <th>Home ask (depth)</th>
+        <th>Draw ask (depth)</th>
+        <th>Away ask (depth)</th>
+        <th>Sum</th>
+        <th>Edge $/sh</th>
+        <th>Edge %</th>
+        <th>Fillable</th>
+        <th>Arms?</th>
+        <th>Paper fire</th>
+      </tr>
+    </thead>
+    <tbody id="arb-rows"></tbody>
+  </table>
+<script>
+function fmtDec(s, dp) {
+  if (s == null) return '—';
+  const n = parseFloat(s);
+  if (!Number.isFinite(n)) return '—';
+  return n.toFixed(dp);
+}
+
+function fmtKickoff(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+  } catch (e) {
+    return iso;
+  }
+}
+
+function cellAsk(leg) {
+  if (!leg.best_ask) return '<span class="edge-neg">—</span>';
+  const depth = leg.ask_depth_shares ? ` <span style="color:#8b949e">(${fmtDec(leg.ask_depth_shares,0)})</span>` : '';
+  return `<span class="ask-cell">$${fmtDec(leg.best_ask,3)}${depth}</span>`;
+}
+
+async function load() {
+  const r = await fetch('/api/arb');
+  const d = await r.json();
+  const meta = document.getElementById('meta');
+  const tbody = document.getElementById('arb-rows');
+  const cands = d.candidates || [];
+  const armed = cands.filter(c => c.arms).length;
+  meta.innerHTML = cands.length === 0
+    ? (d.note || 'No football events found right now.')
+    : `${cands.length} match${cands.length===1?'':'es'} scanned · <b class="edge-pos">${armed}</b> meet all arb gates · fetched ${new Date(d.fetched_at).toLocaleTimeString()}`;
+
+  if (cands.length === 0) { tbody.innerHTML = ''; return; }
+
+  tbody.innerHTML = cands.map(c => {
+    const home = c.legs[0], draw = c.legs[1], away = c.legs[2];
+    const edgePct = c.edge_pct ? parseFloat(c.edge_pct) : null;
+    const edgeCls = (edgePct != null && edgePct > 0) ? 'edge-pos' : 'edge-neg';
+    const rowCls = c.arms ? 'arms' : '';
+    const armsCell = c.arms
+      ? '<span class="edge-pos">YES</span>'
+      : `<span class="blocker" title="${(c.blockers||[]).join(' · ')}">NO (${(c.blockers||[]).length})</span>`;
+
+    const size = c.max_fillable_shares ? parseFloat(c.max_fillable_shares) : 0;
+    const fireBtn = (c.arms && size > 0)
+      ? `<button class="fire-btn" onclick='paperFire(${JSON.stringify(c).replace(/\'/g,"&apos;")})'>Paper fire · ${size.toFixed(0)}sh</button>`
+      : `<button class="fire-btn" disabled>—</button>`;
+
+    return `<tr class="${rowCls}">
+      <td>
+        <div><b>${c.match_title}</b></div>
+        <div style="color:#8b949e;font-size:0.8em">${home.team_or_label} vs. ${away.team_or_label}</div>
+      </td>
+      <td>${fmtKickoff(c.kickoff)}</td>
+      <td>${cellAsk(home)}</td>
+      <td>${cellAsk(draw)}</td>
+      <td>${cellAsk(away)}</td>
+      <td class="ask-cell">${c.sum_asks ? '$' + fmtDec(c.sum_asks,4) : '—'}</td>
+      <td class="${edgeCls} ask-cell">${c.edge_per_share ? '$' + fmtDec(c.edge_per_share,4) : '—'}</td>
+      <td class="${edgeCls}">${edgePct != null ? edgePct.toFixed(2) + '%' : '—'}</td>
+      <td>${size > 0 ? size.toFixed(0) : '—'}</td>
+      <td>${armsCell}</td>
+      <td>${fireBtn}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function paperFire(c) {
+  const size = c.max_fillable_shares ? parseFloat(c.max_fillable_shares) : 0;
+  if (!size || size <= 0) { alert('No fillable size'); return; }
+  const cost = parseFloat(c.sum_asks) * size;
+  const profit = size - cost;
+  const msg = `Simulate 3-leg arb buy?\n\n  Match: ${c.match_title}\n  Size:  ${size} shares per leg (capped by depth ÷ 1.5)\n  Cost:  $${cost.toFixed(4)}\n  Payout: $${size.toFixed(4)} (one leg resolves $1)\n  Projected profit: $${profit.toFixed(4)}\n\nThis writes a PAPER ARB entry to the activity log. No real orders are placed.`;
+  if (!confirm(msg)) return;
+  try {
+    const resp = await fetch('/api/arb-paper-fire', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        match_title: c.match_title,
+        kickoff: c.kickoff,
+        shares: String(size),
+        legs: c.legs.map(l => ({
+          label: l.label,
+          market_title: l.market_title,
+          condition_id: l.condition_id,
+          token_id_yes: l.token_id_yes,
+          best_ask: l.best_ask,
+          ask_depth_shares: l.ask_depth_shares || '0',
+        })),
+      }),
+    });
+    const j = await resp.json();
+    if (j.ok) {
+      alert(`PAPER ARB logged\n\n  Shares:      ${j.shares}\n  Total cost:  $${parseFloat(j.total_cost).toFixed(4)}\n  Net profit:  $${parseFloat(j.net_profit).toFixed(4)}\n\nView on /trades Activity Log.`);
+      await load();
+    } else {
+      alert('Paper-fire failed: ' + (j.error || 'unknown'));
+    }
+  } catch (e) {
+    alert('Paper-fire failed: ' + e);
+  }
+}
+
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>"##.to_string())
+}
+
 async fn paper_trades_html() -> Html<String> {
     Html(r##"<!DOCTYPE html>
 <html>
@@ -7306,7 +8039,7 @@ async fn paper_trades_html() -> Html<String> {
       <div id="sell-modal-body"></div>
     </div>
   </div>
-  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a></nav>
+  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a> <a href="/arb">Arb</a></nav>
   <h1>Paper Trades</h1>
   <div class="meta" id="meta">Loading…</div>
   <div id="last-updated" style="color:#8b949e; font-size:0.85em; margin-bottom:0.75em"></div>
@@ -8091,6 +8824,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
   <a href="/weather">Weather</a>
   <a href="/observations">Observations</a>
   <a href="/paper-trades">Paper Trades</a>
+  <a href="/arb">Arb</a>
 </div>
 
 {geoblock_banner}
@@ -8579,6 +9313,7 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   <a href="/weather">Weather</a>
   <a href="/observations">Observations</a>
   <a href="/paper-trades">Paper Trades</a>
+  <a href="/arb">Arb</a>
 </div>
 <div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Scan: <b style="color:{scan_color}">{scan_label}</b></div>
 
