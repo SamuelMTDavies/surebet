@@ -4752,9 +4752,18 @@ async fn process_weather_market(
     })
 }
 
-/// METAR → Wunderground fallback. Open-Meteo is intentionally excluded —
-/// intra-day calculations use only the resolution-grade sensor at the
-/// station, not gridded-model interpolations.
+/// METAR-only intra-day observations. Wunderground's scraped fields are
+/// **intentionally not used**: `temperatureMaxSince7Am` is a rolling
+/// window anchored at the most recent local 7 AM (so between local
+/// midnight and 7 AM it reports YESTERDAY's peak), and
+/// `temperatureMin24Hour` is a 24h rolling window that always crosses
+/// midnight. Neither equals "today's max/min since local midnight",
+/// which is what bracket markets resolve against. METAR gives us the
+/// per-report samples and `aggregate_by_local_day` windows them to the
+/// station's local calendar day correctly.
+///
+/// Open-Meteo is intentionally excluded here — intra-day calculations
+/// use only the resolution-grade station sensor.
 async fn fetch_sensor_observations(
     http: &reqwest::Client,
     resolution_url: &str,
@@ -4767,49 +4776,22 @@ async fn fetch_sensor_observations(
         surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
     };
 
-    // 1. METAR — native integer °C at the airport station.
-    if let Some(date) = target_date {
-        if let Ok(reports) =
-            surebet::weather::metar::fetch_metar_reports(http, &icao, 36).await
-        {
-            let tz = surebet::weather::metar::tz_offset_for_icao(&icao);
-            if let Some(agg) =
-                surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)
-            {
-                return Some(ObservationsBlock {
-                    max_so_far: c_to_market_unit(agg.max_c),
-                    min_so_far: c_to_market_unit(agg.min_c),
-                    current: c_to_market_unit(agg.current_c),
-                    last_observation_at: agg.latest_obs_utc.to_rfc3339(),
-                    timezone: format!("UTC{:+}", tz / 3600),
-                    source: format!("METAR ({} reports)", agg.report_count),
-                    station: Some(agg.icao),
-                    resolution_url: Some(resolution_url.to_string()),
-                });
-            }
-        }
-    }
-
-    // 2. Wunderground scrape — same underlying data as METAR, reformatted.
-    // Used when METAR is momentarily unavailable or the ICAO is archived.
-    if let Ok(wu) = surebet::weather::wunderground::fetch_wunderground(http, &icao).await {
-        let f_to_unit = |f: f64| match unit {
-            surebet::weather::TemperatureUnit::Celsius => (f - 32.0) * 5.0 / 9.0,
-            surebet::weather::TemperatureUnit::Fahrenheit => f,
-        };
-        return Some(ObservationsBlock {
-            max_so_far: f_to_unit(wu.max_since_7am_f),
-            min_so_far: f_to_unit(wu.min_24h_f),
-            current: f_to_unit(wu.current_f),
-            last_observation_at: wu.observation_time_utc.to_rfc3339(),
-            timezone: String::new(),
-            source: "Wunderground (scrape)".to_string(),
-            station: Some(wu.icao),
-            resolution_url: Some(resolution_url.to_string()),
-        });
-    }
-
-    None
+    let date = target_date?;
+    let reports = surebet::weather::metar::fetch_metar_reports(http, &icao, 36)
+        .await
+        .ok()?;
+    let tz = surebet::weather::metar::tz_offset_for_icao(&icao);
+    let agg = surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)?;
+    Some(ObservationsBlock {
+        max_so_far: c_to_market_unit(agg.max_c),
+        min_so_far: c_to_market_unit(agg.min_c),
+        current: c_to_market_unit(agg.current_c),
+        last_observation_at: agg.latest_obs_utc.to_rfc3339(),
+        timezone: format!("UTC{:+}", tz / 3600),
+        source: format!("METAR ({} reports)", agg.report_count),
+        station: Some(agg.icao),
+        resolution_url: Some(resolution_url.to_string()),
+    })
 }
 
 /// Compare our model's expected resolution value against the market's
@@ -5018,29 +5000,35 @@ fn compute_coverage_combos(brackets: &[WeatherBracketJson]) -> Vec<CoverageCombo
 }
 
 /// Shared helper used by both `/api/weather` and `/api/observations`:
-/// fetch today's running max/min/current using METAR → Wunderground → Open-Meteo.
+/// fetch today's running max/min/current **from METAR only**.
+///
+/// - **Wunderground is skipped**: its `temperatureMaxSince7Am` and
+///   `temperatureMin24Hour` are rolling windows that cross local
+///   midnight and silently carry yesterday's extremes into today.
+/// - **Open-Meteo is skipped**: it's a gridded model, not the
+///   station-grade resolution sensor. We'd rather surface "no data" than
+///   substitute a wrong-location reading.
 ///
 /// Returns `None` when the market resolves on a future local date (no
-/// observations exist yet) or when every provider fails.
+/// observations exist yet) or when METAR fails.
 async fn fetch_obs_block_for_event(
     http: &reqwest::Client,
     resolution_url: &str,
     target_date: Option<chrono::NaiveDate>,
-    lat: Option<f64>,
-    lon: Option<f64>,
+    _lat: Option<f64>,
+    _lon: Option<f64>,
     unit: surebet::weather::TemperatureUnit,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<ObservationsBlock> {
-    let icao = surebet::weather::wunderground::icao_from_resolution_url(resolution_url);
+    let icao = surebet::weather::wunderground::icao_from_resolution_url(resolution_url)?;
 
-    let target_in_future = match (target_date, icao.as_deref()) {
-        (Some(date), Some(icao_code)) => {
-            let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
+    let target_in_future = match target_date {
+        Some(date) => {
+            let tz = surebet::weather::metar::tz_offset_for_icao(&icao);
             let local_today = (now + chrono::Duration::seconds(tz)).date_naive();
             date > local_today
         }
-        (Some(date), None) => date > now.date_naive(),
-        _ => false,
+        None => return None,
     };
     if target_in_future {
         return None;
@@ -5051,72 +5039,22 @@ async fn fetch_obs_block_for_event(
         surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
     };
 
-    // 1. METAR
-    if let (Some(icao_code), Some(date)) = (&icao, target_date) {
-        if let Ok(reports) =
-            surebet::weather::metar::fetch_metar_reports(http, icao_code, 36).await
-        {
-            let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
-            if let Some(agg) =
-                surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)
-            {
-                return Some(ObservationsBlock {
-                    max_so_far: c_to_market_unit(agg.max_c),
-                    min_so_far: c_to_market_unit(agg.min_c),
-                    current: c_to_market_unit(agg.current_c),
-                    last_observation_at: agg.latest_obs_utc.to_rfc3339(),
-                    timezone: format!("UTC{:+}", tz / 3600),
-                    source: format!("METAR ({} reports)", agg.report_count),
-                    station: Some(agg.icao),
-                    resolution_url: Some(resolution_url.to_string()),
-                });
-            }
-        }
-    }
-
-    // 2. Wunderground
-    if let Some(icao_code) = &icao {
-        if let Ok(wu) =
-            surebet::weather::wunderground::fetch_wunderground(http, icao_code).await
-        {
-            let f_to_unit = |f: f64| match unit {
-                surebet::weather::TemperatureUnit::Celsius => (f - 32.0) * 5.0 / 9.0,
-                surebet::weather::TemperatureUnit::Fahrenheit => f,
-            };
-            return Some(ObservationsBlock {
-                max_so_far: f_to_unit(wu.max_since_7am_f),
-                min_so_far: f_to_unit(wu.min_24h_f),
-                current: f_to_unit(wu.current_f),
-                last_observation_at: wu.observation_time_utc.to_rfc3339(),
-                timezone: String::new(),
-                source: "Wunderground".to_string(),
-                station: Some(wu.icao),
-                resolution_url: Some(resolution_url.to_string()),
-            });
-        }
-    }
-
-    // 3. Open-Meteo
-    if let (Some(lat), Some(lon), Some(date)) = (lat, lon, target_date) {
-        if let Ok(om) = fetch_observations(http, lat, lon, date, unit).await {
-            return Some(ObservationsBlock {
-                max_so_far: om.max_so_far,
-                min_so_far: om.min_so_far,
-                current: om.current,
-                last_observation_at: om.last_observation_at.to_rfc3339(),
-                timezone: om.timezone,
-                source: om.source.to_string(),
-                station: icao.clone(),
-                resolution_url: if resolution_url.is_empty() {
-                    None
-                } else {
-                    Some(resolution_url.to_string())
-                },
-            });
-        }
-    }
-
-    None
+    let date = target_date?;
+    let reports = surebet::weather::metar::fetch_metar_reports(http, &icao, 36)
+        .await
+        .ok()?;
+    let tz = surebet::weather::metar::tz_offset_for_icao(&icao);
+    let agg = surebet::weather::metar::aggregate_by_local_day(&reports, date, tz)?;
+    Some(ObservationsBlock {
+        max_so_far: c_to_market_unit(agg.max_c),
+        min_so_far: c_to_market_unit(agg.min_c),
+        current: c_to_market_unit(agg.current_c),
+        last_observation_at: agg.latest_obs_utc.to_rfc3339(),
+        timezone: format!("UTC{:+}", tz / 3600),
+        source: format!("METAR ({} reports)", agg.report_count),
+        station: Some(agg.icao),
+        resolution_url: Some(resolution_url.to_string()),
+    })
 }
 
 /// Convenience wrapper used by the paper-trade save/load paths: given a
@@ -5783,9 +5721,9 @@ async fn process_weather_event(
         .map(|d| d.with_timezone(&chrono::Utc));
     let target_date = end_date_utc.map(|d| d.date_naive());
 
-    let (lat, lon) = lookup_station(&city)
-        .map(|(_, la, lo)| (Some(la), Some(lo)))
-        .unwrap_or((None, None));
+    // Lat/lon no longer used for intra-day — Open-Meteo dropped from
+    // the path because METAR is the sole resolution-grade source.
+    let _ = lookup_station(&city);
 
     let unit = event
         .get("markets")
@@ -5807,20 +5745,20 @@ async fn process_weather_event(
         })
         .unwrap_or(surebet::weather::TemperatureUnit::Celsius);
 
-    // Provider dispatch: METAR (native integer °C from aviationweather.gov) is
-    // the same data Wunderground reformats — hitting it directly avoids the
-    // °C → °F → °C round-trip that Wunderground's embedded JSON introduces.
-    // Order: METAR → Wunderground scrape → Open-Meteo gridded fallback.
+    // Intra-day numbers come from METAR ONLY. Wunderground and Open-Meteo
+    // are both disqualified for intra-day max/min/current: Wunderground's
+    // scraped aggregate fields are rolling windows that cross local
+    // midnight; Open-Meteo is gridded-model data, not the station sensor
+    // that resolves the market.
     let resolution_url = event
         .get("resolutionSource")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let icao = surebet::weather::wunderground::icao_from_resolution_url(resolution_url);
 
-    // Skip observation fetch for markets whose target date is still in the future:
-    // METAR has no reports yet, and Wunderground's "today's running max" is about
-    // the wrong day. The Weather tab is for forecasts; Observations is for
-    // already-observed data only.
+    // Skip observation fetch for markets whose target date is still in the
+    // future: METAR has no reports yet. The Weather tab is for forecasts;
+    // Observations is for already-observed data only.
     let target_in_future = match (target_date, icao.as_deref()) {
         (Some(date), Some(icao_code)) => {
             let tz = surebet::weather::metar::tz_offset_for_icao(icao_code);
@@ -5841,7 +5779,12 @@ async fn process_weather_event(
             surebet::weather::TemperatureUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
         };
 
-        // 1. METAR.
+        // METAR only. Wunderground's scraped aggregates (temperatureMaxSince7Am,
+        // temperatureMin24Hour) are rolling windows that cross local midnight
+        // and silently carry yesterday's extremes into today — unusable for
+        // "today's max/min" which is what these markets resolve against.
+        // Open-Meteo is gridded, not station-grade. If METAR is unavailable,
+        // surface "no data" rather than substitute.
         if let (Some(icao_code), Some(date)) = (&icao, target_date) {
             match surebet::weather::metar::fetch_metar_reports(http, icao_code, 36).await {
                 Ok(reports) => {
@@ -5863,52 +5806,6 @@ async fn process_weather_event(
                 }
                 Err(e) => {
                     tracing::warn!(icao = %icao_code, error = %e, "METAR fetch failed");
-                }
-            }
-        }
-
-        // 2. Wunderground HTML fallback.
-        if result.is_none() {
-            if let Some(icao_code) = &icao {
-                if let Ok(wu) =
-                    surebet::weather::wunderground::fetch_wunderground(http, icao_code).await
-                {
-                    let f_to_unit = |f: f64| match unit {
-                        surebet::weather::TemperatureUnit::Celsius => (f - 32.0) * 5.0 / 9.0,
-                        surebet::weather::TemperatureUnit::Fahrenheit => f,
-                    };
-                    result = Some(ObservationsBlock {
-                        max_so_far: f_to_unit(wu.max_since_7am_f),
-                        min_so_far: f_to_unit(wu.min_24h_f),
-                        current: f_to_unit(wu.current_f),
-                        last_observation_at: wu.observation_time_utc.to_rfc3339(),
-                        timezone: String::new(),
-                        source: "Wunderground".to_string(),
-                        station: Some(wu.icao),
-                        resolution_url: Some(resolution_url.to_string()),
-                    });
-                }
-            }
-        }
-
-        // 3. Open-Meteo last-resort (past-hours only, never forecast hours).
-        if result.is_none() {
-            if let (Some(lat), Some(lon), Some(date)) = (lat, lon, target_date) {
-                if let Ok(om) = fetch_observations(http, lat, lon, date, unit).await {
-                    result = Some(ObservationsBlock {
-                        max_so_far: om.max_so_far,
-                        min_so_far: om.min_so_far,
-                        current: om.current,
-                        last_observation_at: om.last_observation_at.to_rfc3339(),
-                        timezone: om.timezone,
-                        source: om.source.to_string(),
-                        station: icao.clone(),
-                        resolution_url: if resolution_url.is_empty() {
-                            None
-                        } else {
-                            Some(resolution_url.to_string())
-                        },
-                    });
                 }
             }
         }
