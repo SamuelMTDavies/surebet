@@ -628,8 +628,11 @@ struct AppState {
 }
 
 /// Per-alert immutable record emitted when a new METAR reading flips a
-/// bracket from LIVE → DEAD. `best_ask_current` and `depth_current` are
-/// refreshed at API-call time, not frozen at alert detection.
+/// bracket from LIVE → DEAD. `best_ask_at_detection` / `depth_at_
+/// detection` freeze the CLOB state at the moment we spotted the flip
+/// — useful for historical review even if the live book later goes
+/// empty. The `/api/metar-alerts` endpoint additionally enriches each
+/// alert with a fresh live-book snapshot.
 #[derive(Clone, Debug, Serialize)]
 struct MetarAlert {
     id: String,
@@ -645,6 +648,11 @@ struct MetarAlert {
     unit_sym: String,      // "°F" | "°C"
     old_extreme: f64,      // in market units
     new_extreme: f64,      // in market units
+    /// Best NO ask observed at the moment the flip was detected. `None`
+    /// if the book was empty or the fetch failed.
+    best_ask_at_detection: Option<f64>,
+    /// Depth (shares) available at `best_ask_at_detection`.
+    depth_at_detection: Option<f64>,
 }
 
 /// Per-station cache of the previous aggregate — used to detect *new*
@@ -6432,6 +6440,11 @@ async fn metar_poll_once(state: &AppState, http: &reqwest::Client) {
                 unit_sym: entry.unit_sym.to_string(),
                 old_extreme,
                 new_extreme,
+                // Populated below after all per-bracket detection runs,
+                // to avoid holding the book_store fetch inline during
+                // the diff loop.
+                best_ask_at_detection: None,
+                depth_at_detection: None,
             });
             prior_flagged.insert(b.token_id_no.clone());
         }
@@ -6460,8 +6473,29 @@ async fn metar_poll_once(state: &AppState, http: &reqwest::Client) {
     *state.metar.flagged_dead.write().await = prior_flagged;
 
     if !new_alerts.is_empty() {
+        // Freeze a book snapshot per alert at detection time. Runs
+        // bounded-concurrently so a pile of simultaneous flips doesn't
+        // fan out unbounded fetches. Even if the book later empties,
+        // the detection-time snapshot survives on the alert.
+        let hydrated = futures_util::stream::iter(new_alerts.into_iter().map(|mut a| {
+            let book_store = state.book_store.clone();
+            let clob_url = state.clob_url.clone();
+            async move {
+                let book = book_store.fetch_rest_book(&clob_url, &a.token_id_no).await;
+                if let Some(b) = book.as_ref() {
+                    let (ask, depth, _bid) = book_top(b);
+                    a.best_ask_at_detection = ask.and_then(|p| p.to_f64());
+                    a.depth_at_detection = depth.and_then(|s| s.to_f64());
+                }
+                a
+            }
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+
         let mut alerts = state.metar.alerts.write().await;
-        for a in new_alerts {
+        for a in hydrated {
             alerts.push_front(a);
         }
         while alerts.len() > METAR_ALERT_RING_SIZE {
@@ -6848,8 +6882,13 @@ async function loadMetarAlerts() {
   el.innerHTML = (d.alerts).map(row => {
     const a = row.alert;
     const detected = new Date(a.detected_at).toLocaleTimeString();
-    const bestAsk = row.current_best_ask ? '$' + parseFloat(row.current_best_ask).toFixed(4) : '—';
-    const depth = row.current_depth ? parseFloat(row.current_depth).toFixed(0) : '—';
+    // "at detection" = frozen snapshot when we spotted the flip.
+    // "current" = live refetch done when the UI loaded. Either can be
+    // missing; showing both helps assess whether the window is still open.
+    const snapAsk = a.best_ask_at_detection != null ? '$' + a.best_ask_at_detection.toFixed(4) : '—';
+    const snapDepth = a.depth_at_detection != null ? a.depth_at_detection.toFixed(0) + 'sh' : '—';
+    const liveAsk = row.current_best_ask ? '$' + parseFloat(row.current_best_ask).toFixed(4) : '—';
+    const liveDepth = row.current_depth ? parseFloat(row.current_depth).toFixed(0) + 'sh' : '—';
     const sz = row.capture_size ? parseFloat(row.capture_size).toFixed(2) : '—';
     const cost = row.capture_cost ? '$' + parseFloat(row.capture_cost).toFixed(2) : '—';
     const label = a.bracket_label + ' · ' + a.measure;
@@ -6861,14 +6900,18 @@ async function loadMetarAlerts() {
       ? 'padding:0.25em 0.7em;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:4px;cursor:pointer;font-weight:600'
       : 'padding:0.25em 0.7em;background:#30363d;color:#8b949e;border:1px solid #30363d;border-radius:4px;cursor:not-allowed;opacity:0.6';
     const btnLabel = row.capturable
-      ? `Capture · buy ${sz}NO @ ${bestAsk} (${cost})`
-      : (row.current_best_ask ? `NO ask ${bestAsk} > ceiling` : 'no book');
+      ? `Capture · buy ${sz}NO @ ${liveAsk} (${cost})`
+      : (row.current_best_ask ? `live ask ${liveAsk} > ceiling` : 'no live book');
     const onclick = row.capturable ? `onclick='captureMetarAlert(${JSON.stringify(row).replace(/\'/g,"&apos;")})'` : '';
 
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:0.8em;padding:0.5em 0.6em;border-top:1px solid #21262d">
       <div>
         <div><b>${a.market_question}</b> · <span style="color:#fce28e">${label}</span></div>
-        <div style="color:#8b949e;font-size:0.82em">${detected} · station ${a.station} · ${flipNote} · current NO ${bestAsk} (${depth}sh)</div>
+        <div style="color:#8b949e;font-size:0.82em">
+          ${detected} · station ${a.station} · ${flipNote}
+          · <span style="color:#c9d1d9">at detection: NO ${snapAsk} (${snapDepth})</span>
+          · live: NO ${liveAsk} (${liveDepth})
+        </div>
       </div>
       <button style="${btnStyle}" ${onclick} ${row.capturable ? '' : 'disabled'}>${btnLabel}</button>
     </div>`;
