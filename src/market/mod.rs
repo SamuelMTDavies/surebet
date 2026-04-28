@@ -1,13 +1,13 @@
 //! Market discovery and filtering.
 //!
-//! Uses the official Polymarket SDK (polymarket-client-sdk) Gamma client
+//! Uses the official Polymarket SDK (polymarket-client-sdk-v2) Gamma client
 //! for market discovery. The SDK handles all Gamma API deserialization
 //! quirks (stringified JSON arrays, mixed string/float fields, etc.)
 
 use crate::config::FilterConfig;
-use polymarket_client_sdk::gamma;
-use polymarket_client_sdk::gamma::types::request::MarketsRequest;
-use polymarket_client_sdk::gamma::types::response::Market as SdkMarket;
+use polymarket_client_sdk_v2::gamma;
+use polymarket_client_sdk_v2::gamma::types::request::MarketsRequest;
+use polymarket_client_sdk_v2::gamma::types::response::Market as SdkMarket;
 use tracing::{debug, info, warn};
 
 /// A market discovered from the Gamma API, with fields converted to string

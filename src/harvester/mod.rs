@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
-use polymarket_client_sdk::gamma::types::response::Market as SdkMarket;
+use polymarket_client_sdk_v2::gamma::types::response::Market as SdkMarket;
 
 use crate::orderbook::{OrderBook, OrderBookStore};
 

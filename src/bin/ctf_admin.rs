@@ -26,7 +26,7 @@ use alloy::signers::Signer;
 use alloy::signers::local::LocalSigner;
 use alloy::sol;
 use anyhow::{Context, Result, anyhow, bail};
-use polymarket_client_sdk::ctf::types::{
+use polymarket_client_sdk_v2::ctf::types::{
     CollectionIdRequest, MergePositionsRequest, PositionIdRequest, RedeemNegRiskRequest,
     RedeemPositionsRequest,
 };
@@ -42,9 +42,42 @@ sol! {
         function payoutDenominator(bytes32 conditionId) external view returns (uint256);
         function payoutNumerators(bytes32 conditionId, uint256 index) external view returns (uint256);
     }
+
+    #[sol(rpc)]
+    interface IERC20 {
+        function balanceOf(address account) external view returns (uint256);
+        function approve(address spender, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
+
+    // Polymarket V2 CollateralOnramp / Offramp.
+    // Onramp.wrap   pulls USDC.e from msg.sender (after approve) and mints pUSD 1:1 to `_to`.
+    // Offramp.unwrap burns pUSD from msg.sender (after approve) and returns USDC.e 1:1 to `_to`.
+    #[sol(rpc)]
+    interface ICollateralRamp {
+        function wrap(address _asset, address _to, uint256 _amount) external;
+        function unwrap(address _asset, address _to, uint256 _amount) external;
+    }
 }
 
-const USDC: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+// Legacy bridged USDC. After Polymarket's V2 migration this is no longer the
+// protocol's collateral — it's only relevant for one-time migration via the
+// CollateralOnramp (wrap/unwrap subcommands).
+const USDCE: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+// V2 collateral. Used for every position-related CTF call (split / merge /
+// redeem / position-id derivation). Imported as `COLLATERAL` so the call sites
+// read as the role rather than the specific token.
+const PUSD: Address = address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+const COLLATERAL: Address = PUSD;
+const ONRAMP: Address = address!("0x93070a847efEf7F70739046A929D47a521F5B8ee");
+// V2 exchange contracts. Both must be approved on pUSD so they can move the
+// wallet's collateral when filling buys / locking quote-side liquidity. The
+// V1 addresses (`0x4bFb41…8982E`, `0xC5d563…20f80a`) are deliberately omitted
+// — they reject post-V2 signatures, so leaving them un-approved is harmless.
+const CTF_EXCHANGE_V2: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
+const NEG_RISK_CTF_EXCHANGE_V2: Address =
+    address!("0xe2222d279d744050d28e00520010520000310F59");
+const NEG_RISK_ADAPTER: Address = address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
 const POLYGON_CHAIN_ID: u64 = 137;
 const DEFAULT_RPC: &str = "https://polygon-rpc.com";
 
@@ -55,11 +88,20 @@ fn print_usage() {
     eprintln!("  ctf_admin redeem-neg-risk --condition-id 0x... [--yes-amount <USDC>] [--no-amount <USDC>]");
     eprintln!("  ctf_admin balance         --condition-id 0x...");
     eprintln!("  ctf_admin resolution      --condition-id 0x...");
+    eprintln!("  ctf_admin wrap            [--amount <USDC>]    # USDC.e → pUSD (omit --amount for full balance)");
+    eprintln!("  ctf_admin unwrap          --amount <pUSD>       # pUSD → USDC.e");
+    eprintln!("  ctf_admin approve-collateral                     # one-time pUSD approval for V2 trading");
     eprintln!();
     eprintln!("Notes:");
     eprintln!("  redeem          — standard CTF binary markets (single-question YES/NO).");
     eprintln!("  redeem-neg-risk — Polymarket negative-risk markets (multi-outcome events).");
     eprintln!("                    Pass the on-chain token amounts to redeem; defaults to 0 if omitted.");
+    eprintln!("  wrap            — V2 collateral migration. Calls approve(USDC.e → Onramp) then");
+    eprintln!("                    Onramp.wrap(USDC.e, wallet, amount). Mints pUSD 1:1 to the wallet.");
+    eprintln!("  approve-collateral — Sets max-uint pUSD allowance on the four V2 spenders the");
+    eprintln!("                    dashboard's mint+sell needs: ConditionalTokens, NegRiskAdapter,");
+    eprintln!("                    CtfExchange V2, NegRiskCtfExchange V2. Idempotent — already-set");
+    eprintln!("                    allowances are skipped. Run once after wrapping USDC.e → pUSD.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  ctf_admin merge           --condition-id 0xd387bfe6... --amount 2.0");
@@ -67,6 +109,9 @@ fn print_usage() {
     eprintln!("  ctf_admin redeem-neg-risk --condition-id 0x35b47285... --no-amount 10.0");
     eprintln!("  ctf_admin balance         --condition-id 0xd387bfe6...");
     eprintln!("  ctf_admin resolution      --condition-id 0xd387bfe6...");
+    eprintln!("  ctf_admin wrap                              # wrap entire USDC.e balance");
+    eprintln!("  ctf_admin wrap            --amount 10.0     # wrap exactly $10.00");
+    eprintln!("  ctf_admin unwrap          --amount 5.0      # unwrap $5.00 pUSD back to USDC.e");
 }
 
 #[tokio::main]
@@ -89,10 +134,16 @@ async fn main() -> Result<()> {
     }
 
     let cmd = args[1].as_str();
-    let condition_id_str = arg_value(&args, "--condition-id")
-        .ok_or_else(|| anyhow!("--condition-id is required"))?;
-    let condition_id =
-        B256::from_str(&condition_id_str).context("invalid --condition-id (expected 0x...)")?;
+    // condition-id is required for every CTF subcommand; wrap/unwrap operate on
+    // collateral balances and don't reference any market.
+    let needs_condition = !matches!(cmd, "wrap" | "unwrap" | "approve-collateral");
+    let condition_id = if needs_condition {
+        let s = arg_value(&args, "--condition-id")
+            .ok_or_else(|| anyhow!("--condition-id is required"))?;
+        B256::from_str(&s).context("invalid --condition-id (expected 0x...)")?
+    } else {
+        B256::ZERO
+    };
 
     let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
         .context("POLYMARKET_PRIVATE_KEY env var not set")?;
@@ -104,7 +155,9 @@ async fn main() -> Result<()> {
     let wallet_addr = signer.address();
     println!("wallet:    {wallet_addr}");
     println!("rpc:       {rpc_url}");
-    println!("condition: {condition_id}");
+    if needs_condition {
+        println!("condition: {condition_id}");
+    }
 
     let provider = ProviderBuilder::new()
         .wallet(signer)
@@ -116,7 +169,7 @@ async fn main() -> Result<()> {
     // Polymarket negative-risk markets. The standard CTF entry points still
     // work — the only difference is that `redeem_neg_risk()` is now available.
     let ctf_client =
-        polymarket_client_sdk::ctf::Client::with_neg_risk(provider, POLYGON_CHAIN_ID)
+        polymarket_client_sdk_v2::ctf::Client::with_neg_risk(provider, POLYGON_CHAIN_ID)
             .context("failed to init CTF client")?;
 
     match cmd {
@@ -132,7 +185,7 @@ async fn main() -> Result<()> {
             println!("amount:    ${amount_dec} ({amount_units} units)");
             println!();
 
-            let req = MergePositionsRequest::for_binary_market(USDC, condition_id, amount_units);
+            let req = MergePositionsRequest::for_binary_market(COLLATERAL, condition_id, amount_units);
             let resp = ctf_client
                 .merge_positions(&req)
                 .await
@@ -145,7 +198,7 @@ async fn main() -> Result<()> {
             println!("action:    redeem");
             println!();
 
-            let req = RedeemPositionsRequest::for_binary_market(USDC, condition_id);
+            let req = RedeemPositionsRequest::for_binary_market(COLLATERAL, condition_id);
             let resp = ctf_client
                 .redeem_positions(&req)
                 .await
@@ -211,7 +264,7 @@ async fn main() -> Result<()> {
                     .await
                     .map_err(|e| anyhow!("collection_id({label}) failed: {e}"))?;
                 let pos_req = PositionIdRequest::builder()
-                    .collateral_token(USDC)
+                    .collateral_token(COLLATERAL)
                     .collection_id(coll.collection_id)
                     .build();
                 let pos = ctf_client
@@ -307,6 +360,221 @@ async fn main() -> Result<()> {
                 }
                 println!("  → Run `ctf_admin redeem --condition-id {condition_id}` to claim.");
             }
+        }
+        "wrap" => {
+            // V2 collateral migration: USDC.e → pUSD via CollateralOnramp.
+            // Two-step: approve(USDC.e → onramp), then onramp.wrap(USDC.e, wallet, amount).
+            // pUSD is minted 1:1 to the wallet; backing is enforced on-chain.
+            let provider = ctf_client.provider().clone();
+            let usdce = IERC20::new(USDCE, provider.clone());
+            let pusd = IERC20::new(PUSD, provider.clone());
+            let onramp = ICollateralRamp::new(ONRAMP, provider.clone());
+
+            let bal_raw = usdce
+                .balanceOf(wallet_addr)
+                .call()
+                .await
+                .map_err(|e| anyhow!("USDC.e balanceOf failed: {e}"))?;
+            let bal_units: u128 = bal_raw.try_into().unwrap_or(0);
+            let bal_dec = Decimal::from(bal_units) / Decimal::from(1_000_000u64);
+
+            let amount_dec = match arg_value(&args, "--amount") {
+                Some(s) => Decimal::from_str(&s).context("invalid --amount")?,
+                None => bal_dec,
+            };
+            if amount_dec <= Decimal::ZERO {
+                bail!("nothing to wrap (USDC.e balance is 0 and no --amount specified)");
+            }
+            let amount_units = decimal_to_usdc_units(amount_dec)?;
+            if amount_units > bal_raw {
+                bail!(
+                    "amount ${amount_dec} exceeds USDC.e balance ${bal_dec}"
+                );
+            }
+
+            let pusd_before_raw = pusd
+                .balanceOf(wallet_addr)
+                .call()
+                .await
+                .map_err(|e| anyhow!("pUSD balanceOf failed: {e}"))?;
+            let pusd_before: u128 = pusd_before_raw.try_into().unwrap_or(0);
+
+            println!("action:    wrap (USDC.e → pUSD)");
+            println!("amount:    ${amount_dec} ({amount_units} units)");
+            println!("usdce_bal: ${bal_dec}");
+            println!("pusd_bal:  ${}", Decimal::from(pusd_before) / Decimal::from(1_000_000u64));
+            println!("onramp:    {ONRAMP}");
+            println!();
+
+            // Step 1: approve onramp to pull USDC.e from the wallet.
+            // Set exactly the wrap amount — using max-uint would leave a dangling
+            // approval on a contract we only need to interact with once per wrap.
+            let allowance_raw = usdce
+                .allowance(wallet_addr, ONRAMP)
+                .call()
+                .await
+                .map_err(|e| anyhow!("USDC.e allowance failed: {e}"))?;
+            if allowance_raw < amount_units {
+                println!("step 1/2: approve onramp for {amount_units} units...");
+                let approve_tx = usdce
+                    .approve(ONRAMP, amount_units)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("approve send failed: {e}"))?;
+                let approve_hash = *approve_tx.tx_hash();
+                let _approve_receipt = approve_tx
+                    .get_receipt()
+                    .await
+                    .map_err(|e| anyhow!("approve receipt failed: {e}"))?;
+                println!("  ✓ approve tx: {approve_hash}");
+            } else {
+                println!("step 1/2: approve already covers amount (allowance OK)");
+            }
+
+            // Step 2: wrap. Onramp pulls USDC.e and mints pUSD 1:1 to `_to`.
+            println!("step 2/2: onramp.wrap(USDC.e, wallet, {amount_units})...");
+            let wrap_tx = onramp
+                .wrap(USDCE, wallet_addr, amount_units)
+                .send()
+                .await
+                .map_err(|e| anyhow!("wrap send failed: {e}"))?;
+            let wrap_hash = *wrap_tx.tx_hash();
+            let receipt = wrap_tx
+                .get_receipt()
+                .await
+                .map_err(|e| anyhow!("wrap receipt failed: {e}"))?;
+            println!("  ✓ wrap tx:    {wrap_hash}");
+            println!("    block:      {}", receipt.block_number.unwrap_or(0));
+
+            // Verify the 1:1 mint actually happened.
+            let pusd_after_raw = pusd
+                .balanceOf(wallet_addr)
+                .call()
+                .await
+                .map_err(|e| anyhow!("pUSD balanceOf (after) failed: {e}"))?;
+            let pusd_after: u128 = pusd_after_raw.try_into().unwrap_or(0);
+            let minted = pusd_after.saturating_sub(pusd_before);
+            let minted_dec = Decimal::from(minted) / Decimal::from(1_000_000u64);
+            println!();
+            println!("→ minted ${minted_dec} pUSD (new balance: ${})",
+                Decimal::from(pusd_after) / Decimal::from(1_000_000u64));
+        }
+        "unwrap" => {
+            // Reverse direction: pUSD → USDC.e. Must approve onramp on pUSD,
+            // then call onramp.unwrap(USDC.e, wallet, amount).
+            let amount_str = arg_value(&args, "--amount")
+                .ok_or_else(|| anyhow!("--amount is required for unwrap (in pUSD)"))?;
+            let amount_dec = Decimal::from_str(&amount_str).context("invalid --amount")?;
+            if amount_dec <= Decimal::ZERO {
+                bail!("--amount must be > 0");
+            }
+            let amount_units = decimal_to_usdc_units(amount_dec)?;
+
+            let provider = ctf_client.provider().clone();
+            let pusd = IERC20::new(PUSD, provider.clone());
+            let onramp = ICollateralRamp::new(ONRAMP, provider.clone());
+
+            let bal_raw = pusd
+                .balanceOf(wallet_addr)
+                .call()
+                .await
+                .map_err(|e| anyhow!("pUSD balanceOf failed: {e}"))?;
+            if amount_units > bal_raw {
+                let bal_dec = Decimal::from(bal_raw.to::<u128>()) / Decimal::from(1_000_000u64);
+                bail!("amount ${amount_dec} exceeds pUSD balance ${bal_dec}");
+            }
+
+            println!("action:    unwrap (pUSD → USDC.e)");
+            println!("amount:    ${amount_dec} ({amount_units} units)");
+            println!();
+
+            let allowance_raw = pusd
+                .allowance(wallet_addr, ONRAMP)
+                .call()
+                .await
+                .map_err(|e| anyhow!("pUSD allowance failed: {e}"))?;
+            if allowance_raw < amount_units {
+                println!("step 1/2: approve onramp on pUSD...");
+                let approve_tx = pusd
+                    .approve(ONRAMP, amount_units)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("approve send failed: {e}"))?;
+                let _ = approve_tx
+                    .get_receipt()
+                    .await
+                    .map_err(|e| anyhow!("approve receipt failed: {e}"))?;
+                println!("  ✓ approve done");
+            }
+
+            println!("step 2/2: onramp.unwrap(USDC.e, wallet, {amount_units})...");
+            let unwrap_tx = onramp
+                .unwrap(USDCE, wallet_addr, amount_units)
+                .send()
+                .await
+                .map_err(|e| anyhow!("unwrap send failed: {e}"))?;
+            let unwrap_hash = *unwrap_tx.tx_hash();
+            let receipt = unwrap_tx
+                .get_receipt()
+                .await
+                .map_err(|e| anyhow!("unwrap receipt failed: {e}"))?;
+            println!("  ✓ unwrap tx:  {unwrap_hash}");
+            println!("    block:      {}", receipt.block_number.unwrap_or(0));
+        }
+        "approve-collateral" => {
+            // After the V1 → V2 collateral switch (USDC.e → pUSD), every
+            // existing on-chain allowance the wallet had set on USDC.e is
+            // useless to the V2 protocol. Re-approve pUSD against the four
+            // spenders the dashboard's mint / sell / redeem paths use.
+            //
+            // We use max-uint as the allowance. That matches Polymarket's UI
+            // behavior on first deposit and avoids re-approving every time
+            // the wallet runs out of headroom. The trade-off is that an
+            // exploit on any of these contracts could drain unbounded pUSD
+            // from the wallet — acceptable here because all four are core
+            // Polymarket protocol contracts the wallet already trusts.
+            let provider = ctf_client.provider().clone();
+            let pusd = IERC20::new(PUSD, provider.clone());
+
+            let spenders: [(Address, &str); 4] = [
+                (CTF_CONTRACT, "ConditionalTokens (split / merge / redeem)"),
+                (NEG_RISK_ADAPTER, "NegRiskAdapter (neg-risk split / merge)"),
+                (CTF_EXCHANGE_V2, "CtfExchange V2 (binary orders)"),
+                (NEG_RISK_CTF_EXCHANGE_V2, "NegRiskCtfExchange V2 (neg-risk orders)"),
+            ];
+
+            println!("action:    approve-collateral");
+            println!("collateral: {PUSD} (pUSD)");
+            println!();
+
+            for (spender, label) in spenders {
+                let current = pusd
+                    .allowance(wallet_addr, spender)
+                    .call()
+                    .await
+                    .map_err(|e| anyhow!("allowance({label}) failed: {e}"))?;
+                if current == U256::MAX {
+                    println!("✓ {spender}  {label}");
+                    println!("    already at max — skipping");
+                    continue;
+                }
+                println!("→ {spender}  {label}");
+                let tx = pusd
+                    .approve(spender, U256::MAX)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("approve({label}) send failed: {e}"))?;
+                let hash = *tx.tx_hash();
+                let _ = tx
+                    .get_receipt()
+                    .await
+                    .map_err(|e| anyhow!("approve({label}) receipt failed: {e}"))?;
+                println!("    ✓ tx: {hash}");
+            }
+
+            println!();
+            println!("→ pUSD allowances set. Restart the dashboard to clear");
+            println!("  the cached \"USDC not approved\" warnings on startup.");
         }
         other => {
             print_usage();

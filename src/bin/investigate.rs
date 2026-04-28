@@ -3,7 +3,7 @@
 //! Usage: cargo run --bin investigate -- <address> [--rpc-http <url>] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
 
 use anyhow::{bail, Context, Result};
-use polymarket_client_sdk::types::Address;
+use polymarket_client_sdk_v2::types::Address;
 use std::io::Write as _;
 use std::str::FromStr;
 

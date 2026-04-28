@@ -46,8 +46,11 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 
-# Polymarket SDK (official)
-polymarket-client-sdk = { version = "0.4", features = ["gamma", "clob", "ws", "rtds", "data", "tracing", "ctf"] }
+# Polymarket SDK (official). V2 was published as a separate crate
+# (`polymarket_client_sdk_v2` — note the underscores) rather than as a major
+# version bump. Pinned exactly so a passive `cargo update` cannot silently
+# move us to a different on-chain protocol.
+polymarket_client_sdk_v2 = { version = "=0.5.1", features = ["gamma", "clob", "ws", "rtds", "data", "tracing", "ctf"] }
 futures = "0.3"
 
 # TLS — the SDK's WS client needs a rustls CryptoProvider installed

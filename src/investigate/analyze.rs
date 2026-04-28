@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use polymarket_client_sdk::data::types::Side;
+use polymarket_client_sdk_v2::data::types::Side;
 use rust_decimal::Decimal;
 
 use super::correlate::CorrelatedTraderData;
@@ -180,7 +180,7 @@ pub fn analyze(correlated: &CorrelatedTraderData) -> TraderAnalysis {
 
 /// Build position lifecycles by FIFO pairing buys and sells on the same asset.
 fn build_lifecycles(
-    trades: &[polymarket_client_sdk::data::types::response::Trade],
+    trades: &[polymarket_client_sdk_v2::data::types::response::Trade],
 ) -> Vec<PositionLifecycle> {
     // Group trades by asset_id (token ID)
     let mut buys_by_asset: HashMap<String, Vec<(i64, Decimal, Decimal, String, String, String)>> =
@@ -305,7 +305,7 @@ fn build_timing(
 }
 
 fn build_patterns(
-    trades: &[polymarket_client_sdk::data::types::response::Trade],
+    trades: &[polymarket_client_sdk_v2::data::types::response::Trade],
     meta: &HashMap<String, super::enrich::MarketMeta>,
     lifecycles: &[PositionLifecycle],
 ) -> PatternAnalysis {

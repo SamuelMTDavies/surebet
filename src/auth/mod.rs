@@ -282,14 +282,17 @@ impl ClobApiClient {
         self.delete("/cancel-market-orders", &body).await
     }
 
-    /// Get open orders.
+    /// Get open / resting orders for this wallet. The CLOB rejects
+    /// `GET /orders` with 405 Method Not Allowed (POST `/orders` is the
+    /// batch-create endpoint). The user-facing query path is `/data/orders`.
     pub async fn get_orders(&self) -> Result<serde_json::Value, AuthError> {
-        self.get("/orders").await
+        self.get("/data/orders").await
     }
 
-    /// Get trade history.
+    /// Get trade history. Same situation as get_orders — `/trades` is the
+    /// taker-history path, fills live at `/data/trades`.
     pub async fn get_trades(&self) -> Result<serde_json::Value, AuthError> {
-        self.get("/trades").await
+        self.get("/data/trades").await
     }
 
     /// Send heartbeat (dead man's switch). If heartbeats stop,

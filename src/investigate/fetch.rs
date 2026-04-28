@@ -4,16 +4,16 @@
 //! closed positions, portfolio value, and market count.
 
 use anyhow::{Context, Result};
-use polymarket_client_sdk::data;
-use polymarket_client_sdk::data::types::request::{
+use polymarket_client_sdk_v2::data;
+use polymarket_client_sdk_v2::data::types::request::{
     ActivityRequest, ClosedPositionsRequest, PositionsRequest, TradesRequest, TradedRequest,
     ValueRequest,
 };
-use polymarket_client_sdk::data::types::response::{
+use polymarket_client_sdk_v2::data::types::response::{
     Activity, ClosedPosition, Position, Trade, Traded, Value,
 };
-use polymarket_client_sdk::data::types::SortDirection;
-use polymarket_client_sdk::types::Address;
+use polymarket_client_sdk_v2::data::types::SortDirection;
+use polymarket_client_sdk_v2::types::Address;
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 

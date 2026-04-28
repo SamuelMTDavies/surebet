@@ -178,7 +178,7 @@ impl OrderBookStore {
     /// parsing needed here.
     pub fn apply_sdk_book_update(
         &self,
-        update: &polymarket_client_sdk::clob::ws::types::response::BookUpdate,
+        update: &polymarket_client_sdk_v2::clob::ws::types::response::BookUpdate,
     ) {
         let asset_id = update.asset_id.to_string();
 

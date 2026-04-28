@@ -1,12 +1,12 @@
 //! Polymarket CLOB WebSocket connector using the official SDK.
 //!
-//! Uses polymarket-client-sdk's clob::ws::Client for automatic reconnection,
+//! Uses polymarket-client-sdk-v2's clob::ws::Client for automatic reconnection,
 //! subscription management, and message deserialization.
 
 use crate::orderbook::OrderBookStore;
 use futures::StreamExt;
-use polymarket_client_sdk::clob::ws as sdk_ws;
-use polymarket_client_sdk::types::U256;
+use polymarket_client_sdk_v2::clob::ws as sdk_ws;
+use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 use std::pin::pin;
 use std::str::FromStr;

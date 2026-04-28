@@ -23,16 +23,16 @@ use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use polymarket_client_sdk::auth::Normal as NormalAuth;
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::{OrderType as SdkOrderType, Side as SdkSide};
-use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
-use polymarket_client_sdk::ctf::types::{
+use polymarket_client_sdk_v2::auth::Normal as NormalAuth;
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::clob::types::{OrderType as SdkOrderType, Side as SdkSide};
+use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkClobConfig};
+use polymarket_client_sdk_v2::ctf::types::{
     CollectionIdRequest, MergePositionsRequest, PositionIdRequest, RedeemNegRiskRequest,
     RedeemPositionsRequest, SplitPositionRequest,
 };
-use polymarket_client_sdk::types::address;
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::types::address;
+use polymarket_client_sdk_v2::POLYGON;
 use std::sync::atomic::{AtomicBool, Ordering};
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
@@ -55,9 +55,13 @@ use surebet::weather::strategy::{
 use surebet::weather::{lookup_station, parse_bracket_label, TemperatureMeasure};
 use surebet::ws::clob::{start_clob_ws, ClobEvent};
 
-/// USDC on Polygon (USDC.e bridged)
-const USDC: alloy::primitives::Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
-/// CTF contract on Polygon (needs USDC approval for splits)
+/// V2 collateral. Used as the collateral arg for every CTF call (split / merge
+/// / redeem / position-id derivation) and for the "approve CTF + NegRiskAdapter
+/// to spend collateral" check below. Polymarket's V2 migration replaced USDC.e
+/// with pUSD; legacy USDC.e is reachable only via the wrap path in `ctf_admin`.
+const COLLATERAL: alloy::primitives::Address =
+    address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+/// CTF contract on Polygon (needs collateral approval for splits)
 const CTF_CONTRACT: alloy::primitives::Address =
     address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
 /// NegRiskAdapter on Polygon — neg_risk markets must route split/merge through
@@ -123,7 +127,7 @@ alloy::sol! {
 
 // ─── CTF Split wrapper ──────────────────────────────────────────────────────
 
-/// Type-erased wrapper around `polymarket_client_sdk::ctf::Client` so we can
+/// Type-erased wrapper around `polymarket_client_sdk_v2::ctf::Client` so we can
 /// store it in `AppState` without leaking the generic provider type.
 struct CtfSplitter {
     inner: Box<dyn CtfSplitTrait + Send + Sync>,
@@ -224,7 +228,7 @@ impl ResolutionStatus {
 }
 
 struct CtfClientWrapper<P: alloy::providers::Provider + Clone + Send + Sync + 'static> {
-    client: polymarket_client_sdk::ctf::Client<P>,
+    client: polymarket_client_sdk_v2::ctf::Client<P>,
     wallet: alloy::primitives::Address,
 }
 
@@ -253,7 +257,7 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfClientWra
             .client
             .position_id(
                 &PositionIdRequest::builder()
-                    .collateral_token(USDC)
+                    .collateral_token(COLLATERAL)
                     .collection_id(coll.collection_id)
                     .build(),
             )
@@ -326,7 +330,7 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
             );
             let partition = vec![U256::from(1u64), U256::from(2u64)];
             let pending_tx = adapter
-                .splitPosition(USDC, B256::ZERO, condition_id, partition, amount_usdc_units)
+                .splitPosition(COLLATERAL, B256::ZERO, condition_id, partition, amount_usdc_units)
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("NegRisk split failed: {e}"))?;
@@ -338,7 +342,7 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
             Ok(self.gas_for(tx_hash).await)
         } else {
             let req =
-                SplitPositionRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
+                SplitPositionRequest::for_binary_market(COLLATERAL, condition_id, amount_usdc_units);
             let resp = self
                 .client
                 .split_position(&req)
@@ -361,7 +365,7 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
             );
             let partition = vec![U256::from(1u64), U256::from(2u64)];
             let pending_tx = adapter
-                .mergePositions(USDC, B256::ZERO, condition_id, partition, amount_usdc_units)
+                .mergePositions(COLLATERAL, B256::ZERO, condition_id, partition, amount_usdc_units)
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("NegRisk merge failed: {e}"))?;
@@ -373,7 +377,7 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
             Ok(self.gas_for(tx_hash).await)
         } else {
             let req =
-                MergePositionsRequest::for_binary_market(USDC, condition_id, amount_usdc_units);
+                MergePositionsRequest::for_binary_market(COLLATERAL, condition_id, amount_usdc_units);
             let resp = self
                 .client
                 .merge_positions(&req)
@@ -384,7 +388,7 @@ impl<P: alloy::providers::Provider + Clone + Send + Sync + 'static> CtfSplitTrai
     }
 
     async fn redeem_position(&self, condition_id: B256) -> anyhow::Result<OnchainTxResult> {
-        let req = RedeemPositionsRequest::for_binary_market(USDC, condition_id);
+        let req = RedeemPositionsRequest::for_binary_market(COLLATERAL, condition_id);
         let resp = self
             .client
             .redeem_positions(&req)
@@ -568,6 +572,121 @@ struct PlaceOrderOutcome {
     success: bool,
     order_id: String,
     error_msg: String,
+}
+
+/// Actual on-chain fill result for a placed order, sourced from
+/// `/data/trades`. Replaces simulated values in the activity log.
+#[derive(Debug, Clone, Default)]
+struct OrderFills {
+    shares: Decimal,
+    notional_usdc: Decimal,
+    avg_price: Decimal,
+    fill_count: usize,
+}
+
+/// Poll `/data/trades` for trades whose `taker_order_id` matches
+/// `order_id`. Returns the summed shares and USDC notional as soon as
+/// any fills appear, or zero totals if nothing settles within the
+/// window. Tight-limit orders either fill at the limit within a few
+/// seconds (maker was already there) or never fill — so a short window
+/// (a few poll cycles) is enough. Caller is responsible for cancelling
+/// the GTC order when fills are zero.
+async fn poll_order_fills(
+    api: &ClobApiClient,
+    order_id: &str,
+    timeout_ms: u64,
+) -> OrderFills {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut last_seen = OrderFills::default();
+    loop {
+        match api.get("/data/trades?limit=100").await {
+            Ok(raw) => {
+                let arr = raw
+                    .as_array()
+                    .cloned()
+                    .or_else(|| raw.get("data").and_then(|v| v.as_array()).cloned())
+                    .unwrap_or_default();
+                let mut shares = Decimal::ZERO;
+                let mut notional = Decimal::ZERO;
+                let mut count = 0usize;
+                for t in arr.iter() {
+                    // Case 1: our order was the taker (we aggressed into
+                    // the book). Top-level size/price describe our fill.
+                    let taker_oid = t
+                        .get("taker_order_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if taker_oid.eq_ignore_ascii_case(order_id) {
+                        let price = t
+                            .get("price")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or_default();
+                        let size = t
+                            .get("size")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or_default();
+                        shares += size;
+                        notional += price * size;
+                        count += 1;
+                        continue;
+                    }
+                    // Case 2: our order was a maker (rested, then taken).
+                    // Our slice is in maker_orders[] — the top-level
+                    // size is the taker's total aggression across ALL
+                    // makers, which would over-count. Sum our entries'
+                    // matched_amount instead.
+                    if let Some(makers) = t.get("maker_orders").and_then(|v| v.as_array()) {
+                        for m in makers.iter() {
+                            let moid = m
+                                .get("order_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !moid.eq_ignore_ascii_case(order_id) {
+                                continue;
+                            }
+                            let amt = m
+                                .get("matched_amount")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| Decimal::from_str(s).ok())
+                                .unwrap_or_default();
+                            let price = m
+                                .get("price")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| Decimal::from_str(s).ok())
+                                .unwrap_or_default();
+                            shares += amt;
+                            notional += price * amt;
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    let avg = if shares > Decimal::ZERO {
+                        notional / shares
+                    } else {
+                        Decimal::ZERO
+                    };
+                    last_seen = OrderFills {
+                        shares,
+                        notional_usdc: notional,
+                        avg_price: avg,
+                        fill_count: count,
+                    };
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!("poll_order_fills: {}", e);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    last_seen
 }
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -771,15 +890,30 @@ fn default_zero() -> String {
 /// Round + clamp a BUY limit price for CLOB validation. Rounds UP to
 /// 2 dp, then clamps to [0.01, 0.99].
 fn round_buy_price(p: Decimal) -> Decimal {
-    let r = p.round_dp_with_strategy(2, RoundingStrategy::AwayFromZero);
+    // Round DOWN for buys so a tick-noisy price never exceeds the
+    // source best-ask. Clamped to the valid CLOB tick range.
+    let r = p.round_dp_with_strategy(2, RoundingStrategy::ToZero);
     r.clamp(Decimal::new(1, 2), Decimal::new(99, 2))
 }
 
 /// Round + clamp a SELL limit price for CLOB validation. Rounds DOWN to
-/// 2 dp, then clamps to [0.01, 0.99].
+/// 2 dp, then clamps to [0.01, 0.99]. Use this for AUTO-COMPUTED prices
+/// (book walks, default floors) where 2 dp is the safe lowest common
+/// denominator across every Polymarket tick size.
 fn round_sell_price(p: Decimal) -> Decimal {
     let r = p.round_dp_with_strategy(2, RoundingStrategy::ToZero);
     r.clamp(Decimal::new(1, 2), Decimal::new(99, 2))
+}
+
+/// Looser sell-price normaliser for USER-TYPED floors. Trims to 4 dp
+/// (covers every Polymarket tick: 0.01, 0.001, and the rare 0.0001) and
+/// clamps to [0.001, 0.999] so we never submit 0 or 1.0. If the market
+/// has a coarser tick (most are 0.01) the CLOB will reject the order and
+/// the error bubbles back — better than silently truncating "$0.703" to
+/// "$0.70" without telling the user.
+fn clamp_sell_price_user(p: Decimal) -> Decimal {
+    let r = p.round_dp_with_strategy(4, RoundingStrategy::ToZero);
+    r.clamp(Decimal::new(1, 3), Decimal::new(999, 3))
 }
 
 /// Round a share size to 2 dp — always **down** so we never order more
@@ -791,21 +925,12 @@ fn round_share_size(s: Decimal) -> Decimal {
     s.round_dp_with_strategy(2, RoundingStrategy::ToZero)
 }
 
-/// Default price-floor for sell orders: **max(best_bid × 0.90, state.min_sell)**.
-/// Cap the walk at this floor AND use it as the CLOB limit — that way the
-/// order never fills below a reasonable slippage band from the current top
-/// bid. A blank or thin bid book returns `state.min_sell` as the floor,
-/// which the caller should check (filled_shares will be 0 if nothing clears
-/// the floor).
-///
-/// 10% slippage is the default safety margin. The caller can override via
-/// an explicit `min_price` on the request — the modal UI exposes this.
+/// Default price-floor for sell orders: **max(best_bid, state.min_sell)**.
+/// Tight by default — the CLOB will fill at or above best_bid only. The
+/// caller can override via an explicit `min_price` on the request (the
+/// modal UI exposes this) if they want to accept some slippage.
 fn default_sell_floor(best_bid: Decimal, min_sell: Decimal) -> Decimal {
-    let slippage = best_bid * Decimal::new(9, 1); // 0.9
-    // Round DOWN to keep the fill-radius slightly wider than the exact
-    // 90% figure, so we don't shave off the last penny of top-of-book
-    // due to tick-rounding.
-    let floored = slippage.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    let floored = best_bid.round_dp_with_strategy(2, RoundingStrategy::ToZero);
     floored.max(min_sell).max(Decimal::new(1, 2))
 }
 
@@ -826,6 +951,27 @@ struct HarvestRequest {
     /// back here.
     #[serde(default)]
     strategy: Option<String>,
+    /// Optional per-trade budget override (USDC, decimal string). When set
+    /// and parseable as a positive Decimal, the trade's effective budget
+    /// becomes `min(override, state.max_trade)` — the user can shrink the
+    /// budget for a single click (e.g. "$1") but never raise it past the
+    /// global cap. Daily-spend rails still apply on top.
+    #[serde(default)]
+    max_cost_usd: Option<String>,
+}
+
+/// Resolve the effective per-trade budget from an optional user override.
+/// `None` / blank / non-positive → fall back to the configured cap.
+/// Otherwise: clamp to `[0, max_trade]`. Never widens; only shrinks.
+fn resolve_trade_budget(override_str: &Option<String>, max_trade: Decimal) -> Decimal {
+    match override_str
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s.trim()).ok())
+        .filter(|d| *d > Decimal::ZERO)
+    {
+        Some(d) => d.min(max_trade),
+        None => max_trade,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -982,7 +1128,7 @@ async fn main() -> Result<()> {
                         {
                             Ok(provider) => {
                                 // Check USDC approval for CTF contract + NegRiskAdapter
-                                let usdc_contract = IERC20::new(USDC, provider.clone());
+                                let usdc_contract = IERC20::new(COLLATERAL, provider.clone());
                                 match usdc_contract
                                     .allowance(wallet_addr, CTF_CONTRACT)
                                     .call()
@@ -992,7 +1138,7 @@ async fn main() -> Result<()> {
                                         if allowance.is_zero() {
                                             println!("WARNING: USDC not approved for CTF contract!");
                                             println!("  Run the approvals example first:");
-                                            println!("  cd polymarket-client-sdk-patch && cargo run --example approvals --features ctf");
+                                            println!("  cd polymarket-client-sdk-v2-patch && cargo run --example approvals --features ctf");
                                             println!("  Mint+sell DISABLED until approved.");
                                             None
                                         } else {
@@ -1018,7 +1164,7 @@ async fn main() -> Result<()> {
                                                     println!("  WARNING: could not check NegRiskAdapter allowance: {e}");
                                                 }
                                             }
-                                            match polymarket_client_sdk::ctf::Client::with_neg_risk(
+                                            match polymarket_client_sdk_v2::ctf::Client::with_neg_risk(
                                                 provider,
                                                 POLYGON_CHAIN_ID,
                                             ) {
@@ -1126,6 +1272,11 @@ async fn main() -> Result<()> {
         .route("/api/merge", post(api_merge))
         .route("/api/redeem", post(api_redeem))
         .route("/api/redeem-neg-risk", post(api_redeem_neg_risk))
+        .route("/api/archive-position", post(api_archive_position))
+        .route("/api/unarchive-position", post(api_unarchive_position))
+        .route("/api/active-orders", get(api_active_orders))
+        .route("/api/recent-fills", get(api_recent_fills))
+        .route("/api/cancel-order", post(api_cancel_order))
         .route("/api/clear-geoblock", post(api_clear_geoblock))
         .route("/api/rescan", post(api_rescan))
         .route("/api/status", get(api_status))
@@ -1134,11 +1285,10 @@ async fn main() -> Result<()> {
         .route("/api/weather", get(api_weather))
         .route("/observations", get(observations_html))
         .route("/api/observations", get(api_observations))
-        .route("/paper-trades", get(paper_trades_html))
+        // /paper-trades display page deleted — the unified /trades page
+        // is the truth view. Live multi-leg buys (used by /weather) still
+        // post to /api/paper-trade.
         .route("/api/paper-trade", post(api_save_paper_trade))
-        .route("/api/paper-trades", get(api_paper_trades))
-        .route("/api/paper-trade/close", post(api_close_paper_trade))
-        .route("/api/paper-trade/reopen", post(api_reopen_paper_trade))
         .route("/arb", get(arb_html))
         .route("/api/arb", get(api_arb))
         .route("/api/arb-paper-fire", post(api_arb_paper_fire))
@@ -1643,6 +1793,238 @@ async fn api_redeem_neg_risk(
     Json(serde_json::json!({"ok": ok, "entry": entry})).into_response()
 }
 
+/// Body for `/api/archive-position`. Used to dismiss a worthless / unwanted
+/// position from the Open Positions table without paying gas to redeem.
+/// `cash_pnl` is the Polymarket Data API's `cashPnl` for the position at
+/// the moment the user clicked Archive — used to reconcile `realized_pnl`
+/// in stats (BUY entries record an *optimistic* projected profit assuming
+/// a $1 win, so the offset has to reverse that and substitute the real P&L).
+#[derive(Debug, Deserialize)]
+struct ArchivePositionRequest {
+    condition_id: String,
+    #[serde(default)]
+    market: Option<String>,
+    /// Decimal-as-string. Will be the actual realized P&L for this position
+    /// once recorded in stats (typically negative for losers).
+    cash_pnl: String,
+    /// Decimal-as-string. Position's current dollar value per the Data API.
+    /// Recorded for traceability — not used in the reconciliation math.
+    #[serde(default)]
+    current_value: Option<String>,
+}
+
+async fn api_archive_position(
+    State(state): State<AppState>,
+    Json(req): Json<ArchivePositionRequest>,
+) -> impl IntoResponse {
+    let cid_lower = req.condition_id.to_lowercase();
+    if cid_lower.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "condition_id is required"})),
+        )
+            .into_response();
+    }
+
+    let cash_pnl = match Decimal::from_str(&req.cash_pnl) {
+        Ok(d) => d,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid cash_pnl: {}", req.cash_pnl)})),
+            )
+                .into_response();
+        }
+    };
+
+    // Reconcile against existing entries. Sum every prior `net_profit` we've
+    // already attributed to this condition_id (BUY's optimistic projection,
+    // any sell revenue, prior REDEEM/MERGE, etc.) — the archive entry's
+    // `net_profit` is the delta that lands realized_pnl on the truth.
+    let already_recorded: Decimal = {
+        let activity = state.activity.read().await;
+        let mut sum = Decimal::ZERO;
+        for a in activity.iter() {
+            if !a.condition_id.eq_ignore_ascii_case(&cid_lower) {
+                continue;
+            }
+            // Only entries currently counted by compute_stats (OK, non-paper,
+            // non-error) contribute to realized_pnl — match that filter so
+            // the offset is correct.
+            if a.strategy.starts_with("PAPER") {
+                continue;
+            }
+            if a.status.contains("ERR") || a.status.contains("FAIL") {
+                continue;
+            }
+            if !a.status.contains("OK") {
+                continue;
+            }
+            if let Ok(v) = Decimal::from_str(&a.net_profit) {
+                sum += v;
+            }
+        }
+        sum
+    };
+
+    let adjustment = cash_pnl - already_recorded;
+    let current_value = req
+        .current_value
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+
+    let entry = ActivityEntry {
+        time: Utc::now().format("%H:%M:%S").to_string(),
+        market: req.market.clone().unwrap_or_default(),
+        outcome: String::new(),
+        strategy: "ARCHIVE-LOSS".to_string(),
+        buy_shares: "0".to_string(),
+        buy_cost: "0.0000".to_string(),
+        mint_cost: "0.0000".to_string(),
+        sell_revenue: "0.0000".to_string(),
+        net_profit: format!("{:.4}", adjustment),
+        status: format!(
+            "ARCHIVE OK (no on-chain redeem; current_value=${:.4}, cash_pnl={:.4}, prior_recorded={:.4}, adjustment={:.4})",
+            current_value, cash_pnl, already_recorded, adjustment
+        ),
+        condition_id: cid_lower.clone(),
+        gas_matic: "0".to_string(),
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+    };
+
+    persist_and_record(&state, entry.clone()).await;
+
+    Json(serde_json::json!({"ok": true, "entry": entry})).into_response()
+}
+
+/// Body for `/api/unarchive-position`. Reverses a prior archive: appends
+/// an UNARCHIVE-RESTORE entry whose `net_profit` is the negation of the
+/// most recent ARCHIVE-LOSS adjustment for this condition_id, so realized
+/// P&L returns to its pre-archive value. The position re-appears in Open
+/// Positions on the next refresh and standard Merge/Redeem buttons work.
+#[derive(Debug, Deserialize)]
+struct UnarchiveRequest {
+    condition_id: String,
+}
+
+async fn api_unarchive_position(
+    State(state): State<AppState>,
+    Json(req): Json<UnarchiveRequest>,
+) -> impl IntoResponse {
+    let cid_lower = req.condition_id.to_lowercase();
+    if cid_lower.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "condition_id is required"})),
+        )
+            .into_response();
+    }
+
+    // Find the most recent ARCHIVE-LOSS entry (not yet matched by an
+    // UNARCHIVE-RESTORE) and grab its net_profit so we can offset it.
+    // We iterate backwards through the activity log: the latest archive
+    // entry without a subsequent restore is the one to reverse.
+    let (matched_market, matched_adjustment) = {
+        let activity = state.activity.read().await;
+        let mut archive_count: i32 = 0;
+        let mut restore_count: i32 = 0;
+        let mut latest_archive: Option<(String, Decimal)> = None;
+        for a in activity.iter() {
+            if !a.condition_id.eq_ignore_ascii_case(&cid_lower) {
+                continue;
+            }
+            if a.strategy == "ARCHIVE-LOSS" {
+                archive_count += 1;
+                latest_archive = Some((
+                    a.market.clone(),
+                    Decimal::from_str(&a.net_profit).unwrap_or(Decimal::ZERO),
+                ));
+            } else if a.strategy == "UNARCHIVE-RESTORE" {
+                restore_count += 1;
+            }
+        }
+        if archive_count <= restore_count {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "position is not currently archived"})),
+            )
+                .into_response();
+        }
+        latest_archive.unwrap_or_else(|| (String::new(), Decimal::ZERO))
+    };
+
+    let reverse_adjustment = -matched_adjustment;
+
+    let entry = ActivityEntry {
+        time: Utc::now().format("%H:%M:%S").to_string(),
+        market: matched_market,
+        outcome: String::new(),
+        strategy: "UNARCHIVE-RESTORE".to_string(),
+        buy_shares: "0".to_string(),
+        buy_cost: "0.0000".to_string(),
+        mint_cost: "0.0000".to_string(),
+        sell_revenue: "0.0000".to_string(),
+        net_profit: format!("{:.4}", reverse_adjustment),
+        status: format!(
+            "UNARCHIVE OK (restored to Open Positions; reverses prior ARCHIVE-LOSS adjustment of {:.4})",
+            matched_adjustment
+        ),
+        condition_id: cid_lower.clone(),
+        gas_matic: "0".to_string(),
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+    };
+
+    persist_and_record(&state, entry.clone()).await;
+
+    Json(serde_json::json!({"ok": true, "entry": entry})).into_response()
+}
+
+// ─── Truth API endpoints (Active Orders / Recent Fills / Cancel) ────────────
+
+async fn api_active_orders(State(state): State<AppState>) -> impl IntoResponse {
+    Json(fetch_active_orders(&state).await)
+}
+
+async fn api_recent_fills(State(state): State<AppState>) -> impl IntoResponse {
+    Json(fetch_recent_fills(&state).await)
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelOrderRequest {
+    order_id: String,
+}
+
+async fn api_cancel_order(
+    State(state): State<AppState>,
+    Json(req): Json<CancelOrderRequest>,
+) -> impl IntoResponse {
+    let Some(api) = state.api.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "CLOB client not initialized (run with --live and POLYMARKET_PRIVATE_KEY)"
+            })),
+        )
+            .into_response();
+    };
+    if req.order_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "order_id is required"})),
+        )
+            .into_response();
+    }
+    match api.cancel_order(&req.order_id).await {
+        Ok(v) => Json(serde_json::json!({"ok": true, "result": v})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": format!("{e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// Append entry to in-memory activity AND the on-disk JSONL log.
 async fn persist_and_record(state: &AppState, entry: ActivityEntry) {
     {
@@ -1939,7 +2321,19 @@ async fn compute_open_positions(state: &AppState) -> Vec<OpenPosition> {
         activity.clone()
     };
     let mut log_index: BTreeMap<String, (String, String, Decimal)> = BTreeMap::new();
+    // Archived cids: the count of ARCHIVE-LOSS minus UNARCHIVE-RESTORE. If
+    // the most recent action was Archive (count > 0), we hide the row; if
+    // the user later un-archives, the count drops back to 0 and the row
+    // reappears. Lets us toggle freely without losing history.
+    let mut archive_balance: BTreeMap<String, i32> = BTreeMap::new();
     for a in &activity_snap {
+        if !a.condition_id.is_empty() {
+            if a.strategy == "ARCHIVE-LOSS" {
+                *archive_balance.entry(a.condition_id.to_lowercase()).or_insert(0) += 1;
+            } else if a.strategy == "UNARCHIVE-RESTORE" {
+                *archive_balance.entry(a.condition_id.to_lowercase()).or_insert(0) -= 1;
+            }
+        }
         if a.condition_id.is_empty() || !a.status.contains("MINT OK") {
             continue;
         }
@@ -1949,6 +2343,10 @@ async fn compute_open_positions(state: &AppState) -> Vec<OpenPosition> {
             (a.market.clone(), a.outcome.clone(), mc),
         );
     }
+    let archived: std::collections::HashSet<String> = archive_balance
+        .into_iter()
+        .filter_map(|(k, v)| if v > 0 { Some(k) } else { None })
+        .collect();
 
     // Loaded markets list — provides nicer time-left strings than parsing the
     // Data API's `endDate` ourselves.
@@ -1991,6 +2389,13 @@ async fn compute_open_positions(state: &AppState) -> Vec<OpenPosition> {
         // Skip dust rows (the API includes positions with size 0 when we ask
         // for sizeThreshold=0 — those are fully closed positions we don't need).
         if p.size <= 0.0 {
+            continue;
+        }
+        // Skip positions the user has explicitly archived. We still hold the
+        // tokens on-chain (no redeem was done) but the user has dismissed
+        // them as worthless / not worth gas — ARCHIVE-LOSS already accounted
+        // for the realized loss in stats.
+        if archived.contains(&p.condition_id.to_lowercase()) {
             continue;
         }
         grouped
@@ -2177,6 +2582,345 @@ async fn api_positions(State(state): State<AppState>) -> impl IntoResponse {
     Json(compute_open_positions(&state).await)
 }
 
+/// One row in the Archived Positions table — a position the user previously
+/// dismissed via the Archive button. Built from activity log entries; the
+/// position is NOT cross-checked against the Data API (so even if the
+/// underlying tokens have been redeemed externally, the row stays until
+/// explicitly unarchived).
+#[derive(Debug, Clone, Serialize)]
+struct ArchivedPosition {
+    condition_id: String,
+    market: String,
+    /// Last recorded archive adjustment for this cid (negative for a loss).
+    /// Tells the user what got rolled into stats so they know what an
+    /// Unarchive will reverse.
+    archived_pnl: Decimal,
+    /// HH:MM:SS of the most recent ARCHIVE-LOSS entry — for "archived 2h ago"
+    /// style display in the UI (we keep it simple: just the time string).
+    archived_at: String,
+    /// Date (YYYY-MM-DD) of the latest archive — separated so the table can
+    /// show "today / yesterday / older" without parsing.
+    archived_date: String,
+}
+
+/// Walk the activity log and return all positions whose net (ARCHIVE-LOSS −
+/// UNARCHIVE-RESTORE) count is > 0. Latest archive entry per cid wins for
+/// the display fields.
+async fn compute_archived_positions(state: &AppState) -> Vec<ArchivedPosition> {
+    use std::collections::HashMap;
+    let activity = state.activity.read().await;
+    let mut balance: HashMap<String, i32> = HashMap::new();
+    let mut latest: HashMap<String, ArchivedPosition> = HashMap::new();
+    for a in activity.iter() {
+        if a.condition_id.is_empty() {
+            continue;
+        }
+        let cid = a.condition_id.to_lowercase();
+        if a.strategy == "ARCHIVE-LOSS" {
+            *balance.entry(cid.clone()).or_insert(0) += 1;
+            latest.insert(
+                cid.clone(),
+                ArchivedPosition {
+                    condition_id: cid,
+                    market: a.market.clone(),
+                    archived_pnl: Decimal::from_str(&a.net_profit).unwrap_or(Decimal::ZERO),
+                    archived_at: a.time.clone(),
+                    archived_date: a.date.clone(),
+                },
+            );
+        } else if a.strategy == "UNARCHIVE-RESTORE" {
+            *balance.entry(cid).or_insert(0) -= 1;
+        }
+    }
+    let mut out: Vec<ArchivedPosition> = balance
+        .into_iter()
+        .filter_map(|(cid, n)| if n > 0 { latest.remove(&cid) } else { None })
+        .collect();
+    // Newest first
+    out.sort_by(|a, b| {
+        b.archived_date
+            .cmp(&a.archived_date)
+            .then_with(|| b.archived_at.cmp(&a.archived_at))
+    });
+    out
+}
+
+// ─── Truth: Active Orders + Recent Fills (CLOB API) ─────────────────────────
+//
+// Together with `compute_open_positions` (Polymarket Data API holdings),
+// these are the three source-of-truth views for the unified /trades page.
+// Nothing here is derived from local intent — only from what the exchange
+// reports.
+
+/// Resting / partially-filled limit order on the CLOB. Source: GET /orders.
+/// We mirror the exchange's lower-case field names directly so what the user
+/// sees on the dashboard is identical to what they'd see on Polymarket.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ActiveOrder {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    market: String,
+    #[serde(default)]
+    asset_id: String,
+    #[serde(default)]
+    side: String,
+    #[serde(default)]
+    price: String,
+    #[serde(default)]
+    original_size: String,
+    #[serde(default)]
+    size_matched: String,
+    /// Unix seconds (or string-coerced). The CLOB returns this as a string
+    /// in some responses and a number in others — accept both via a helper.
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    created_at: String,
+    #[serde(default)]
+    expiration: String,
+    /// Resolved off the activity log: market title from the most recent
+    /// matching condition_id, plus a guess at "Yes" / "No" based on
+    /// whether the asset_id matches the YES or NO token of a known mint.
+    /// Best-effort — empty when we have no local context.
+    #[serde(default)]
+    market_title: String,
+    #[serde(default)]
+    outcome_label: String,
+}
+
+/// Settled fill from the CLOB matcher. Source: GET /data/trades.
+/// One row per matched trade; an order can have many.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WalletFill {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    taker_order_id: String,
+    #[serde(default)]
+    market: String,
+    #[serde(default)]
+    asset_id: String,
+    #[serde(default)]
+    side: String,
+    #[serde(default)]
+    price: String,
+    #[serde(default)]
+    size: String,
+    #[serde(default)]
+    fee_rate_bps: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_number")]
+    match_time: String,
+    #[serde(default)]
+    transaction_hash: String,
+    #[serde(default)]
+    trader_side: String,
+    /// Per-maker breakdown from the CLOB. When this wallet was a maker on
+    /// the trade, the wallet-owner's true slice (size + side) lives here,
+    /// not in the top-level fields. See `reshape_for_wallet`.
+    #[serde(default)]
+    maker_orders: Vec<MakerOrderSlice>,
+    /// Notional = price × size, computed server-side for display.
+    #[serde(default)]
+    notional: String,
+    /// Resolved off the activity log when possible. Empty when unknown.
+    #[serde(default)]
+    market_title: String,
+}
+
+/// One entry in `maker_orders[]` from the CLOB `/data/trades` response.
+/// Represents a single maker's contribution to a matched trade.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct MakerOrderSlice {
+    #[serde(default)]
+    order_id: String,
+    #[serde(default)]
+    maker_address: String,
+    #[serde(default)]
+    matched_amount: String,
+    #[serde(default)]
+    price: String,
+    #[serde(default)]
+    side: String,
+    #[serde(default)]
+    asset_id: String,
+}
+
+impl WalletFill {
+    /// When this wallet was the MAKER on the trade, the top-level `size`
+    /// reflects the taker's *total* aggression across all makers (which
+    /// may include other wallets entirely, sometimes on the complementary
+    /// outcome token for neg-risk markets). The wallet's real fill is the
+    /// entry in `maker_orders[]` whose `maker_address` matches the wallet.
+    ///
+    /// This function mutates `side`, `size`, `price` in place so the rest
+    /// of the pipeline (display, notional, sorting) sees the wallet's
+    /// slice. If the wallet appears on multiple maker_orders entries for
+    /// the same trade (rare but possible — same asset, same price, same
+    /// order resting), their `matched_amount` is summed.
+    ///
+    /// For `trader_side == "TAKER"` trades the top-level fields already
+    /// describe the wallet's action (the taker IS the wallet), so no
+    /// reshaping is done.
+    fn reshape_for_wallet(&mut self, wallet: &str) {
+        if !self.trader_side.eq_ignore_ascii_case("MAKER") {
+            return;
+        }
+        let mut total = Decimal::ZERO;
+        let mut weighted_px = Decimal::ZERO;
+        let mut side = String::new();
+        for m in self.maker_orders.iter() {
+            if !m.maker_address.eq_ignore_ascii_case(wallet) {
+                continue;
+            }
+            let amt = Decimal::from_str(&m.matched_amount).unwrap_or(Decimal::ZERO);
+            let px = Decimal::from_str(&m.price).unwrap_or(Decimal::ZERO);
+            total += amt;
+            weighted_px += amt * px;
+            if side.is_empty() {
+                side = m.side.clone();
+            }
+        }
+        if total > Decimal::ZERO {
+            self.size = format!("{}", total);
+            self.price = if weighted_px > Decimal::ZERO {
+                format!("{}", weighted_px / total)
+            } else {
+                self.price.clone()
+            };
+            if !side.is_empty() {
+                self.side = side;
+            }
+        }
+    }
+}
+
+/// CLOB returns `created_at` / `match_time` as either a number or a string
+/// depending on the path. Coerce to String so deserialization always works.
+fn deserialize_string_or_number<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    })
+}
+
+/// GET /orders → list of active orders, enriched with market_title /
+/// outcome_label from the activity log when possible. Returns empty Vec
+/// (NOT an error) when CLOB credentials are missing — the page renders
+/// the section with a "no active orders" notice in that case.
+async fn fetch_active_orders(state: &AppState) -> Vec<ActiveOrder> {
+    let Some(api) = state.api.as_ref() else {
+        return Vec::new();
+    };
+    let raw = match api.get_orders().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "fetch_active_orders: CLOB get_orders failed");
+            return Vec::new();
+        }
+    };
+    let arr = raw
+        .as_array()
+        .cloned()
+        .or_else(|| raw.get("data").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    let mut orders: Vec<ActiveOrder> = arr
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<ActiveOrder>(v).ok())
+        .collect();
+
+    // Enrich market_title from the activity log (we keep the latest
+    // non-empty market name per condition_id seen). Best-effort — many
+    // orders are placed for tokens we never logged a buy for, those just
+    // show the truncated asset_id.
+    let activity = state.activity.read().await;
+    let mut title_by_market: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for a in activity.iter() {
+        if !a.condition_id.is_empty() && !a.market.is_empty() {
+            title_by_market.insert(a.condition_id.to_lowercase(), a.market.clone());
+        }
+    }
+    for o in orders.iter_mut() {
+        if !o.market.is_empty() {
+            if let Some(t) = title_by_market.get(&o.market.to_lowercase()) {
+                o.market_title = t.clone();
+            }
+        }
+    }
+    orders
+}
+
+/// GET /data/trades → recent settled fills. Limit hardcoded to 200 — that's
+/// the wallet's most recent activity, plenty for a live dashboard. Each
+/// fill gets `notional = price × size` computed and `market_title` enriched
+/// from the activity log when possible.
+async fn fetch_recent_fills(state: &AppState) -> Vec<WalletFill> {
+    let Some(api) = state.api.as_ref() else {
+        return Vec::new();
+    };
+    let raw = match api.get("/data/trades?limit=200").await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "fetch_recent_fills: /data/trades failed");
+            return Vec::new();
+        }
+    };
+    let arr = raw
+        .as_array()
+        .cloned()
+        .or_else(|| raw.get("data").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    let mut fills: Vec<WalletFill> = arr
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<WalletFill>(v).ok())
+        .collect();
+
+    // notional + title enrichment
+    let activity = state.activity.read().await;
+    let mut title_by_market: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for a in activity.iter() {
+        if !a.condition_id.is_empty() && !a.market.is_empty() {
+            title_by_market.insert(a.condition_id.to_lowercase(), a.market.clone());
+        }
+    }
+    // Reshape maker-side fills to show the wallet's slice (side, size,
+    // price) rather than the top-level taker aggression. Requires the
+    // wallet address; if we don't have it we skip the reshape and the
+    // display stays wrong but won't crash.
+    let wallet_lower = state
+        .wallet_address
+        .map(|a| format!("{:#x}", a))
+        .unwrap_or_default();
+    for f in fills.iter_mut() {
+        if !wallet_lower.is_empty() {
+            f.reshape_for_wallet(&wallet_lower);
+        }
+        let p = Decimal::from_str(&f.price).unwrap_or(Decimal::ZERO);
+        let s = Decimal::from_str(&f.size).unwrap_or(Decimal::ZERO);
+        f.notional = format!("{:.4}", p * s);
+        if !f.market.is_empty() {
+            if let Some(t) = title_by_market.get(&f.market.to_lowercase()) {
+                f.market_title = t.clone();
+            }
+        }
+    }
+    // Newest first by match_time (string-comparable since they're unix
+    // seconds — both as numbers and as numeric strings).
+    fills.sort_by(|a, b| b.match_time.cmp(&a.match_time));
+    fills
+}
+
 /// Convert a USDC amount in dollars (e.g. `2.0000`) to 6-decimal base units
 /// (`2_000_000`). Handles any scale correctly — unlike `.to_string().parse()`
 /// which breaks on fractional scales like `"2000000.0000"`.
@@ -2298,6 +3042,9 @@ async fn api_harvest_preview(
             .into_response();
     }
 
+    // Per-trade budget — clamps any user override to the global cap.
+    let effective_budget = resolve_trade_budget(&req.max_cost_usd, state.max_trade);
+
     // Re-fetch books for fresh data
     let mut outcomes: Vec<OutcomeInfo> = Vec::new();
     for (i, token_id) in market.clob_token_ids.iter().enumerate() {
@@ -2312,7 +3059,7 @@ async fn api_harvest_preview(
             .await;
         let info = match book {
             Some(ref b) => {
-                build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade)
+                build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, effective_budget)
             }
             None => OutcomeInfo {
                 label: label.clone(),
@@ -2374,7 +3121,7 @@ async fn api_harvest_preview(
     }
     let mint_available = have_all_bids && min_loser_depth < Decimal::MAX && state.ctf.is_some();
     let (mint_amount, mint_sell_revenue, mint_profit_pct) = if mint_available {
-        let amount = min_loser_depth.min(state.max_trade);
+        let amount = min_loser_depth.min(effective_budget);
         // Revenue at this exact amount: walk each loser's bids fresh.
         // Cached `top_sellable_revenue` is for `top_sellable_shares` —
         // which may exceed `amount` if one loser has much deeper top.
@@ -2404,7 +3151,11 @@ async fn api_harvest_preview(
     Json(serde_json::json!({
         "market_question": req.market_question,
         "winner_label": winner.label,
-        "max_trade": state.max_trade.to_string(),
+        // `max_trade` reflects the EFFECTIVE budget used for this preview
+        // (override or global cap, whichever is smaller). `global_max_trade`
+        // is the hard ceiling for the input control's max attribute.
+        "max_trade": effective_budget.to_string(),
+        "global_max_trade": state.max_trade.to_string(),
         "buy": {
             "shares": buy_shares.to_string(),
             "cost": buy_cost.to_string(),
@@ -2468,6 +3219,13 @@ struct SellRequest {
     /// (e.g. "15°C · exit"). Falls back to `outcome` when blank.
     #[serde(default)]
     label: Option<String>,
+    /// `true` → place as a resting sell that lives on the book until a
+    /// matching bid appears. Skips the post-place "poll for 6s and cancel
+    /// if dry" logic that's appropriate for marketable orders. CLOB
+    /// matcher still enforces `min_price` as the absolute floor — no
+    /// fills can land below it, ever.
+    #[serde(default)]
+    rest: Option<bool>,
 }
 
 /// Resolve a sell request's market + token_id. Returns `Err` with a
@@ -2616,47 +3374,40 @@ struct SellPlan {
     levels_consumed: usize,
 }
 
-/// Walk the bid book top-down up to `want_shares` and compute the sell
-/// plan. Stops at `min_price` (skips levels strictly below) and caps
-/// total shares at what the caller actually holds.
+/// Tight top-of-book sell plan: limit = best_bid (subject to `min_price`
+/// floor), size = min(want_shares, best_bid_depth). No book-walking —
+/// if the top of book is thin we partial-fill, never drop to lower bids.
 fn simulate_sell_walk(
     book: &surebet::orderbook::OrderBook,
     want_shares: Decimal,
     min_price: Decimal,
 ) -> SellPlan {
-    let mut remaining = want_shares;
-    let mut revenue = Decimal::ZERO;
-    let mut filled = Decimal::ZERO;
-    let mut levels = 0usize;
-    let mut worst: Option<Decimal> = None;
-    // BTreeMap iterates asc; sell side walks descending (highest bid first).
-    for (&price, &size) in book.bids.levels.iter().rev() {
-        if price < min_price || remaining <= Decimal::ZERO {
-            break;
-        }
-        let take: Decimal = size.min(remaining);
-        if take <= Decimal::ZERO {
-            continue;
-        }
-        revenue += price * take;
-        filled += take;
-        remaining -= take;
-        levels += 1;
-        // Each loop iteration's price is monotonically <= previous, so
-        // the last iteration's price is the lowest we walked.
-        worst = Some(price);
-    }
-    let avg = if filled > Decimal::ZERO {
-        revenue / filled
-    } else {
-        Decimal::ZERO
+    let Some((best_bid, depth)) = book.bids.best(true) else {
+        return SellPlan {
+            filled_shares: Decimal::ZERO,
+            gross_revenue: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: None,
+            levels_consumed: 0,
+        };
     };
+    if best_bid < min_price || want_shares <= Decimal::ZERO {
+        return SellPlan {
+            filled_shares: Decimal::ZERO,
+            gross_revenue: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: Some(best_bid),
+            levels_consumed: 0,
+        };
+    }
+    let filled = want_shares.min(depth);
+    let revenue = best_bid * filled;
     SellPlan {
         filled_shares: filled,
         gross_revenue: revenue,
-        avg_fill_price: avg,
-        worst_walked_price: worst,
-        levels_consumed: levels,
+        avg_fill_price: best_bid,
+        worst_walked_price: Some(best_bid),
+        levels_consumed: 1,
     }
 }
 
@@ -2904,7 +3655,17 @@ async fn api_sell(
     let revenue = plan.gross_revenue;
     let avg_price = plan.avg_fill_price;
 
-    if filled <= Decimal::ZERO {
+    // For RESTING sells (`req.rest = true`) we WANT to place the order
+    // even when nothing crosses the floor right now — that's the whole
+    // point. Size = full want_shares; the CLOB floor still gates fills.
+    // For non-resting sells, no fillable size is an error (the caller
+    // expected an immediate match).
+    let is_resting_pre = req.rest.unwrap_or(false);
+    let (order_size, sized_for_resting) = if filled > Decimal::ZERO {
+        (filled, false)
+    } else if is_resting_pre && want_shares > Decimal::ZERO {
+        (want_shares, true)
+    } else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -2915,7 +3676,7 @@ async fn api_sell(
             })),
         )
             .into_response();
-    }
+    };
 
     // CLOB limit = the FLOOR (min_price), not the worst level walked.
     // This is the critical protection: the matcher fills best-first,
@@ -2924,6 +3685,7 @@ async fn api_sell(
     // anywhere above rock-bottom. The walk is size-aware (stops at
     // want_shares); the floor is price-aware (stops at min_price).
     let order_limit_price = min_price;
+    let _ = sized_for_resting; // kept for future status differentiation
 
     // Mode resolution: explicit "paper" / "live" override in the
     // request wins; otherwise follow the server's runtime mode. This
@@ -2959,13 +3721,22 @@ async fn api_sell(
                     .into_response();
             }
         };
-        // Tick-size safe: book-sourced price but round defensively for
-        // f64 noise; shares can carry division precision.
+        // Tick-size: when the user typed `min_price` we honour 3-4 dp
+        // (so $0.703 stays $0.703 instead of getting silently truncated
+        // to $0.70). Auto-defaults still go through round_sell_price
+        // for the safe 2 dp lowest common denominator. If the market's
+        // tick is coarser than what the user typed, the CLOB rejects
+        // the order and the error surfaces — explicit, not silent.
+        let limit_for_clob = if req.min_price.is_some() {
+            clamp_sell_price_user(order_limit_price)
+        } else {
+            round_sell_price(order_limit_price)
+        };
         match order_client
             .place_limit(
                 &token_id,
-                round_sell_price(order_limit_price),
-                round_share_size(filled),
+                limit_for_clob,
+                round_share_size(order_size),
                 OrderSide::Sell,
             )
             .await
@@ -2990,29 +3761,72 @@ async fn api_sell(
         )
     };
 
+    // Post-place: poll /data/trades for actual fills. For marketable
+    // sells (limit ≤ best bid) tight-limits either match instantly or
+    // never — a 6s window is enough, and zero fills means cancel the
+    // GTC order so it doesn't sit stale.
+    //
+    // For RESTING sells (`req.rest = Some(true)`, e.g. limit > best
+    // bid) the user explicitly wants the order to live on the book
+    // until matched. We still poll briefly to catch any immediate
+    // match, but never cancel on no-fill — the order is intentional.
+    let is_resting = req.rest.unwrap_or(false);
+    let fills = if is_live && err_msg.is_empty() {
+        if let (Some(api), Some(oid)) = (state.api.as_ref(), order_id_opt.as_deref()) {
+            let f = poll_order_fills(api, oid, 6_000).await;
+            if f.shares <= Decimal::ZERO && !is_resting {
+                if let Err(e) = api.cancel_order(oid).await {
+                    tracing::warn!(order_id = %oid, error = %e, "cancel_order after no-fill failed");
+                }
+            }
+            f
+        } else {
+            OrderFills::default()
+        }
+    } else {
+        OrderFills {
+            shares: filled,
+            notional_usdc: revenue,
+            avg_price,
+            fill_count: 0,
+        }
+    };
+
     // Activity entry: SELL (or PAPER SELL) with negative buy_cost (we
     // received USDC), sell_revenue = gross. net_profit requires a cost
     // basis the server doesn't know — leave it as `sell_revenue` so the
     // stats treat this as inflowing capital without a known basis.
-    // Client can join against prior MINT/BUY entries by condition_id to
-    // compute the full round-trip return.
     let strategy = if is_live { "SELL" } else { "PAPER SELL" };
+    let no_fill = is_live && err_msg.is_empty() && fills.shares <= Decimal::ZERO;
+    let final_status = if no_fill && is_resting {
+        format!(
+            "{} — RESTING on book (no immediate match; order live until filled or cancelled)",
+            status
+        )
+    } else if no_fill {
+        format!("{} — NO FILL (cancelled)", status)
+    } else if fills.fill_count > 0 {
+        format!(
+            "{} — filled {:.2} sh @ ${:.4} = ${:.4} ({} fills)",
+            status, fills.shares, fills.avg_price, fills.notional_usdc, fills.fill_count
+        )
+    } else if err_msg.is_empty() {
+        status.clone()
+    } else {
+        format!("{} — order_id={}", status, order_id_opt.as_deref().unwrap_or("none"))
+    };
     let entry = ActivityEntry {
         date: Utc::now().format("%Y-%m-%d").to_string(),
         time: now,
         market: market.question.clone(),
         outcome: req.outcome.clone(),
         strategy: strategy.to_string(),
-        buy_shares: filled.to_string(),
-        buy_cost: format!("-{revenue:.4}"),
+        buy_shares: fills.shares.to_string(),
+        buy_cost: format!("-{:.4}", fills.notional_usdc),
         mint_cost: "0".to_string(),
-        sell_revenue: format!("{revenue:.4}"),
-        net_profit: format!("{revenue:.4}"),
-        status: if err_msg.is_empty() {
-            status.clone()
-        } else {
-            format!("{} — order_id={}", status, order_id_opt.as_deref().unwrap_or("none"))
-        },
+        sell_revenue: format!("{:.4}", fills.notional_usdc),
+        net_profit: format!("{:.4}", fills.notional_usdc),
+        status: final_status,
         condition_id: req.condition_id.clone(),
         gas_matic: "0".to_string(),
     };
@@ -3021,12 +3835,17 @@ async fn api_sell(
     rewrite_activity_file(&state).await;
 
     Json(serde_json::json!({
-        "ok": err_msg.is_empty(),
+        // For resting orders, "no immediate fill" is the expected outcome —
+        // not an error. The order is live on the book and will appear in
+        // the Active Orders section until matched or cancelled.
+        "ok": err_msg.is_empty() && (!no_fill || is_resting),
         "entry": entry,
-        "filled_shares": filled.to_string(),
-        "gross_revenue": revenue.to_string(),
-        "avg_price": avg_price.to_string(),
+        "filled_shares": fills.shares.to_string(),
+        "gross_revenue": fills.notional_usdc.to_string(),
+        "avg_price": fills.avg_price.to_string(),
         "order_id": order_id_opt,
+        "no_fill": no_fill,
+        "is_resting": is_resting,
         "error": if err_msg.is_empty() { None } else { Some(err_msg) },
     }))
     .into_response()
@@ -3057,54 +3876,48 @@ struct BuyPlan {
     levels_consumed: usize,
 }
 
+/// Tight top-of-book buy plan: limit = best_ask (subject to
+/// `limit_price` ceiling), size = min(budget / best_ask, best_ask_depth),
+/// floored to 2dp (CLOB lot size). No book-walking — if the top of book
+/// is thin, partial-fill rather than reaching into deeper, worse
+/// liquidity.
 fn simulate_buy_walk(
     book: &surebet::orderbook::OrderBook,
     max_cost_usd: Decimal,
     limit_price: Decimal,
 ) -> BuyPlan {
-    let mut remaining_budget = max_cost_usd;
-    let mut cost = Decimal::ZERO;
-    let mut filled = Decimal::ZERO;
-    let mut levels = 0usize;
-    let mut worst: Option<Decimal> = None;
-    // BTreeMap iterates asc — that's the direction buys want (cheapest first).
-    for (&price, &size) in book.asks.levels.iter() {
-        if price > limit_price || remaining_budget <= Decimal::ZERO {
-            break;
-        }
-        let level_cost: Decimal = price * size;
-        if level_cost <= remaining_budget {
-            // Take the whole level.
-            cost += level_cost;
-            filled += size;
-            remaining_budget -= level_cost;
-        } else {
-            // Partial fill at this level — take as many shares as
-            // the budget allows.
-            if price > Decimal::ZERO {
-                let frac_shares = remaining_budget / price;
-                cost += remaining_budget;
-                filled += frac_shares;
-                remaining_budget = Decimal::ZERO;
-            }
-        }
-        levels += 1;
-        worst = Some(price);
-        if remaining_budget <= Decimal::ZERO {
-            break;
-        }
-    }
-    let avg = if filled > Decimal::ZERO {
-        cost / filled
-    } else {
-        Decimal::ZERO
+    let Some((best_ask, depth)) = book.asks.best(false) else {
+        return BuyPlan {
+            filled_shares: Decimal::ZERO,
+            gross_cost: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: None,
+            levels_consumed: 0,
+        };
     };
+    if best_ask > limit_price || max_cost_usd <= Decimal::ZERO || best_ask <= Decimal::ZERO {
+        return BuyPlan {
+            filled_shares: Decimal::ZERO,
+            gross_cost: Decimal::ZERO,
+            avg_fill_price: Decimal::ZERO,
+            worst_walked_price: Some(best_ask),
+            levels_consumed: 0,
+        };
+    }
+    // Size capped by both the budget (at best_ask) and by available
+    // depth at the top level. Floor to 2 dp so the CLOB tick validator
+    // is happy and we never round UP past budget/depth.
+    let size_by_budget = max_cost_usd / best_ask;
+    let raw_size = size_by_budget.min(depth);
+    let filled = raw_size.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    let cost = best_ask * filled;
+    let levels_consumed = if filled > Decimal::ZERO { 1 } else { 0 };
     BuyPlan {
         filled_shares: filled,
         gross_cost: cost,
-        avg_fill_price: avg,
-        worst_walked_price: worst,
-        levels_consumed: levels,
+        avg_fill_price: best_ask,
+        worst_walked_price: Some(best_ask),
+        levels_consumed,
     }
 }
 
@@ -3356,36 +4169,72 @@ async fn api_buy_direct(
         )
     };
 
-    // Record cost against daily cap (live only — paper mode doesn't
-    // actually spend).
-    if is_live && err_msg.is_empty() {
+    // ── Post-place: poll /data/trades for actual fills. Tight-limit
+    // orders either match instantly or never fill — 6s is enough.
+    // Zero fills → cancel the GTC order and record a no-fill.
+    let fills = if is_live && err_msg.is_empty() {
+        if let (Some(api), Some(oid)) = (state.api.as_ref(), order_id_opt.as_deref()) {
+            let f = poll_order_fills(api, oid, 6_000).await;
+            if f.shares <= Decimal::ZERO {
+                if let Err(e) = api.cancel_order(oid).await {
+                    tracing::warn!(order_id = %oid, error = %e, "cancel_order after no-fill failed");
+                }
+            }
+            f
+        } else {
+            OrderFills::default()
+        }
+    } else {
+        // Paper mode: surface the simulated plan as the "fill" so downstream
+        // logging stays consistent.
+        OrderFills {
+            shares: plan.filled_shares,
+            notional_usdc: plan.gross_cost,
+            avg_price: plan.avg_fill_price,
+            fill_count: 0,
+        }
+    };
+
+    // Record ACTUAL cost against daily cap (not simulated). Only count
+    // something when the fill is real.
+    if is_live && err_msg.is_empty() && fills.notional_usdc > Decimal::ZERO {
         state
             .daily_spend
             .write()
             .await
-            .push((now_utc, plan.gross_cost));
+            .push((now_utc, fills.notional_usdc));
     }
 
     let strategy = if is_live { "BUY" } else { "PAPER BUY" };
+    let no_fill = is_live && err_msg.is_empty() && fills.shares <= Decimal::ZERO;
+    let final_status = if no_fill {
+        format!("{} — NO FILL (cancelled)", status)
+    } else if fills.fill_count > 0 {
+        format!(
+            "{} — filled {:.2} sh @ ${:.4} = ${:.4} ({} fills)",
+            status, fills.shares, fills.avg_price, fills.notional_usdc, fills.fill_count
+        )
+    } else if err_msg.is_empty() {
+        status.clone()
+    } else {
+        format!("{} — order_id={}", status, order_id_opt.as_deref().unwrap_or("none"))
+    };
+
     let entry = ActivityEntry {
         date: Utc::now().format("%Y-%m-%d").to_string(),
         time: now,
         market: req.market.clone(),
         outcome: req.label.clone(),
         strategy: strategy.to_string(),
-        buy_shares: plan.filled_shares.to_string(),
-        buy_cost: format!("{:.4}", plan.gross_cost),
+        buy_shares: fills.shares.to_string(),
+        buy_cost: format!("{:.4}", fills.notional_usdc),
         mint_cost: "0".to_string(),
         sell_revenue: "0".to_string(),
-        // Expected profit assuming the token resolves at $1. Matches
-        // the harvest handler's `net_profit = shares − cost` convention
-        // for BUY rows so stats aggregate cleanly.
-        net_profit: format!("{:.4}", plan.filled_shares - plan.gross_cost),
-        status: if err_msg.is_empty() {
-            status.clone()
-        } else {
-            format!("{} — order_id={}", status, order_id_opt.as_deref().unwrap_or("none"))
-        },
+        // No projected P&L. The old `shares - cost` figure assumed every
+        // BUY would resolve at $1 — phantom data. Realized P&L gets
+        // derived from CLOB fills + holdings, not from this field.
+        net_profit: "0.0000".to_string(),
+        status: final_status,
         condition_id: req.condition_id.clone().unwrap_or_default(),
         gas_matic: "0".to_string(),
     };
@@ -3393,13 +4242,14 @@ async fn api_buy_direct(
     rewrite_activity_file(&state).await;
 
     Json(serde_json::json!({
-        "ok": err_msg.is_empty(),
+        "ok": err_msg.is_empty() && !no_fill,
         "entry": entry,
-        "filled_shares": plan.filled_shares.to_string(),
-        "gross_cost": plan.gross_cost.to_string(),
-        "avg_price": plan.avg_fill_price.to_string(),
+        "filled_shares": fills.shares.to_string(),
+        "gross_cost": fills.notional_usdc.to_string(),
+        "avg_price": fills.avg_price.to_string(),
         "order_limit_price": order_limit_price.to_string(),
         "order_id": order_id_opt,
+        "no_fill": no_fill,
         "error": if err_msg.is_empty() { None } else { Some(err_msg) },
     }))
     .into_response()
@@ -3436,6 +4286,9 @@ async fn api_harvest(
 
     let winner_token_id = &market.clob_token_ids[req.winner_idx];
 
+    // Per-trade budget for THIS click. Clamped to the global cap.
+    let effective_budget = resolve_trade_budget(&req.max_cost_usd, state.max_trade);
+
     // ── 2. Re-fetch ALL outcome books (fresh data) ──────────────────────
     let mut outcomes: Vec<OutcomeInfo> = Vec::new();
     for (i, token_id) in market.clob_token_ids.iter().enumerate() {
@@ -3449,7 +4302,7 @@ async fn api_harvest(
             .fetch_rest_book(&state.clob_url, token_id)
             .await;
         let info = match book {
-            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, state.max_trade),
+            Some(ref b) => build_outcome_info(&label, token_id, b, state.max_buy, state.min_sell, effective_budget),
             None => OutcomeInfo {
                 label: label.clone(),
                 token_id: token_id.clone(),
@@ -3547,16 +4400,15 @@ async fn api_harvest(
     }
 
     // ── 3b. SAFETY: enforce spending limits ─────────────────────────────
-    // Total cost of this trade = buy_cost + mint_amount
-
-    // Cap per-trade spend
+    // Total cost of this trade = buy_cost + mint_amount. Cap against
+    // `effective_budget` (the per-trade ceiling: either user override or
+    // the global config cap, whichever is smaller).
     let total_raw_cost = capped_buy_cost + mint_amount;
-    if total_raw_cost > state.max_trade {
-        // Scale down proportionally to fit within max_trade
+    if total_raw_cost > effective_budget {
         if mint_amount > Decimal::ZERO && capped_buy_cost > Decimal::ZERO {
             // Both strategies active — prioritise mint (higher margin), then buy with remainder
-            mint_amount = mint_amount.min(state.max_trade);
-            let remainder = state.max_trade - mint_amount;
+            mint_amount = mint_amount.min(effective_budget);
+            let remainder = effective_budget - mint_amount;
             if remainder > Decimal::ZERO && capped_buy_cost > remainder {
                 // Scale buy shares proportionally to capped cost
                 let scale = remainder / capped_buy_cost;
@@ -3567,12 +4419,12 @@ async fn api_harvest(
                 capped_buy_cost = Decimal::ZERO;
             }
         } else if mint_amount > Decimal::ZERO {
-            mint_amount = mint_amount.min(state.max_trade);
+            mint_amount = mint_amount.min(effective_budget);
         } else {
             // Buy only — cap cost directly
-            let scale = state.max_trade / capped_buy_cost;
+            let scale = effective_budget / capped_buy_cost;
             capped_buy_shares = (capped_buy_shares * scale).round_dp(2);
-            capped_buy_cost = state.max_trade;
+            capped_buy_cost = effective_budget;
         }
     }
 
@@ -3659,6 +4511,12 @@ async fn api_harvest(
     let mut actual_mint_cost = Decimal::ZERO;
     let mut actual_sell_revenue = Decimal::ZERO;
     let mut total_gas_matic = Decimal::ZERO;
+    // Truth-tracking for the BUY phase: populated from /data/trades after
+    // the order matches. Override the requested `buy_shares`/`buy_cost`
+    // when constructing the final activity entry, so partial/no-fills
+    // aren't logged as full buys.
+    let mut actual_buy_filled_shares: Option<Decimal> = None;
+    let mut actual_buy_filled_cost: Option<Decimal> = None;
 
     // When a mint succeeds, we immediately persist a provisional entry so
     // the trade is recorded on disk even if the subsequent sell/buy phases
@@ -3835,14 +4693,42 @@ async fn api_harvest(
                                     .await;
                                 match resp {
                                     Ok(r) if r.success => {
-                                        actual_sell_revenue += *best_bid * sell_size;
-                                        if attempt > 0 {
+                                        // Poll /data/trades for actual fills before
+                                        // crediting revenue. The old code added
+                                        // `best_bid * sell_size` as soon as the order
+                                        // was POSTed — phantom: it ignored partial
+                                        // fills, no-fills, and price slippage. Now we
+                                        // wait for the matcher and only credit what
+                                        // actually settled.
+                                        let fills = if let Some(api) = state.api.as_ref() {
+                                            let f = poll_order_fills(api, &r.order_id, 6_000).await;
+                                            if f.shares <= Decimal::ZERO {
+                                                if let Err(e) = api.cancel_order(&r.order_id).await {
+                                                    tracing::warn!(order_id = %r.order_id, error = %e,
+                                                        "harvest sell: cancel after no-fill failed");
+                                                }
+                                            }
+                                            f
+                                        } else {
+                                            OrderFills::default()
+                                        };
+                                        actual_sell_revenue += fills.notional_usdc;
+                                        let retry_tag = if attempt > 0 {
+                                            format!(" (retry {})", attempt)
+                                        } else {
+                                            String::new()
+                                        };
+                                        if fills.shares <= Decimal::ZERO {
                                             status_parts.push(format!(
-                                                "SELL OK id={} (retry {})", r.order_id, attempt
+                                                "SELL NO-FILL id={}{} — cancelled",
+                                                r.order_id, retry_tag
                                             ));
                                         } else {
-                                            status_parts
-                                                .push(format!("SELL OK id={}", r.order_id));
+                                            status_parts.push(format!(
+                                                "SELL OK id={}{} — filled {:.2} sh @ ${:.4} = ${:.4}",
+                                                r.order_id, retry_tag, fills.shares,
+                                                fills.avg_price, fills.notional_usdc
+                                            ));
                                         }
                                         sold = true;
                                         break;
@@ -3952,8 +4838,13 @@ async fn api_harvest(
                 .book_store
                 .fetch_rest_book(&state.clob_url, winner_token_id)
                 .await;
+            // simulate_buy_walk expects (book, max_cost_usd, limit_price).
+            // We previously passed buy_shares (a share count!) as the
+            // budget — at low asks (e.g. $0.10) that meant a $0.50 budget
+            // turned into a 50-share order ($5+ overspend). Pass the real
+            // USDC budget (buy_cost) and `max_buy` as the per-share ceiling.
             let fresh_plan = live_book.as_ref().map(|b| {
-                simulate_buy_walk(b, buy_shares, state.max_buy)
+                simulate_buy_walk(b, buy_cost, state.max_buy)
             });
             let (limit_for_buy, actual_buy_shares) = match fresh_plan.as_ref() {
                 Some(p) if p.filled_shares > Decimal::ZERO => (
@@ -4012,7 +4903,39 @@ async fn api_harvest(
                     } else {
                         strategy = "MINT+SELL+BUY".to_string();
                     }
-                    status_parts.push(format!("BUY OK id={}", r.order_id));
+                    // Poll /data/trades for actual fills before recording.
+                    // The order being POSTed doesn't mean it filled — limit
+                    // BUYs at the ask can sit unfilled if the book moved.
+                    // No-fill → cancel so it doesn't rest on the book.
+                    let fills = if let Some(api) = state.api.as_ref() {
+                        let f = poll_order_fills(api, &r.order_id, 6_000).await;
+                        if f.shares <= Decimal::ZERO {
+                            if let Err(e) = api.cancel_order(&r.order_id).await {
+                                tracing::warn!(order_id = %r.order_id, error = %e,
+                                    "harvest buy: cancel after no-fill failed");
+                            }
+                        }
+                        f
+                    } else {
+                        OrderFills::default()
+                    };
+                    if fills.shares <= Decimal::ZERO {
+                        status_parts.push(format!(
+                            "BUY NO-FILL id={} — cancelled (limit ${:.4} × {} sh)",
+                            r.order_id,
+                            round_buy_price(limit_for_buy),
+                            round_share_size(actual_buy_shares),
+                        ));
+                        actual_buy_filled_shares = Some(Decimal::ZERO);
+                        actual_buy_filled_cost = Some(Decimal::ZERO);
+                    } else {
+                        status_parts.push(format!(
+                            "BUY OK id={} — filled {:.2} sh @ ${:.4} = ${:.4}",
+                            r.order_id, fills.shares, fills.avg_price, fills.notional_usdc
+                        ));
+                        actual_buy_filled_shares = Some(fills.shares);
+                        actual_buy_filled_cost = Some(fills.notional_usdc);
+                    }
 
                     // HOOVER spawn INTENTIONALLY DISABLED.
                     //
@@ -4051,17 +4974,29 @@ async fn api_harvest(
     }
 
     // ── 6. Compute net profit and finalize log entry ────────────────────
-    // net_profit = buy_profit + sell_revenue (minted winners retained are
-    // worth the mint cost at resolution, so mint+sell profit = sell_revenue).
-    let net_profit = buy_profit + actual_sell_revenue;
+    // net_profit on this entry = realized cash inflow from selling losers
+    // (actual_sell_revenue). The `buy_profit = shares - cost` projection
+    // we used to add is phantom — it assumes the winner resolves at $1,
+    // which is the trade thesis, not a fact. Realized P&L gets derived
+    // from CLOB fills + on-chain holdings instead. `_buy_profit` is kept
+    // as a local for the response payload and previews, but no longer
+    // contributes to the persisted entry.
+    let _buy_profit = buy_profit;
+    let net_profit = actual_sell_revenue;
+
+    // Prefer the actual fill amounts when they're available — that's
+    // the truth. Falls back to the requested values only when no BUY
+    // was attempted (mint-only) or in PAPER mode (no fills exist).
+    let logged_buy_shares = actual_buy_filled_shares.unwrap_or(buy_shares);
+    let logged_buy_cost = actual_buy_filled_cost.unwrap_or(buy_cost);
 
     let final_entry = ActivityEntry {
         time: now,
         market: req.market_question,
         outcome: req.label.clone(),
         strategy,
-        buy_shares: buy_shares.to_string(),
-        buy_cost: format!("{:.4}", buy_cost),
+        buy_shares: logged_buy_shares.to_string(),
+        buy_cost: format!("{:.4}", logged_buy_cost),
         mint_cost: format!("{:.4}", actual_mint_cost),
         sell_revenue: format!("{:.4}", actual_sell_revenue),
         net_profit: format!("{:.4}", net_profit),
@@ -4071,8 +5006,9 @@ async fn api_harvest(
         date: Utc::now().format("%Y-%m-%d").to_string(),
     };
 
-    // Record spend in daily tracker
-    let total_spent = buy_cost + actual_mint_cost;
+    // Record ACTUAL spend in daily tracker (not requested) so the cap
+    // reflects money that actually left the wallet.
+    let total_spent = logged_buy_cost + actual_mint_cost;
     if total_spent > Decimal::ZERO {
         let mut spend_log = state.daily_spend.write().await;
         spend_log.push((Utc::now(), total_spent));
@@ -5355,7 +6291,6 @@ async fn weather_html() -> Html<String> {
   <a href="/trades">Trades</a>
   <a href="/weather" class="active">Weather</a>
   <a href="/observations">Observations</a>
-  <a href="/paper-trades">Paper Trades</a>
   <a href="/arb">Arb</a>
 </div>
 
@@ -5560,7 +6495,7 @@ async function savePaperTrade() {
       const orderSummary = j.order_ids
         ? ` · orders: ${j.order_ids.filter(x => x).length}/${j.order_ids.length} filled`
         : '';
-      status.innerHTML = `✓ Saved trade${modeTag} <code>${j.id}</code> · cost $${j.total_cost.toFixed(2)}${orderSummary} · <a href="/paper-trades" style="color:#58a6ff">view on /paper-trades</a>`;
+      status.innerHTML = `✓ Saved trade${modeTag} <code>${j.id}</code> · cost $${j.total_cost.toFixed(2)}${orderSummary} · <a href="/trades" style="color:#58a6ff">view on /trades</a>`;
       status.style.color = '#7ee2a8';
       status.style.display = 'block';
       setTimeout(clearBuilder, 3500);
@@ -6861,7 +7796,7 @@ async fn observations_html() -> Html<String> {
       <div id="buy-modal-body"></div>
     </div>
   </div>
-  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a> <a href="/arb">Arb</a></nav>
+  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/arb">Arb</a></nav>
   <h1>Weather observations · dead bracket scanner</h1>
 
   <!-- METAR frontrun alerts. Background poller (every 2 min) diffs new METAR
@@ -7217,10 +8152,29 @@ struct PaperTradeLeg {
     bracket_label: String,
     token_id: String,
     ask_at_buy: f64,
+    /// Requested share size at order placement. May not equal `filled_shares`
+    /// — partial fills, tighter walked prices, or no-fills are normal.
     shares: f64,
     /// Model-assigned probability of this bracket winning at the time of purchase.
     #[serde(default)]
     model_prob_at_buy: Option<f64>,
+    /// ACTUAL shares acquired on chain (sum of /data/trades fills for this
+    /// leg's order_id). `None` for legacy entries; `Some(0.0)` for confirmed
+    /// no-fills. Source of truth for downstream P&L — never trust `shares`
+    /// for accounting.
+    #[serde(default)]
+    filled_shares: Option<f64>,
+    /// ACTUAL USDC paid for the filled portion. Sum of `price × size` from
+    /// the matching `/data/trades` rows.
+    #[serde(default)]
+    filled_cost: Option<f64>,
+    /// Volume-weighted average fill price across all fills for this leg.
+    #[serde(default)]
+    filled_avg_price: Option<f64>,
+    /// Number of separate fills (matches against distinct makers). 0 = no
+    /// fill yet (or never).
+    #[serde(default)]
+    fill_count: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -7415,11 +8369,15 @@ async fn api_save_paper_trade(
             }
         }
 
-        // Place buy orders for each leg. Errors are captured per leg; a partial
-        // fill still saves the trade (the user can handle cleanup manually).
-        let mut order_ids: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
-        let mut leg_errors: Vec<Option<String>> = Vec::with_capacity(req.legs.len());
-        for leg in &req.legs {
+        // Place each leg's buy order, then poll /data/trades for the actual
+        // fill before recording the trade. This is the difference between
+        // "we tried to buy 5 shares" (phantom) and "we actually own 2.5"
+        // (truth). No-fill orders get cancelled so they don't sit on the
+        // book stale; partial fills are recorded as-is.
+        let mut legs = req.legs;
+        let mut order_ids: Vec<Option<String>> = Vec::with_capacity(legs.len());
+        let mut leg_errors: Vec<Option<String>> = Vec::with_capacity(legs.len());
+        for leg in legs.iter_mut() {
             // f64 → Decimal can carry FP garbage (0.55 becomes 0.55000…444).
             // Tick-size + direction-aware: BUY rounds up then clamps to
             // [0.01, 0.99]. Covers both the f64-noise bug and the
@@ -7430,39 +8388,70 @@ async fn api_save_paper_trade(
             let size = round_share_size(
                 Decimal::from_f64_retain(leg.shares).unwrap_or(Decimal::ZERO),
             );
-            match order_client
+            let placed = order_client
                 .place_limit(&leg.token_id, price, size, OrderSide::Buy)
-                .await
-            {
-                Ok(r) if r.success => {
-                    order_ids.push(Some(r.order_id));
-                    leg_errors.push(None);
-                }
+                .await;
+            let oid = match placed {
+                Ok(r) if r.success => Some(r.order_id),
                 Ok(r) => {
                     order_ids.push(None);
                     leg_errors.push(Some(r.error_msg));
+                    leg.filled_shares = Some(0.0);
+                    leg.filled_cost = Some(0.0);
+                    leg.filled_avg_price = Some(0.0);
+                    leg.fill_count = Some(0);
+                    continue;
                 }
                 Err(e) => {
                     order_ids.push(None);
                     leg_errors.push(Some(format!("{e}")));
+                    leg.filled_shares = Some(0.0);
+                    leg.filled_cost = Some(0.0);
+                    leg.filled_avg_price = Some(0.0);
+                    leg.fill_count = Some(0);
+                    continue;
                 }
-            }
+            };
+            // Poll /data/trades for actual fills against this order_id.
+            // Tight-limit BUYs at the ask either match instantly or rest
+            // unfilled — 6s window matches the existing buy-direct flow.
+            // Zero fills → cancel the GTC order so it doesn't sit stale.
+            let oid_str = oid.as_ref().unwrap();
+            let fills = if let Some(api) = state.api.as_ref() {
+                let f = poll_order_fills(api, oid_str, 6_000).await;
+                if f.shares <= Decimal::ZERO {
+                    if let Err(e) = api.cancel_order(oid_str).await {
+                        tracing::warn!(order_id = %oid_str, error = %e,
+                            "paper-trade buy: cancel after no-fill failed");
+                    }
+                }
+                f
+            } else {
+                OrderFills::default()
+            };
+            // Truth-record the leg, even when nothing filled — a zero
+            // entry IS the truth, and downstream stats need the
+            // distinction between "didn't try" and "tried but no fill".
+            leg.filled_shares = Some(fills.shares.to_string().parse().unwrap_or(0.0));
+            leg.filled_cost = Some(fills.notional_usdc.to_string().parse().unwrap_or(0.0));
+            leg.filled_avg_price = Some(fills.avg_price.to_string().parse().unwrap_or(0.0));
+            leg.fill_count = Some(fills.fill_count);
+            order_ids.push(oid);
+            leg_errors.push(if fills.shares <= Decimal::ZERO {
+                Some("no fill — order cancelled".to_string())
+            } else {
+                None
+            });
         }
 
-        // If NOTHING placed successfully, treat as an error; otherwise save with
-        // whatever got through and the user can decide what to do.
-        if order_ids.iter().all(|o| o.is_none()) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "all legs failed",
-                    "leg_errors": leg_errors,
-                })),
-            )
-                .into_response();
-        }
+        // If every leg either errored or got zero fills, surface as an
+        // error response. We still save the trade record so the user can
+        // see what was attempted, but the API caller knows nothing landed.
+        let any_filled = legs.iter().any(|l| l.filled_shares.unwrap_or(0.0) > 0.0);
 
-        let total_cost: f64 = req.legs.iter().map(|l| l.ask_at_buy * l.shares).sum();
+        // Total cost = sum of ACTUAL filled costs across legs. No more
+        // ask×shares phantom — if a leg didn't fill, it contributes $0.
+        let total_cost: f64 = legs.iter().map(|l| l.filled_cost.unwrap_or(0.0)).sum();
         let trade = PaperTrade {
             id: uuid::Uuid::new_v4().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -7471,7 +8460,7 @@ async fn api_save_paper_trade(
             unit: req.unit,
             target_date: req.target_date,
             regime: req.regime,
-            legs: req.legs,
+            legs,
             total_cost,
             model_win_prob_at_buy: req.model_win_prob_at_buy,
             mode: "live".to_string(),
@@ -7484,6 +8473,20 @@ async fn api_save_paper_trade(
             winning_bracket: None,
             obs_at_buy: obs_at_buy.clone(),
         };
+        if !any_filled {
+            // Persist the no-fill trade so the audit trail keeps it, then
+            // signal the failure back to the caller.
+            let _ = persist_trade(&trade).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "no legs filled (all rejected, errored, or cancelled after no-fill)",
+                    "leg_errors": leg_errors,
+                    "trade_id": trade.id,
+                })),
+            )
+                .into_response();
+        }
         if let Err(e) = persist_trade(&trade).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7542,38 +8545,6 @@ async fn api_save_paper_trade(
     .into_response()
 }
 
-/// Fetch the best (highest) bid for a CLOB YES token.
-///
-/// Polymarket's CLOB `/book` endpoint returns bids sorted ASCENDING (lowest
-/// first) and asks sorted DESCENDING (highest first) — both moving away from
-/// the mid. So `bids.first()` is the WORST bid, not the best. Take the max
-/// across all levels to get the real best bid.
-async fn fetch_best_bid(
-    http: &reqwest::Client,
-    clob_url: &str,
-    token_id: &str,
-) -> Option<f64> {
-    #[derive(Deserialize)]
-    struct BookResp {
-        bids: Option<Vec<PriceLevel>>,
-    }
-    #[derive(Deserialize)]
-    struct PriceLevel {
-        price: String,
-    }
-    let url = format!("{clob_url}/book?token_id={token_id}");
-    let resp = http.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let book: BookResp = resp.json().await.ok()?;
-    book.bids.and_then(|bs| {
-        bs.iter()
-            .filter_map(|p| p.price.parse::<f64>().ok())
-            .reduce(f64::max)
-    })
-}
-
 /// Append a trade to the JSONL log. Shared by both paper and live save paths.
 async fn persist_trade(trade: &PaperTrade) -> Result<(), String> {
     let line = serde_json::to_string(trade)
@@ -7591,599 +8562,8 @@ async fn persist_trade(trade: &PaperTrade) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct CloseTradeRequest {
-    id: String,
-}
 
-/// POST /api/paper-trade/close
-/// Mark a paper trade as closed, snapshot current exit revenue, and rewrite
-/// the JSONL. Load-modify-rewrite is fine for a local file with small trade
-/// counts; if this ever grows we'd move to a real store.
-/// POST /api/paper-trade/reopen
-/// Flip a trade's status back to "open". Used when an earlier Close
-/// click ran under the old snapshot-only logic that didn't actually
-/// sell any legs — the on-chain shares are still held, so the user
-/// wants the trade row back in the "open" list so they can re-click
-/// Close under the new live-sell logic.
-async fn api_reopen_paper_trade(
-    State(_state): State<AppState>,
-    Json(req): Json<CloseTradeRequest>,
-) -> impl IntoResponse {
-    let contents = match tokio::fs::read_to_string(PAPER_TRADES_FILE).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("no paper trades file: {e}")})),
-            )
-                .into_response();
-        }
-    };
-    let mut trades: Vec<PaperTrade> = contents
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<PaperTrade>(l).ok())
-        .collect();
-    let idx = match trades.iter().position(|t| t.id == req.id) {
-        Some(i) => i,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "trade not found"})),
-            )
-                .into_response();
-        }
-    };
-    // Only reopen if it's currently in a closed-but-not-sold-on-chain
-    // state. Resolved/redeemed trades are terminal.
-    let was = trades[idx].status.clone();
-    match was.as_str() {
-        "closed_manual" | "sold_partial" => {}
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("trade status is '{was}' — can only reopen closed_manual or sold_partial")
-                })),
-            )
-                .into_response();
-        }
-    }
-    trades[idx].status = "open".to_string();
-    trades[idx].closed_at = None;
-    trades[idx].close_sell_revenue = None;
-    trades[idx].realized_pnl = None;
 
-    // Atomic rewrite via tmp+rename.
-    let tmp_path = format!("{}.tmp", PAPER_TRADES_FILE);
-    let mut out = String::new();
-    for t in &trades {
-        if let Ok(s) = serde_json::to_string(t) {
-            out.push_str(&s);
-            out.push('\n');
-        }
-    }
-    if let Err(e) = tokio::fs::write(&tmp_path, out).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("write failed: {e}")})),
-        )
-            .into_response();
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, PAPER_TRADES_FILE).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("rename failed: {e}")})),
-        )
-            .into_response();
-    }
-
-    Json(serde_json::json!({
-        "reopened": true,
-        "id": req.id,
-        "was": was,
-    }))
-    .into_response()
-}
-
-async fn api_close_paper_trade(
-    State(state): State<AppState>,
-    Json(req): Json<CloseTradeRequest>,
-) -> impl IntoResponse {
-    let contents = match tokio::fs::read_to_string(PAPER_TRADES_FILE).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("no paper trades file: {e}")})),
-            )
-                .into_response();
-        }
-    };
-    let mut trades: Vec<PaperTrade> = contents
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<PaperTrade>(l).ok())
-        .collect();
-
-    let idx = match trades.iter().position(|t| t.id == req.id) {
-        Some(i) => i,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "trade not found"})),
-            )
-                .into_response();
-        }
-    };
-
-    if trades[idx].status != "open" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("trade already {}", trades[idx].status)})),
-        )
-            .into_response();
-    }
-
-    let trade = trades[idx].clone();
-    let is_live = trade.mode == "live";
-
-    // Paper-mode: snapshot only. No on-chain shares to sell.
-    // Live-mode: walk each leg's bid book and place a real SDK
-    // limit-sell for the held size. Slippage-aware floor = worst level
-    // walked (mirrors /api/sell). Track per-leg results so the user
-    // sees exactly which legs cleared and which didn't.
-    let mut exit_revenue = 0.0_f64;
-    let mut per_leg: Vec<serde_json::Value> = Vec::with_capacity(trade.legs.len());
-    let mut any_failed = false;
-    let mut any_sold = false;
-
-    for (i, leg) in trade.legs.iter().enumerate() {
-        // Skip legs where the original BUY failed — we don't hold
-        // those shares.
-        if let Some(Some(err)) = trade.leg_errors.get(i) {
-            per_leg.push(serde_json::json!({
-                "leg": leg.bracket_label,
-                "skipped": format!("original buy failed: {err}"),
-            }));
-            continue;
-        }
-
-        let book = state
-            .book_store
-            .fetch_rest_book(&state.clob_url, &leg.token_id)
-            .await;
-        let record_shares = Decimal::from_f64_retain(leg.shares)
-            .unwrap_or(Decimal::ZERO)
-            .round_dp(2);
-
-        // Live-mode: cap `want_shares` at the actual ERC-1155 balance on
-        // chain. The saved `leg.shares` is the *intended* size — if the
-        // original BUY only partially filled (or never filled), we hold
-        // less than recorded. Without this cap the SDK rejects the sell
-        // with "not enough balance / allowance".
-        //
-        // Paper-mode: skip the chain query, trust the record.
-        let want_shares = if is_live {
-            let on_chain = match (state.ctf.as_ref(), U256::from_str(&leg.token_id)) {
-                (Some(ctf), Ok(tid)) => match ctf.inner.balance_for_token_id(tid).await {
-                    Ok(bal) => {
-                        // Raw is at 1e6 scale. Floor (ToZero) — never
-                        // over-report what we hold, or the CLOB rejects.
-                        let bal_dec = Decimal::from_str(&bal.to_string())
-                            .unwrap_or(Decimal::ZERO)
-                            / Decimal::from(1_000_000i64);
-                        Some(bal_dec.round_dp_with_strategy(2, RoundingStrategy::ToZero))
-                    }
-                    Err(e) => {
-                        tracing::warn!(token = %leg.token_id, error = %e, "balance_for_token_id failed, falling back to record");
-                        None
-                    }
-                },
-                _ => None,
-            };
-            match on_chain {
-                Some(on) if on < record_shares => on,
-                _ => record_shares,
-            }
-        } else {
-            record_shares
-        };
-
-        // Size-aware + price-aware per leg. Default floor = 90% of
-        // best bid on THIS leg's book (10% slippage band), floored at
-        // state.min_sell. The walk stops here and the CLOB limit is
-        // set to this — no leg's fill can drop below its own floor.
-        let leg_best_bid = book
-            .as_ref()
-            .and_then(|b| b.bids.best(true).map(|(p, _)| p));
-        let leg_floor = leg_best_bid
-            .map(|bb| default_sell_floor(bb, state.min_sell))
-            .unwrap_or(state.min_sell);
-
-        let plan = match book.as_ref() {
-            Some(b) => simulate_sell_walk(b, want_shares, leg_floor),
-            None => SellPlan {
-                filled_shares: Decimal::ZERO,
-                gross_revenue: Decimal::ZERO,
-                avg_fill_price: Decimal::ZERO,
-                worst_walked_price: None,
-                levels_consumed: 0,
-            },
-        };
-
-        if is_live {
-            // Always update the snapshot revenue, even if we can't sell.
-            if plan.filled_shares > Decimal::ZERO {
-                if let Ok(r) = plan.gross_revenue.to_string().parse::<f64>() {
-                    exit_revenue += r;
-                }
-            }
-
-            // Zero want_shares ⇒ we hold none of this leg (original buy
-            // likely never filled or was already sold). Skip cleanly
-            // instead of letting the CLOB reject with an opaque error.
-            if want_shares <= Decimal::ZERO {
-                per_leg.push(serde_json::json!({
-                    "leg": leg.bracket_label,
-                    "skipped": "zero on-chain balance — nothing held for this leg",
-                }));
-                continue;
-            }
-
-            if plan.filled_shares <= Decimal::ZERO {
-                per_leg.push(serde_json::json!({
-                    "leg": leg.bracket_label,
-                    "skipped": format!(
-                        "no bids ≥ ${} (floor = 90% of best bid) — too illiquid to sell without dumping",
-                        leg_floor
-                    ),
-                }));
-                any_failed = true;
-                continue;
-            }
-
-            let order_client = match state.order_client.as_ref() {
-                Some(c) => c,
-                None => {
-                    per_leg.push(serde_json::json!({
-                        "leg": leg.bracket_label,
-                        "skipped": "order_client not initialized",
-                    }));
-                    any_failed = true;
-                    continue;
-                }
-            };
-            // CLOB limit = the leg's price floor. Won't match below it
-            // even if the book moves. Tick-safe rounding + clamp keep
-            // the SDK validator happy.
-            let limit = round_sell_price(leg_floor);
-            let size = round_share_size(plan.filled_shares);
-            match order_client
-                .place_limit(&leg.token_id, limit, size, OrderSide::Sell)
-                .await
-            {
-                Ok(r) if r.success => {
-                    any_sold = true;
-                    per_leg.push(serde_json::json!({
-                        "leg": leg.bracket_label,
-                        "order_id": r.order_id,
-                        "shares": size.to_string(),
-                        "limit": limit.to_string(),
-                        "avg_price": plan.avg_fill_price.to_string(),
-                    }));
-                    // Per-leg activity entry so realized P&L rolls into stats.
-                    let entry = ActivityEntry {
-                        date: Utc::now().format("%Y-%m-%d").to_string(),
-                        time: Utc::now().format("%H:%M:%S").to_string(),
-                        market: trade.market_question.clone(),
-                        outcome: format!("{} · exit", leg.bracket_label),
-                        strategy: "SELL".to_string(),
-                        buy_shares: size.to_string(),
-                        buy_cost: format!("-{:.4}", plan.gross_revenue),
-                        mint_cost: "0".to_string(),
-                        sell_revenue: format!("{:.4}", plan.gross_revenue),
-                        net_profit: format!("{:.4}", plan.gross_revenue),
-                        status: format!("SELL OK: order {} (paper-trade close)", r.order_id),
-                        condition_id: String::new(),
-                        gas_matic: "0".to_string(),
-                    };
-                    state.activity.write().await.push(entry);
-                    rewrite_activity_file(&state).await;
-                }
-                Ok(r) => {
-                    any_failed = true;
-                    per_leg.push(serde_json::json!({
-                        "leg": leg.bracket_label,
-                        "error": format!("place_limit rejected: {}", r.error_msg),
-                    }));
-                }
-                Err(e) => {
-                    any_failed = true;
-                    per_leg.push(serde_json::json!({
-                        "leg": leg.bracket_label,
-                        "error": format!("place_limit error: {e}"),
-                    }));
-                }
-            }
-        } else {
-            // Paper-mode: snapshot revenue + per-leg info, no order.
-            if let Ok(r) = plan.gross_revenue.to_string().parse::<f64>() {
-                exit_revenue += r;
-            }
-            per_leg.push(serde_json::json!({
-                "leg": leg.bracket_label,
-                "paper": true,
-                "shares": want_shares.to_string(),
-                "projected_revenue": plan.gross_revenue.to_string(),
-            }));
-        }
-    }
-
-    let realized = exit_revenue - trade.total_cost;
-    // New status values: "sold_live" (all legs sold), "sold_partial"
-    // (some succeeded, some didn't), "closed_manual" (paper snapshot
-    // or live trade where nothing could sell).
-    trades[idx].status = if is_live {
-        if any_sold && !any_failed {
-            "sold_live".to_string()
-        } else if any_sold {
-            "sold_partial".to_string()
-        } else {
-            "closed_manual".to_string()
-        }
-    } else {
-        "closed_manual".to_string()
-    };
-    trades[idx].close_sell_revenue = Some(exit_revenue);
-    trades[idx].realized_pnl = Some(realized);
-    trades[idx].closed_at = Some(chrono::Utc::now().to_rfc3339());
-
-    // Rewrite the file atomically via temp-file + rename.
-    let tmp_path = format!("{}.tmp", PAPER_TRADES_FILE);
-    let mut out = String::new();
-    for t in &trades {
-        match serde_json::to_string(t) {
-            Ok(s) => {
-                out.push_str(&s);
-                out.push('\n');
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("serialize failed: {e}")})),
-                )
-                    .into_response();
-            }
-        }
-    }
-    if let Err(e) = tokio::fs::write(&tmp_path, out).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("write failed: {e}")})),
-        )
-            .into_response();
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, PAPER_TRADES_FILE).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("rename failed: {e}")})),
-        )
-            .into_response();
-    }
-
-    Json(serde_json::json!({
-        "closed": true,
-        "id": req.id,
-        "mode": trade.mode,
-        "status": trades[idx].status,
-        "per_leg": per_leg,
-        "exit_revenue": exit_revenue,
-        "realized_pnl": realized,
-    }))
-    .into_response()
-}
-
-#[derive(Serialize)]
-struct PaperTradeWithPnl {
-    #[serde(flatten)]
-    trade: PaperTrade,
-    /// Current bid on each leg's YES (what we could sell it for right now).
-    current_bids: Vec<Option<f64>>,
-    /// Sum of (current_bid × shares) across legs — hypothetical sell-all revenue.
-    current_sell_revenue: f64,
-    /// `current_sell_revenue - total_cost`.
-    unrealized_pnl: f64,
-    /// Best-case payout at resolution: max shares across legs (only one can win).
-    max_payout_at_resolution: f64,
-    /// Profit at best case: max_payout - total_cost.
-    profit_if_any_leg_wins: f64,
-    /// Loss at worst case: -total_cost.
-    loss_if_all_legs_lose: f64,
-    /// Live lifecycle signal:
-    /// - "exit_opportunity": `current_sell_revenue > total_cost` — you can sell now for locked profit
-    /// - "open":             still waiting on resolution, sell-now would lose
-    live_status: String,
-    /// % return if any leg wins at resolution: `profit_if_any_leg_wins /
-    /// total_cost * 100`. `None` for zero-cost trades (shouldn't happen).
-    win_return_pct: Option<f64>,
-    /// % return if exited immediately at current bids: `unrealized_pnl /
-    /// total_cost * 100`. `None` for closed trades.
-    exit_return_pct: Option<f64>,
-    /// Current observation snapshot (max / min / current) for open trades,
-    /// same shape as `trade.obs_at_buy`. `None` for closed trades or when
-    /// the upstream observation provider fails.
-    current_obs: Option<ObservationsBlock>,
-}
-
-async fn api_paper_trades(State(state): State<AppState>) -> impl IntoResponse {
-    let mut trades: Vec<PaperTrade> = match tokio::fs::read_to_string(PAPER_TRADES_FILE).await {
-        Ok(s) => s
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str::<PaperTrade>(l).ok())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .user_agent(BROWSER_UA)
-        .build()
-        .unwrap_or_default();
-
-    // Cache Gamma event lookups by slug so we don't fetch the same event
-    // repeatedly when multiple trades reference it.
-    let mut event_cache: std::collections::HashMap<String, Option<serde_json::Value>> =
-        std::collections::HashMap::new();
-    let mut dirty = false;
-
-    // Resolution detection: for each open trade, fetch the event and see if
-    // one of its child markets has resolved (outcomePrices == ["1","0"] →
-    // that market's YES won). If so, flip our trade to "resolved" and compute
-    // realized_pnl. Persist the state change back to disk so we don't repeat work.
-    for t in &mut trades {
-        if t.status != "open" {
-            continue;
-        }
-        let event_opt = if let Some(cached) = event_cache.get(&t.market_slug) {
-            cached.clone()
-        } else {
-            let url = format!("{}/events/slug/{}", state.gamma_url, t.market_slug);
-            let fetched: Option<serde_json::Value> = match http.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-                _ => None,
-            };
-            event_cache.insert(t.market_slug.clone(), fetched.clone());
-            fetched
-        };
-        let Some(event) = event_opt else { continue };
-
-        // Find the winning bracket by scanning child markets for
-        // outcomePrices == ["1","0"] (YES pays $1).
-        let winner_label: Option<String> = event
-            .get("markets")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter().find_map(|m| {
-                    let prices = m
-                        .get("outcomePrices")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())?;
-                    let yes_price: f64 = prices.first()?.parse().ok()?;
-                    if yes_price >= 0.99 {
-                        m.get("groupItemTitle")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-            });
-
-        if let Some(winner) = winner_label {
-            // Resolution detected. Realized = $1 × shares if we held that leg, else 0.
-            let winning_leg_payout: f64 = t
-                .legs
-                .iter()
-                .find(|l| l.bracket_label == winner)
-                .map(|l| l.shares)
-                .unwrap_or(0.0);
-            let realized = winning_leg_payout - t.total_cost;
-            t.status = "resolved".to_string();
-            t.close_sell_revenue = Some(winning_leg_payout);
-            t.realized_pnl = Some(realized);
-            t.closed_at = Some(chrono::Utc::now().to_rfc3339());
-            t.winning_bracket = Some(winner);
-            dirty = true;
-        }
-    }
-
-    // Persist any resolutions we just detected.
-    if dirty {
-        let tmp_path = format!("{}.tmp", PAPER_TRADES_FILE);
-        let mut out = String::new();
-        for t in &trades {
-            if let Ok(s) = serde_json::to_string(t) {
-                out.push_str(&s);
-                out.push('\n');
-            }
-        }
-        if tokio::fs::write(&tmp_path, out).await.is_ok() {
-            let _ = tokio::fs::rename(&tmp_path, PAPER_TRADES_FILE).await;
-        }
-    }
-
-    let mut enriched: Vec<PaperTradeWithPnl> = Vec::new();
-    for t in trades {
-        let mut current_bids: Vec<Option<f64>> = Vec::new();
-        let mut current_sell_revenue = 0.0_f64;
-        let mut current_obs: Option<ObservationsBlock> = None;
-        // Only fetch live bids + observations for open trades — closed/
-        // resolved trades freeze at their close snapshot.
-        if t.status == "open" {
-            for leg in &t.legs {
-                let bid = fetch_best_bid(&http, &state.clob_url, &leg.token_id).await;
-                if let Some(b) = bid {
-                    current_sell_revenue += b * leg.shares;
-                }
-                current_bids.push(bid);
-            }
-            // Reuse the event we already fetched for resolution detection.
-            if let Some(Some(event)) = event_cache.get(&t.market_slug) {
-                current_obs = fetch_obs_for_event_json(
-                    &http,
-                    event,
-                    t.target_date.as_deref(),
-                    &t.unit,
-                )
-                .await;
-            }
-        } else {
-            current_bids = t.legs.iter().map(|_| None).collect();
-        }
-        let unrealized_pnl = current_sell_revenue - t.total_cost;
-        let max_payout_at_resolution = t
-            .legs
-            .iter()
-            .map(|l| l.shares)
-            .fold(0.0_f64, f64::max);
-        let profit_if_any_leg_wins = max_payout_at_resolution - t.total_cost;
-        let loss_if_all_legs_lose = -t.total_cost;
-        let live_status = match t.status.as_str() {
-            "open" if unrealized_pnl > 0.0 => "exit_opportunity".to_string(),
-            other => other.to_string(),
-        };
-        let win_return_pct = if t.total_cost > 0.0 {
-            Some(profit_if_any_leg_wins / t.total_cost * 100.0)
-        } else {
-            None
-        };
-        let exit_return_pct = if t.total_cost > 0.0 && t.status == "open" {
-            Some(unrealized_pnl / t.total_cost * 100.0)
-        } else {
-            None
-        };
-        enriched.push(PaperTradeWithPnl {
-            trade: t,
-            current_bids,
-            current_sell_revenue,
-            unrealized_pnl,
-            max_payout_at_resolution,
-            profit_if_any_leg_wins,
-            loss_if_all_legs_lose,
-            live_status,
-            win_return_pct,
-            exit_return_pct,
-            current_obs,
-        });
-    }
-
-    // Newest first
-    enriched.sort_by(|a, b| b.trade.created_at.cmp(&a.trade.created_at));
-    Json(serde_json::json!({ "trades": enriched }))
-}
 
 // ─── Football 3-way arbitrage scanner ────────────────────────────────────
 //
@@ -8771,7 +9151,7 @@ async fn arb_html() -> Html<String> {
 <body>
   <nav>
     <a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a>
-    <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a>
+    <a href="/observations">Observations</a>
     <a href="/arb" style="font-weight:600">Arb</a>
   </nav>
   <h1>3-Way Arbitrage Scanner <span class="phase-badge">Phase 1+2</span></h1>
@@ -8914,430 +9294,6 @@ setInterval(load, 10000);
 </html>"##.to_string())
 }
 
-async fn paper_trades_html() -> Html<String> {
-    Html(r##"<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Paper trades</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 1em; background: #0d1117; color: #c9d1d9; }
-    h1 { margin: 0 0 0.5em; }
-    nav a { color: #58a6ff; margin-right: 1em; text-decoration: none; }
-    .meta { color: #8b949e; font-size: 0.9em; margin: 0.5em 0 1em; }
-    .trade { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75em 1em; margin-bottom: 1em; }
-    .trade-title { font-weight: 600; font-size: 1.02em; }
-    .trade-sub { color: #8b949e; font-size: 0.85em; margin: 0.3em 0; }
-    table { border-collapse: collapse; width: 100%; font-size: 0.9em; margin-top: 0.5em; }
-    th, td { padding: 0.3em 0.5em; text-align: right; border-bottom: 1px solid #21262d; }
-    th { color: #8b949e; font-weight: normal; }
-    th:first-child, td:first-child { text-align: left; }
-    .pnl-pos { color: #7ee2a8; }
-    .pnl-neg { color: #ffa198; }
-    .regime-badge { background: #1f2933; color: #8b949e; padding: 0.1em 0.4em; border-radius: 3px; font-size: 0.75em; }
-  </style>
-</head>
-<body>
-  <!-- Per-leg sell modal. Same flow as /trades Open Positions Sell:
-       fetch preview at 90%-of-bid floor, let user tighten/loosen the
-       floor, then POST /api/sell with token_id override. -->
-  <div id="sell-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center">
-    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1.5em;max-width:620px;width:92%;max-height:90vh;overflow-y:auto">
-      <div id="sell-modal-body"></div>
-    </div>
-  </div>
-  <nav><a href="/">Markets</a> <a href="/trades">Trades</a> <a href="/weather">Weather</a> <a href="/observations">Observations</a> <a href="/paper-trades">Paper Trades</a> <a href="/arb">Arb</a></nav>
-  <h1>Paper Trades</h1>
-  <div class="meta" id="meta">Loading…</div>
-  <div id="last-updated" style="color:#8b949e; font-size:0.85em; margin-bottom:0.75em"></div>
-  <div id="trades"></div>
-<script>
-let lastFetch = null;
-
-async function load() {
-  const r = await fetch('/api/paper-trades');
-  const d = await r.json();
-  lastFetch = Date.now();
-  const meta = document.getElementById('meta');
-  const el = document.getElementById('trades');
-  const trades = d.trades || [];
-  const totalCost = trades.reduce((s,t) => s + t.total_cost, 0);
-  const totalPnl = trades.reduce((s,t) => s + t.unrealized_pnl, 0);
-  const exitOpps = trades.filter(t => t.live_status === 'exit_opportunity').length;
-  const pnlClass = totalPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-  const sign = totalPnl >= 0 ? '+' : '';
-
-  let exitBadge = '';
-  if (exitOpps > 0) {
-    exitBadge = ` · <span style="background:#238636;color:white;padding:0.1em 0.5em;border-radius:3px;font-weight:600">${exitOpps} EXIT OPPORTUNITY${exitOpps>1?'s':''}</span>`;
-  }
-
-  meta.innerHTML = trades.length === 0
-    ? 'No paper trades yet. Select brackets on the <a href="/weather" style="color:#58a6ff">Weather tab</a> to create one.'
-    : `${trades.length} trade${trades.length>1?'s':''} · total cost $${totalCost.toFixed(2)} · <span class="${pnlClass}">sell-now P&amp;L ${sign}$${totalPnl.toFixed(2)}</span>${exitBadge}`;
-
-  el.innerHTML = trades.map(t => {
-    const pnlClass = t.unrealized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-    const sign = t.unrealized_pnl >= 0 ? '+' : '';
-    const exitBanner = t.live_status === 'exit_opportunity'
-      ? `<div style="background:#238636;color:white;padding:0.4em 0.8em;border-radius:4px;margin-bottom:0.5em;font-weight:600">
-          ⚡ EXIT NOW — locked profit if you sell at current bids: +$${t.unrealized_pnl.toFixed(2)}
-         </div>`
-      : '';
-
-    const legsHtml = t.legs.map((leg, i) => {
-      const bid = t.current_bids[i];
-      const bidStr = bid == null ? '—' : `$${bid.toFixed(3)}`;
-      const leg_revenue = bid == null ? 0 : bid * leg.shares;
-      const leg_cost = leg.ask_at_buy * leg.shares;
-      const legPnl = leg_revenue - leg_cost;
-      const legSign = legPnl >= 0 ? '+' : '';
-      const legCls = legPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const probStr = leg.model_prob_at_buy != null ? `${(leg.model_prob_at_buy*100).toFixed(1)}%` : '—';
-      // Per-leg Sell button — only for live open trades with a bid on
-      // this leg. Uses the same sell modal as Open Positions (with the
-      // 90%-of-best-bid floor + slippage input). Routes through
-      // /api/sell with token_id override so no market lookup needed.
-      const legSellBtn = (t.mode === 'live' && t.status === 'open' && leg.shares > 0)
-        ? `<button class="sell-btn" style="padding:0.15em 0.5em;font-size:0.8em" onclick="sellLeg('${leg.token_id}',${JSON.stringify(leg.bracket_label).replace(/"/g,'&quot;')},${JSON.stringify(t.market_question).replace(/"/g,'&quot;')},'${leg.shares}')">Sell</button>`
-        : '';
-      return `<tr>
-        <td>${leg.bracket_label}</td>
-        <td>${leg.shares}</td>
-        <td>$${leg.ask_at_buy.toFixed(3)}</td>
-        <td>${probStr}</td>
-        <td>$${leg_cost.toFixed(2)}</td>
-        <td>${bidStr}</td>
-        <td class="${legCls}">${legSign}$${legPnl.toFixed(2)}</td>
-        <td>${legSellBtn}</td>
-      </tr>`;
-    }).join('');
-    const modelProb = t.model_win_prob_at_buy != null ? `${(t.model_win_prob_at_buy*100).toFixed(1)}%` : '—';
-    const created = new Date(t.created_at).toLocaleString();
-    const profitIfWin = t.profit_if_any_leg_wins;
-    const lossIfLose = t.loss_if_all_legs_lose;
-    const cardBorder = t.live_status === 'exit_opportunity'
-      ? 'border:2px solid #2ea043'
-      : 'border:1px solid #30363d';
-
-    // Lifecycle state and buttons.
-    const isOpen = t.status === 'open';
-    const statusBadge = t.status === 'open' ? ''
-      : t.status === 'closed_manual'
-        ? `<span style="background:#30363d;color:#c9d1d9;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">CLOSED MANUALLY</span>`
-        : t.status === 'resolved'
-          ? `<span style="background:#1a4d2e;color:#7ee2a8;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">RESOLVED</span>`
-          : `<span style="background:#30363d;color:#c9d1d9;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">${t.status.toUpperCase()}</span>`;
-
-    // When closed, show realized P&L + close timestamp instead of live sell-now.
-    let closedBlock = '';
-    if (!isOpen) {
-      const rp = t.realized_pnl;
-      const rpCls = rp != null && rp >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const rpSign = rp != null && rp >= 0 ? '+' : '';
-      const rpStr = rp != null ? `${rpSign}$${rp.toFixed(2)}` : '—';
-      const csr = t.close_sell_revenue != null ? `$${t.close_sell_revenue.toFixed(2)}` : '—';
-      const winnerStr = t.winning_bracket ? ` · winner <b>${t.winning_bracket}</b>` : '';
-      const closedAt = t.closed_at ? new Date(t.closed_at).toLocaleString() : '—';
-      closedBlock = `<div style="background:#0d2818;color:#c9d1d9;padding:0.4em 0.8em;border-radius:4px;margin-bottom:0.5em;font-size:0.9em">
-        Closed at ${closedAt}${winnerStr} · exit revenue ${csr} · realized P&amp;L <b class="${rpCls}">${rpStr}</b>
-      </div>`;
-    }
-
-    const closeBtn = isOpen
-      ? `<button onclick="closeTrade('${t.id}','${t.mode}')" style="background:${t.mode === 'live' ? '#d97706' : '#21262d'};color:${t.mode === 'live' ? '#fff' : '#c9d1d9'};border:1px solid ${t.mode === 'live' ? '#f59e0b' : '#30363d'};padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">${t.mode === 'live' ? 'Close (sell legs on CLOB)' : 'Close (snapshot at current bids)'}</button>`
-      : '';
-
-    // Reopen button: visible for trades that were marked closed but
-    // whose on-chain legs are likely still held (the old Close path
-    // snapshotted without selling). Flips status back to "open" so
-    // the now-correct Close button can actually sell them.
-    const reopenBtn = (t.mode === 'live' && (t.status === 'closed_manual' || t.status === 'sold_partial'))
-      ? `<button onclick="reopenTrade('${t.id}')" style="background:#58a6ff;color:#fff;border:1px solid #1f6feb;padding:0.3em 0.8em;border-radius:4px;cursor:pointer;font-size:0.85em;margin-left:auto">Reopen (legs may still be live)</button>`
-      : '';
-
-    const modeTag = (t.mode === 'live')
-      ? `<span style="background:#da3633;color:white;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em;font-weight:600">LIVE</span>`
-      : `<span style="background:#1f2933;color:#8b949e;padding:0.1em 0.4em;border-radius:3px;font-size:0.75em">PAPER</span>`;
-
-    // Observations block. `obs_at_buy` is frozen at trade creation, so
-    // it's present on any trade that saved after the feature shipped;
-    // `current_obs` is the live reading fetched on this page load.
-    const unitSym = (t.unit || '').includes('F') ? '°F' : '°C';
-    const fmtObs = (o) => o == null
-      ? '—'
-      : `max <b>${o.max_so_far.toFixed(1)}${unitSym}</b> · min <b>${o.min_so_far.toFixed(1)}${unitSym}</b> · now <b>${o.current.toFixed(1)}${unitSym}</b>`;
-    const hasAnyObs = t.obs_at_buy != null || t.current_obs != null;
-    const obsBlock = !hasAnyObs ? '' : `
-      <div style="display:flex;gap:2em;font-size:0.85em;margin:0.4em 0;flex-wrap:wrap;color:#8b949e">
-        ${t.obs_at_buy != null ? `<div>At buy: ${fmtObs(t.obs_at_buy)}</div>` : ''}
-        ${isOpen && t.current_obs != null ? `<div>Now: ${fmtObs(t.current_obs)}</div>` : ''}
-      </div>`;
-
-    // % return line. Win% always shown; Exit% only when open.
-    const winPct = t.win_return_pct;
-    const exitPct = t.exit_return_pct;
-    const exitCls = (exitPct != null && exitPct >= 0) ? 'pnl-pos' : 'pnl-neg';
-    const exitSign = (exitPct != null && exitPct >= 0) ? '+' : '';
-    const pctLine = `
-      <div style="display:flex;gap:2em;font-size:0.9em;margin:0.4em 0;flex-wrap:wrap">
-        ${winPct != null ? `<div>Win return: <b class="pnl-pos">+${winPct.toFixed(1)}%</b></div>` : ''}
-        ${isOpen && exitPct != null ? `<div>Sell-now return: <b class="${exitCls}">${exitSign}${exitPct.toFixed(1)}%</b></div>` : ''}
-      </div>`;
-
-    return `<div class="trade" style="${cardBorder}${!isOpen ? ';opacity:0.75' : ''}">
-      <div class="trade-title" style="display:flex;align-items:center;gap:0.5em">
-        <span>${t.market_question}</span>
-        ${modeTag}
-        <span class="regime-badge">${t.regime}</span>
-        ${statusBadge}
-        ${closeBtn}
-        ${reopenBtn}
-      </div>
-      <div class="trade-sub">Entered ${created} · Model P(win at entry) ${modelProb}</div>
-      ${closedBlock}
-      ${isOpen ? exitBanner : ''}
-      ${obsBlock}
-      <div style="display:flex;gap:2em;font-size:0.9em;margin:0.5em 0;flex-wrap:wrap">
-        <div>Cost: <b>$${t.total_cost.toFixed(2)}</b></div>
-        <div>Max payout (any leg wins): <b>$${t.max_payout_at_resolution.toFixed(2)}</b></div>
-        <div>Profit if any wins: <b class="pnl-pos">+$${profitIfWin.toFixed(2)}</b></div>
-        <div>Loss if all lose: <b class="pnl-neg">$${lossIfLose.toFixed(2)}</b></div>
-        ${isOpen ? `<div>Sell-now revenue: <b>$${t.current_sell_revenue.toFixed(2)}</b></div>
-        <div>Sell-now P&amp;L: <b class="${pnlClass}">${sign}$${t.unrealized_pnl.toFixed(2)}</b></div>` : ''}
-      </div>
-      ${pctLine}
-      <table>
-        <tr><th>Bracket</th><th>Shares</th><th>Ask at buy</th><th>Model P</th><th>Leg cost</th><th>Current bid</th><th>Leg sell-now P&amp;L</th></tr>
-        ${legsHtml}
-      </table>
-    </div>`;
-  }).join('');
-
-  tickAge();
-}
-
-function tickAge() {
-  if (!lastFetch) return;
-  const s = Math.round((Date.now() - lastFetch) / 1000);
-  document.getElementById('last-updated').textContent = `updated ${s}s ago · auto-refresh every 15s`;
-}
-
-async function reopenTrade(id) {
-  if (!confirm('Reopen this trade? Flips it back to "open" so you can retry the Close flow (which now actually places sell orders on the CLOB for live legs). No orders are placed by this action itself — it just restores the trade to the open list.')) return;
-  try {
-    const r = await fetch('/api/paper-trade/reopen', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({id}),
-    });
-    const j = await r.json();
-    if (j.reopened) {
-      await load();
-    } else {
-      alert(`Reopen failed: ${j.error || 'unknown'}`);
-    }
-  } catch (e) {
-    alert(`Reopen failed: ${e}`);
-  }
-}
-
-async function closeTrade(id, mode) {
-  const msg = mode === 'live'
-    ? '⚠️ This will place REAL sell orders for every held leg of this trade at the current best bid. Proceed?'
-    : 'Close this paper trade at current bids? This snapshots the exit P&L and marks it closed.';
-  if (!confirm(msg)) return;
-  try {
-    const r = await fetch('/api/paper-trade/close', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({id}),
-    });
-    const j = await r.json();
-    if (j.closed) {
-      if (j.mode === 'live') {
-        // Show per-leg breakdown so the user sees which legs actually sold.
-        const legs = (j.per_leg || []).map(l => {
-          if (l.order_id) return `✓ ${l.leg}: sold ${l.shares} @ ${l.limit} (order ${l.order_id})`;
-          if (l.skipped) return `⊘ ${l.leg}: skipped — ${l.skipped}`;
-          if (l.error) return `✗ ${l.leg}: ${l.error}`;
-          return `? ${l.leg}`;
-        }).join('\n');
-        alert(
-          `Close status: ${j.status}\n` +
-          `Exit revenue: $${j.exit_revenue.toFixed(4)}\n` +
-          `Realized P&L: $${(j.realized_pnl ?? 0).toFixed ? (j.realized_pnl).toFixed(4) : j.realized_pnl}\n\n` +
-          `Per-leg:\n${legs}`
-        );
-      }
-      await load();
-    } else {
-      alert(`Close failed: ${j.error || 'unknown'}`);
-    }
-  } catch (e) {
-    alert(`Close failed: ${e}`);
-  }
-}
-
-// ─── Per-leg Sell (shared modal with /trades Open Positions) ────────────
-// Same server path — POST /api/sell-preview then /api/sell — but we pass
-// `token_id` + `label` directly so the server skips the condition_id
-// → outcome → market_id lookup (the paper-trade record already has the
-// exact token we want to sell).
-async function sellLeg(tokenId, label, market, heldShares) {
-  await refreshSellLegPreview(tokenId, label, market, heldShares, null);
-}
-
-async function refreshSellLegPreview(tokenId, label, market, heldShares, minPriceOverride) {
-  const body = {
-    condition_id: '',
-    token_id: tokenId,
-    outcome: label,
-    label: label,
-    market: market,
-    shares: String(heldShares),
-  };
-  if (minPriceOverride != null) body.min_price = String(minPriceOverride);
-  const resp = await fetch('/api/sell-preview', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-  const p = await resp.json();
-  if (p.error) { alert('Preview failed: ' + p.error); return; }
-  showSellLegModal(tokenId, label, market, heldShares, p);
-}
-
-function showSellLegModal(tokenId, label, market, heldShares, p) {
-  const modal = document.getElementById('sell-modal');
-  const body = document.getElementById('sell-modal-body');
-
-  const requested = parseFloat(p.requested_shares) || 0;
-  const fillable = parseFloat(p.fillable_shares) || 0;
-  const gross = parseFloat(p.gross_revenue) || 0;
-  const avgPx = parseFloat(p.avg_fill_price) || 0;
-  const bestBid = p.best_bid != null ? parseFloat(p.best_bid) : null;
-  const minPrice = parseFloat(p.min_price_used) || 0;
-  const partial = fillable < requested;
-  const dry = fillable <= 0;
-  const limitFloor = minPrice;
-
-  const slippagePct = bestBid && bestBid > 0
-    ? ((1 - (limitFloor / bestBid)) * 100).toFixed(1)
-    : '—';
-
-  const warn = dry
-    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids ≥ $${limitFloor.toFixed(4)} — book too thin to sell at floor. Lower the floor at your own risk.</div>`
-    : partial
-    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial fill: only ${fillable.toFixed(2)} of ${requested.toFixed(2)} shares clear the floor. The rest would require selling below $${limitFloor.toFixed(4)}.</div>`
-    : '';
-
-  const execBtn = dry
-    ? `<button disabled style="padding:0.3em 0.8em;border-radius:4px;background:#30363d;color:#8b949e;border:1px solid #30363d;opacity:0.5;cursor:not-allowed">Execute sell</button>`
-    : `<button style="padding:0.3em 0.8em;border-radius:4px;background:#d97706;color:#fff;border:1px solid #f59e0b;cursor:pointer;font-weight:600" onclick="executeSellLeg('${tokenId}',${JSON.stringify(label).replace(/"/g,'&quot;')},${JSON.stringify(market).replace(/"/g,'&quot;')},'${fillable}','${limitFloor}')">Execute sell</button>`;
-
-  body.innerHTML = `
-    <div style="margin-bottom:1em">
-      <div style="font-size:1.05em">${market}</div>
-      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">
-        Sell leg <b>${label}</b> · held <b>${heldShares}</b> shares
-      </div>
-    </div>
-    <div style="border:1px solid #30363d;border-radius:6px;padding:1em;font-family:monospace;font-size:0.9em;line-height:1.7em">
-      <div>Best bid: <b>${bestBid != null ? '$' + bestBid.toFixed(3) : '—'}</b></div>
-      <div style="background:#1f2d3d;padding:0.4em 0.6em;border-radius:3px;margin:0.3em 0">
-        <span style="color:#c9d1d9">Minimum price floor: </span>
-        <input id="sell-floor-input" type="number" min="0.01" max="0.99" step="0.01"
-               value="${limitFloor.toFixed(2)}"
-               style="width:5em;padding:0.2em 0.3em;background:#0d1117;color:#58a6ff;border:1px solid #30363d;border-radius:3px;font-family:inherit;font-weight:600">
-        <button style="padding:0.15em 0.5em;margin-left:0.3em;font-size:0.8em;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:3px;cursor:pointer"
-                onclick="applySellLegFloor('${tokenId}',${JSON.stringify(label).replace(/"/g,'&quot;')},${JSON.stringify(market).replace(/"/g,'&quot;')},'${heldShares}')">Apply</button>
-        <span style="color:#8b949e;font-size:0.8em"> — slippage from best bid: ${slippagePct}%</span>
-      </div>
-      <div>Fillable at floor: <b>${fillable.toFixed(2)}</b> / ${requested.toFixed(2)} shares</div>
-      <div>Avg fill price (on walk): <b>$${avgPx.toFixed(4)}</b></div>
-      <div>Gross revenue: <b>$${gross.toFixed(4)}</b></div>
-      <div style="color:#8b949e;font-size:0.8em;margin-top:0.4em">
-        CLOB limit = floor. Matcher fills best-first and stops if it
-        would need to match below the floor — so you never sell below
-        $${limitFloor.toFixed(4)} even if the book moves.
-      </div>
-    </div>
-    ${warn}
-    <div style="margin-top:1em;display:flex;gap:0.5em;justify-content:flex-end">
-      <button style="padding:0.3em 0.8em;border-radius:4px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;cursor:pointer" onclick="closeSellLegModal()">Cancel</button>
-      ${execBtn}
-    </div>
-  `;
-  modal.style.display = 'flex';
-}
-
-function applySellLegFloor(tokenId, label, market, heldShares) {
-  const el = document.getElementById('sell-floor-input');
-  if (!el) return;
-  const v = parseFloat(el.value);
-  if (!Number.isFinite(v) || v <= 0 || v >= 1) {
-    alert('Floor must be between 0.01 and 0.99');
-    return;
-  }
-  refreshSellLegPreview(tokenId, label, market, heldShares, v);
-}
-
-function closeSellLegModal() {
-  const modal = document.getElementById('sell-modal');
-  if (modal) modal.style.display = 'none';
-}
-
-async function executeSellLeg(tokenId, label, market, shares, minPrice) {
-  closeSellLegModal();
-  try {
-    const resp = await fetch('/api/sell', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        condition_id: '',
-        token_id: tokenId,
-        outcome: label,
-        label: label,
-        market: market,
-        shares: String(shares),
-        min_price: String(minPrice),
-      }),
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      const e = data.entry;
-      const filled = parseFloat(data.filled_shares) || 0;
-      const rev = parseFloat(data.gross_revenue) || 0;
-      alert(
-        `${e.strategy} OK\n` +
-        `Filled ${filled.toFixed(2)} ${label} shares\n` +
-        `Gross revenue: $${rev.toFixed(4)}\n` +
-        `Avg price: $${parseFloat(data.avg_price).toFixed(4)}\n\n` +
-        `${e.status}`
-      );
-      await load();
-    } else {
-      alert('Sell failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
-    }
-  } catch (err) {
-    alert('Request failed: ' + err);
-  }
-}
-
-load();
-// Skip auto-refresh while the sell modal is open so we don't wipe an
-// in-progress confirmation.
-setInterval(() => {
-  const m = document.getElementById('sell-modal');
-  if (m && m.style.display !== 'none') return;
-  load();
-}, 15000);
-setInterval(tickAge, 1000);
-</script>
-</body>
-</html>"##.to_string())
-}
 
 // ─── HTML Dashboard ──────────────────────────────────────────────────────────
 
@@ -9351,6 +9307,11 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
     };
     let stats = compute_stats(&activity_snap, state.matic_usd_price);
     let positions = compute_open_positions(&state).await;
+    let archived_positions = compute_archived_positions(&state).await;
+    // CLOB truth: active limit orders + recent settled fills. Both are
+    // best-effort — empty Vec when CLOB credentials are absent (paper mode).
+    let active_orders = fetch_active_orders(&state).await;
+    let recent_fills = fetch_recent_fills(&state).await;
 
     // Stats panel
     let stats_html = format!(
@@ -9396,6 +9357,42 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
         },
         positions = positions.len(),
     );
+
+    // Archived positions table — locally dismissed rows. Tokens are still
+    // held on-chain; Unarchive flips them back into Open Positions so the
+    // standard Merge/Redeem buttons reappear.
+    let archived_rows: String = if archived_positions.is_empty() {
+        String::new()
+    } else {
+        archived_positions
+            .iter()
+            .map(|a| {
+                let pnl_color = if a.archived_pnl < Decimal::ZERO {
+                    "#e74c3c"
+                } else if a.archived_pnl > Decimal::ZERO {
+                    "#2ecc71"
+                } else {
+                    "#8b949e"
+                };
+                let market_esc = a.market.replace('\'', "\\'");
+                format!(
+                    r#"<tr>
+                      <td class="pos-market-cell" title="{cid}">{market}</td>
+                      <td style="color:{pnl_color}">${pnl:.4}</td>
+                      <td style="color:#8b949e">{date} {time}</td>
+                      <td><button class="action-btn" onclick="unarchivePosition('{cid}','{market_esc}','{pnl}')">Unarchive</button></td>
+                    </tr>"#,
+                    cid = a.condition_id,
+                    market = a.market,
+                    market_esc = market_esc,
+                    pnl_color = pnl_color,
+                    pnl = a.archived_pnl,
+                    date = a.archived_date,
+                    time = a.archived_at,
+                )
+            })
+            .collect()
+    };
 
     // Positions table — sourced from the Polymarket Data API so it reflects
     // ALL holdings (CLOB buys + mints + neg-risk markets), not just locally
@@ -9457,6 +9454,20 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
             } else {
                 String::new()
             };
+
+            // Archive: dismiss the row without paying gas. Always exposed —
+            // styled red on resolved+!redeemable (the obvious losing case)
+            // and grey otherwise. The handler reconciles realized P&L into
+            // stats using the Data API's cash_pnl as the source of truth.
+            let archive_is_loss = !p.redeemable && p.resolution != "unresolved";
+            let archive_btn = format!(
+                r#"<button class="action-btn archive-btn{loss_cls}" onclick="archivePosition('{cid}','{market}','{pnl}','{value}')" title="Dismiss this row from Open Positions and record the realized P&amp;L in the activity log. No on-chain redeem.">Archive</button>"#,
+                loss_cls = if archive_is_loss { " archive-loss" } else { "" },
+                cid = p.condition_id,
+                market = sell_market_esc,
+                pnl = p.cash_pnl,
+                value = p.current_value,
+            );
 
             // Resolution status badge
             let (res_label, res_color) = match p.resolution.as_str() {
@@ -9526,7 +9537,7 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                   {pnl_pct_cell}
                   <td><span style="color:{rcol}">{rlabel}</span></td>
                   <td>{tl}</td>
-                  <td>{merge}{sep}{redeem}{sell_sep}{sell_yes}{sell_between}{sell_no}</td>
+                  <td>{merge}{sep}{redeem}{sell_sep}{sell_yes}{sell_between}{sell_no} {archive}</td>
                 </tr>"#,
                 row_style = row_style,
                 cid = p.condition_id,
@@ -9548,16 +9559,180 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
                 sell_yes = sell_yes_btn,
                 sell_between = if !sell_yes_btn.is_empty() && !sell_no_btn.is_empty() { " " } else { "" },
                 sell_no = sell_no_btn,
+                archive = archive_btn,
             )
         }).collect()
     };
 
-    // Activity log table
-    let matic_usd = state.matic_usd_price;
-    let activity_rows: String = if activity_snap.is_empty() {
-        r#"<tr><td colspan="12" style="text-align:center;color:#666">No activity yet</td></tr>"#.to_string()
+    // ── Active Orders table (CLOB resting / partially-filled) ───────────
+    let active_orders_rows: String = if active_orders.is_empty() {
+        r#"<tr><td colspan="9" style="text-align:center;color:#666">No active orders on the book</td></tr>"#.to_string()
     } else {
-        activity_snap.iter().rev().take(100).map(|a| {
+        active_orders.iter().map(|o| {
+            let market_label = if !o.market_title.is_empty() {
+                o.market_title.clone()
+            } else if !o.market.is_empty() {
+                format!("{}…", &o.market[..o.market.len().min(14)])
+            } else {
+                String::from("—")
+            };
+            let asset_short = if o.asset_id.len() > 14 {
+                format!("{}…", &o.asset_id[..14])
+            } else {
+                o.asset_id.clone()
+            };
+            let original = Decimal::from_str(&o.original_size).unwrap_or(Decimal::ZERO);
+            let matched = Decimal::from_str(&o.size_matched).unwrap_or(Decimal::ZERO);
+            let remaining = (original - matched).max(Decimal::ZERO);
+            let pct = if original > Decimal::ZERO {
+                ((matched * Decimal::ONE_HUNDRED) / original).round_dp(1)
+            } else {
+                Decimal::ZERO
+            };
+            let side_color = if o.side.eq_ignore_ascii_case("BUY") {
+                "#2ecc71"
+            } else {
+                "#e74c3c"
+            };
+            let status_color = if o.status.eq_ignore_ascii_case("LIVE") {
+                "#58a6ff"
+            } else {
+                "#8b949e"
+            };
+            // CLOB returns created_at as unix seconds. Render as "Xm ago" /
+            // "Xh ago" — best-effort, falls back to raw value if it doesn't
+            // parse cleanly.
+            let age_label = match o.created_at.parse::<i64>() {
+                Ok(ts) if ts > 0 => {
+                    let now = chrono::Utc::now().timestamp();
+                    let secs = (now - ts).max(0);
+                    if secs < 60 { format!("{}s ago", secs) }
+                    else if secs < 3600 { format!("{}m ago", secs / 60) }
+                    else if secs < 86400 { format!("{}h ago", secs / 3600) }
+                    else { format!("{}d ago", secs / 86400) }
+                }
+                _ => o.created_at.clone(),
+            };
+            let cancel_btn = format!(
+                r#"<button class="action-btn cancel-btn" onclick="cancelOrder('{}')">Cancel</button>"#,
+                o.id,
+            );
+            format!(
+                r#"<tr>
+                  <td class="pos-market-cell" title="market={market_full} asset={asset_full}">{market} <span style="color:#666;font-size:0.75em">[{asset_short}]</span></td>
+                  <td style="color:{side_color};font-weight:bold">{side}</td>
+                  <td>${price}</td>
+                  <td>{original:.2}</td>
+                  <td>{matched:.2}</td>
+                  <td>{remaining:.2}</td>
+                  <td style="color:#8b949e">{pct:.1}%</td>
+                  <td style="color:{status_color}">{status}</td>
+                  <td>{age}</td>
+                  <td>{cancel}</td>
+                </tr>"#,
+                market_full = o.market, asset_full = o.asset_id,
+                market = market_label, asset_short = asset_short,
+                side_color = side_color, side = o.side,
+                price = o.price,
+                original = original, matched = matched, remaining = remaining,
+                pct = pct,
+                status_color = status_color, status = o.status,
+                age = age_label,
+                cancel = cancel_btn,
+            )
+        }).collect::<String>()
+    };
+
+    // ── Recent Fills table (CLOB /data/trades) ──────────────────────────
+    let recent_fills_rows: String = if recent_fills.is_empty() {
+        r#"<tr><td colspan="8" style="text-align:center;color:#666">No fills in the wallet's recent history</td></tr>"#.to_string()
+    } else {
+        recent_fills.iter().take(50).map(|f| {
+            let market_label = if !f.market_title.is_empty() {
+                f.market_title.clone()
+            } else if !f.market.is_empty() {
+                format!("{}…", &f.market[..f.market.len().min(14)])
+            } else {
+                String::from("—")
+            };
+            let side_color = if f.side.eq_ignore_ascii_case("BUY") {
+                "#2ecc71"
+            } else {
+                "#e74c3c"
+            };
+            // match_time → "Xm ago" or absolute time
+            let when_label = match f.match_time.parse::<i64>() {
+                Ok(ts) if ts > 0 => {
+                    let dt = chrono::DateTime::<Utc>::from_timestamp(ts, 0)
+                        .unwrap_or_else(|| chrono::Utc::now());
+                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                }
+                _ => f.match_time.clone(),
+            };
+            let tx_cell = if !f.transaction_hash.is_empty() {
+                let short = if f.transaction_hash.len() > 14 {
+                    format!("{}…", &f.transaction_hash[..14])
+                } else {
+                    f.transaction_hash.clone()
+                };
+                format!(
+                    r#"<a href="https://polygonscan.com/tx/{}" target="_blank" style="color:#58a6ff" title="{}">{}</a>"#,
+                    f.transaction_hash, f.transaction_hash, short,
+                )
+            } else {
+                String::from("—")
+            };
+            let trader_label = if f.trader_side.is_empty() { "—" } else { f.trader_side.as_str() };
+            format!(
+                r#"<tr>
+                  <td>{when}</td>
+                  <td class="pos-market-cell" title="market={market_full} asset={asset_full}">{market}</td>
+                  <td style="color:{side_color};font-weight:bold">{side}</td>
+                  <td>${price}</td>
+                  <td>{size}</td>
+                  <td>${notional}</td>
+                  <td style="color:#8b949e">{trader}</td>
+                  <td>{tx}</td>
+                </tr>"#,
+                market_full = f.market, asset_full = f.asset_id,
+                when = when_label,
+                market = market_label,
+                side_color = side_color, side = f.side,
+                price = f.price,
+                size = f.size,
+                notional = f.notional,
+                trader = trader_label,
+                tx = tx_cell,
+            )
+        }).collect::<String>()
+    };
+
+    // Activity log table — RESTRICTED to on-chain admin entries only.
+    // BUY/SELL/MINT/HOOVER fills are visible in the Recent Fills section
+    // (CLOB truth). The activity log is now the on-chain-action audit
+    // trail: REDEEM, MERGE, ARCHIVE-LOSS, UNARCHIVE-RESTORE, and the
+    // legacy MINT entries (which represent a real on-chain split tx
+    // even when bundled with sell/buy phases).
+    let matic_usd = state.matic_usd_price;
+    let admin_strategies: &[&str] = &[
+        "REDEEM",
+        "REDEEM-NEG-RISK",
+        "MERGE",
+        "ARCHIVE-LOSS",
+        "UNARCHIVE-RESTORE",
+        "MINT+SELL",
+        "MINT+SELL+BUY",
+    ];
+    let admin_entries: Vec<&ActivityEntry> = activity_snap
+        .iter()
+        .rev()
+        .filter(|a| admin_strategies.contains(&a.strategy.as_str()))
+        .take(100)
+        .collect();
+    let activity_rows: String = if admin_entries.is_empty() {
+        r#"<tr><td colspan="12" style="text-align:center;color:#666">No on-chain admin activity yet (REDEEM / MERGE / ARCHIVE / MINT). BUY/SELL fills are in the Recent Fills section above.</td></tr>"#.to_string()
+    } else {
+        admin_entries.into_iter().map(|a| {
             let status_color = if a.status.contains("OK") {
                 "#2ecc71"
             } else if a.status.contains("PAPER") {
@@ -9713,6 +9888,12 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
   .search-box:focus {{ border-color: #58a6ff; }}
   .sell-btn {{ background: #d97706; border-color: #f59e0b; color: #fff; }}
   .sell-btn:hover {{ background: #f59e0b; }}
+  .archive-btn {{ background: #21262d; border-color: #484f58; color: #8b949e; }}
+  .archive-btn:hover {{ background: #30363d; color: #c9d1d9; }}
+  .archive-btn.archive-loss {{ background: #4a1818; border-color: #c0392b; color: #f5b7b1; }}
+  .archive-btn.archive-loss:hover {{ background: #6b1f1f; color: #fff; }}
+  .cancel-btn {{ background: #4a1818; border-color: #c0392b; color: #f5b7b1; }}
+  .cancel-btn:hover {{ background: #6b1f1f; color: #fff; }}
 </style>
 </head><body>
 <!-- Sell-position picker. Shown after the user clicks "Sell YES" or
@@ -9730,7 +9911,6 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
   <a href="/trades" class="active">Trades</a>
   <a href="/weather">Weather</a>
   <a href="/observations">Observations</a>
-  <a href="/paper-trades">Paper Trades</a>
   <a href="/arb">Arb</a>
 </div>
 
@@ -9743,6 +9923,18 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
 <table>
   <tr><th>Market</th><th>Type</th><th>YES</th><th>NO</th><th>Value</th><th>P&amp;L</th><th title="cash_pnl / (avg_price × shares) × 100">P&amp;L %</th><th>Resolution</th><th>Time Left</th><th>Actions</th></tr>
   {positions_rows}
+</table>
+
+<h2>Active Orders <span style="color:#666;font-size:0.8em">(CLOB /orders — resting limits, partial fills)</span></h2>
+<table>
+  <tr><th>Market</th><th>Side</th><th>Price</th><th>Size</th><th>Filled</th><th>Remaining</th><th>%</th><th>Status</th><th>Age</th><th>Actions</th></tr>
+  {active_orders_rows}
+</table>
+
+<h2>Recent Fills <span style="color:#666;font-size:0.8em">(CLOB /data/trades — last 50 settled matches)</span></h2>
+<table>
+  <tr><th>When</th><th>Market</th><th>Side</th><th>Price</th><th>Size</th><th>Notional</th><th>Role</th><th>Tx</th></tr>
+  {recent_fills_rows}
 </table>
 
 <h2>Manual Recovery</h2>
@@ -9761,6 +9953,8 @@ async fn trades_html(State(state): State<AppState>) -> Html<String> {
   <tr><th>When</th><th>Market</th><th>Outcome</th><th>Strategy</th><th>Shares</th><th>Buy Cost</th><th>Sell/Mint</th><th>Net Profit</th><th title="(net_profit − gas_usdc) / (buy_cost + mint_cost) × 100">Net % <span style="color:#8b949e;font-weight:normal">(after gas)</span></th><th>Gas</th><th>Status</th><th>Actions</th></tr>
   {activity_rows}
 </table>
+
+{archived_section}
 
 <script>
 async function recoverPosition(conditionId, amount, market, action) {{
@@ -9814,6 +10008,86 @@ async function recoverNegRisk(conditionId, yesAmount, noAmount, market) {{
     }} else {{
       alert('REDEEM (neg-risk) failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
       if (data.entry) location.reload();
+    }}
+  }} catch (e) {{
+    alert('Request failed: ' + e);
+  }}
+}}
+
+// Reverse a prior archive. Appends an UNARCHIVE-RESTORE entry that
+// offsets the archived adjustment, so realized P&L returns to its
+// pre-archive value and the position re-appears in Open Positions
+// (with Merge/Redeem buttons available again).
+async function unarchivePosition(conditionId, market, archivedPnl) {{
+  const pnl = parseFloat(archivedPnl) || 0;
+  const desc = `Unarchive "${{market}}"?\n\nReverses the archive: the position re-appears in Open Positions and the prior P&L adjustment of ${{pnl.toFixed(4)}} is rolled back from stats. No on-chain action.`;
+  if (!confirm(desc)) return;
+  try {{
+    const resp = await fetch('/api/unarchive-position', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ condition_id: conditionId }}),
+    }});
+    const data = await resp.json();
+    if (data.ok) {{
+      location.reload();
+    }} else {{
+      alert('Unarchive failed: ' + (data.error || 'unknown'));
+    }}
+  }} catch (e) {{
+    alert('Request failed: ' + e);
+  }}
+}}
+
+// Cancel a resting / partially-filled CLOB order. Hits /api/cancel-order
+// which calls api.cancel_order(). The CLOB rejects cancels for orders
+// that have already fully matched, so a 4xx here usually means the order
+// just settled — refresh shows it gone from active.
+async function cancelOrder(orderId) {{
+  if (!confirm('Cancel order ' + orderId.slice(0, 14) + '… ?')) return;
+  try {{
+    const resp = await fetch('/api/cancel-order', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ order_id: orderId }}),
+    }});
+    const data = await resp.json();
+    if (data.ok) {{
+      location.reload();
+    }} else {{
+      alert('Cancel failed: ' + (data.error || 'unknown — order may have already filled or been cancelled'));
+    }}
+  }} catch (e) {{
+    alert('Request failed: ' + e);
+  }}
+}}
+
+// Archive a position locally — no on-chain redeem. Records the realized
+// P&L in the activity log so stats reconcile. Used when a losing position
+// isn't worth the gas to redeem (or the user just wants it off the table).
+async function archivePosition(conditionId, market, cashPnl, currentValue) {{
+  const pnl = parseFloat(cashPnl) || 0;
+  const val = parseFloat(currentValue) || 0;
+  const lossOrGain = pnl < 0 ? `loss of $${{Math.abs(pnl).toFixed(4)}}` : `P&L of $${{pnl.toFixed(4)}}`;
+  const valNote = val > 0.01 ? `\n\nNote: this position is still worth ~$${{val.toFixed(4)}} on-chain — archiving will NOT recover those funds.` : '';
+  const desc = `Archive "${{market}}"?\n\nDismisses the row from Open Positions and records the ${{lossOrGain}} in the activity log. No on-chain redeem (no gas).${{valNote}}`;
+  if (!confirm(desc)) return;
+  try {{
+    const resp = await fetch('/api/archive-position', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        condition_id: conditionId,
+        market: market,
+        cash_pnl: String(cashPnl),
+        current_value: String(currentValue),
+      }}),
+    }});
+    const data = await resp.json();
+    if (data.ok) {{
+      location.reload();
+    }} else {{
+      alert('Archive failed: ' + (data.error || 'unknown'));
     }}
   }} catch (e) {{
     alert('Request failed: ' + e);
@@ -9901,14 +10175,26 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
     : '—';
 
   const warn = dry
-    ? `<div style="background:#4a1818;color:#f5b7b1;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ No bids ≥ $${{limitFloor.toFixed(4)}} — the book is too thin to sell without dumping. Lower the floor at your own risk.</div>`
+    ? `<div style="background:#1f2d3d;color:#9fc4ff;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">No bids ≥ $${{limitFloor.toFixed(4)}} on the book right now. Placing as a <b>resting sell</b> for <b>${{requested.toFixed(2)}}</b> shares — it will live on the book until a buyer reaches your floor (or you cancel it via Active Orders). The CLOB matcher cannot fill below $${{limitFloor.toFixed(4)}}, so no nasty surprises.</div>`
     : partial
-    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial fill: only ${{fillable.toFixed(2)}} of ${{requested.toFixed(2)}} shares clear the floor. The rest would require selling below $${{limitFloor.toFixed(4)}}.</div>`
+    ? `<div style="background:#3a2a0e;color:#fce28e;padding:0.5em 0.8em;border-radius:4px;margin-top:0.5em;font-size:0.9em">⚠ Partial: ${{fillable.toFixed(2)}} of ${{requested.toFixed(2)}} shares cross the floor. The remaining <b>${{(requested - fillable).toFixed(2)}}</b> shares will rest on the book at $${{limitFloor.toFixed(4)}} until a buyer reaches them.</div>`
     : '';
 
-  const execBtn = dry
-    ? `<button class="action-btn" disabled style="opacity:0.4;cursor:not-allowed">Execute sell</button>`
-    : `<button class="action-btn sell-btn" onclick="executeSell('${{conditionId}}','${{outcome}}',${{JSON.stringify(market).replace(/"/g,'&quot;')}},'${{fillable}}','${{limitFloor}}')">Execute sell</button>`;
+  // When the book is dry at the floor, place the FULL requested size
+  // as a resting order (rest=true → server skips the auto-cancel).
+  // When some fills are available, sell those marketable shares; any
+  // partial remainder is also placed at the floor as a rest order
+  // (always size = requested, never just `fillable`).
+  const sellSize = requested > 0 ? requested : fillable;
+  const restFlag = dry || partial ? 'true' : 'false';
+  const btnLabel = dry
+    ? 'Place resting sell at $' + limitFloor.toFixed(2)
+    : partial
+    ? 'Sell now + rest the remainder'
+    : 'Execute sell';
+  const execBtn = sellSize > 0
+    ? `<button class="action-btn sell-btn" onclick="executeSell('${{conditionId}}','${{outcome}}',${{JSON.stringify(market).replace(/"/g,'&quot;')}},'${{sellSize}}','${{limitFloor}}',${{restFlag}})">${{btnLabel}}</button>`
+    : `<button class="action-btn" disabled style="opacity:0.4;cursor:not-allowed">No shares to sell</button>`;
 
   body.innerHTML = `
     <div style="margin-bottom:1em">
@@ -9921,9 +10207,10 @@ function showSellModal(conditionId, outcome, market, heldShares, p) {{
       <div>Best bid: <b>${{bestBid != null ? '$' + bestBid.toFixed(3) : '—'}}</b></div>
       <div style="background:#1f2d3d;padding:0.4em 0.6em;border-radius:3px;margin:0.3em 0">
         <span style="color:#c9d1d9">Minimum price floor: </span>
-        <input id="sell-floor-input" type="number" min="0.01" max="0.99" step="0.01"
-               value="${{limitFloor.toFixed(2)}}"
-               style="width:5em;padding:0.2em 0.3em;background:#0d1117;color:#58a6ff;border:1px solid #30363d;border-radius:3px;font-family:inherit;font-weight:600">
+        <input id="sell-floor-input" type="number" min="0.001" max="0.999" step="0.001"
+               value="${{limitFloor.toFixed(3)}}"
+               title="Up to 3 dp. Most markets have 0.01 ticks; some accept 0.001. CLOB will reject if your tick is too fine for this market."
+               style="width:6em;padding:0.2em 0.3em;background:#0d1117;color:#58a6ff;border:1px solid #30363d;border-radius:3px;font-family:inherit;font-weight:600">
         <button class="action-btn" style="padding:0.15em 0.5em;margin-left:0.3em;font-size:0.8em"
                 onclick="applySellFloor('${{conditionId}}','${{outcome}}',${{JSON.stringify(market).replace(/"/g,'&quot;')}},${{heldShares}})">Apply</button>
         <span style="color:#8b949e;font-size:0.8em"> — slippage from best bid: ${{slippagePct}}%</span>
@@ -9951,8 +10238,8 @@ function applySellFloor(conditionId, outcome, market, heldShares) {{
   const el = document.getElementById('sell-floor-input');
   if (!el) return;
   const v = parseFloat(el.value);
-  if (!Number.isFinite(v) || v <= 0 || v >= 1) {{
-    alert('Floor must be between 0.01 and 0.99');
+  if (!Number.isFinite(v) || v < 0.001 || v > 0.999) {{
+    alert('Floor must be between 0.001 and 0.999');
     return;
   }}
   refreshSellPreview(conditionId, outcome, market, heldShares, v);
@@ -9963,7 +10250,7 @@ function closeSellModal() {{
   if (modal) modal.style.display = 'none';
 }}
 
-async function executeSell(conditionId, outcome, market, shares, minPrice) {{
+async function executeSell(conditionId, outcome, market, shares, minPrice, rest) {{
   closeSellModal();
   try {{
     const resp = await fetch('/api/sell', {{
@@ -9975,6 +10262,7 @@ async function executeSell(conditionId, outcome, market, shares, minPrice) {{
         market: market,
         shares: String(shares),
         min_price: String(minPrice),
+        rest: rest === true || rest === 'true',
       }}),
     }});
     const data = await resp.json();
@@ -9982,13 +10270,13 @@ async function executeSell(conditionId, outcome, market, shares, minPrice) {{
       const e = data.entry;
       const filled = parseFloat(data.filled_shares) || 0;
       const rev = parseFloat(data.gross_revenue) || 0;
-      alert(
-        `${{e.strategy}} OK\n` +
-        `Filled ${{filled.toFixed(2)}} ${{outcome}} shares\n` +
-        `Gross revenue: $${{rev.toFixed(4)}}\n` +
-        `Avg price: $${{parseFloat(data.avg_price).toFixed(4)}}\n\n` +
-        `${{e.status}}`
-      );
+      const isResting = data.is_resting === true;
+      const restingMsg = isResting && filled <= 0
+        ? `Resting on book at $${{parseFloat(minPrice).toFixed(4)}} for ${{parseFloat(shares).toFixed(2)}} ${{outcome}} shares.\nWill fill when a buyer reaches your floor.\nVisible in /trades → Active Orders.\n\n${{e.status}}`
+        : isResting && filled < parseFloat(shares)
+        ? `Filled ${{filled.toFixed(2)}} of ${{parseFloat(shares).toFixed(2)}} ${{outcome}} shares immediately.\nRemaining ${{(parseFloat(shares) - filled).toFixed(2)}} resting at $${{parseFloat(minPrice).toFixed(4)}}.\n\n${{e.status}}`
+        : `Filled ${{filled.toFixed(2)}} ${{outcome}} shares\nGross revenue: $${{rev.toFixed(4)}}\nAvg price: $${{parseFloat(data.avg_price).toFixed(4)}}\n\n${{e.status}}`;
+      alert(`${{e.strategy}} OK\n${{restingMsg}}`);
       location.reload();
     }} else {{
       alert('Sell failed: ' + (data.error || (data.entry ? data.entry.status : 'unknown')));
@@ -10002,6 +10290,20 @@ async function executeSell(conditionId, outcome, market, shares, minPrice) {{
         geoblock_banner = geoblock_banner,
         stats_html = stats_html,
         positions_rows = positions_rows,
+        archived_section = if archived_rows.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<h2>Archived Positions <span style="color:#666;font-size:0.8em">(locally dismissed — tokens still held on-chain; click Unarchive to restore)</span></h2>
+<table>
+  <tr><th>Market</th><th>Recorded P&amp;L</th><th>Archived</th><th>Actions</th></tr>
+  {archived_rows}
+</table>"#,
+                archived_rows = archived_rows,
+            )
+        },
+        active_orders_rows = active_orders_rows,
+        recent_fills_rows = recent_fills_rows,
         activity_rows = activity_rows,
     );
 
@@ -10219,7 +10521,6 @@ async fn dashboard_html(State(state): State<AppState>) -> Html<String> {
   <a href="/trades">Trades</a>
   <a href="/weather">Weather</a>
   <a href="/observations">Observations</a>
-  <a href="/paper-trades">Paper Trades</a>
   <a href="/arb">Arb</a>
 </div>
 <div class="subtitle">Mode: <b style="color:{mode_color}">{mode}</b> | Buy limit: ${max_buy} | Scan: <b style="color:{scan_color}">{scan_label}</b></div>
@@ -10556,18 +10857,22 @@ function renderOutcomes(idx, data) {{
 
 // ── Harvest ────────────────────────────────────────────────────────────
 // Two-step flow: preview shows both strategies, user picks one,
-// then we execute.
-async function harvest(marketIdx, winnerIdx, label, question) {{
-  // 1. Fetch the preview
+// then we execute. Optional `budgetOverride` lets the modal re-preview
+// at a custom $ amount (e.g. $1) without losing the modal context.
+async function harvest(marketIdx, winnerIdx, label, question, budgetOverride) {{
+  const body = {{
+    market_idx: marketIdx,
+    winner_idx: winnerIdx,
+    label: label,
+    market_question: question,
+  }};
+  if (budgetOverride != null && budgetOverride !== '') {{
+    body.max_cost_usd = String(budgetOverride);
+  }}
   const previewResp = await fetch('/api/harvest-preview', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{
-      market_idx: marketIdx,
-      winner_idx: winnerIdx,
-      label: label,
-      market_question: question,
-    }}),
+    body: JSON.stringify(body),
   }});
   const preview = await previewResp.json();
   if (preview.error) {{
@@ -10575,8 +10880,21 @@ async function harvest(marketIdx, winnerIdx, label, question) {{
     return;
   }}
 
-  // 2. Build strategy cards and let the user pick
+  // Build strategy cards and let the user pick
   showStrategyModal(marketIdx, winnerIdx, label, question, preview);
+}}
+
+// Re-run the harvest preview at the budget currently entered in the
+// modal's input. Keeps the modal open and re-renders the cards.
+async function applyHarvestBudget(marketIdx, winnerIdx, label, question) {{
+  const el = document.getElementById('harvest-budget-input');
+  if (!el) return;
+  const v = parseFloat(el.value);
+  if (!Number.isFinite(v) || v <= 0) {{
+    alert('Budget must be a positive number');
+    return;
+  }}
+  await harvest(marketIdx, winnerIdx, label, question, v);
 }}
 
 function showStrategyModal(marketIdx, winnerIdx, label, question, preview) {{
@@ -10633,10 +10951,27 @@ function showStrategyModal(marketIdx, winnerIdx, label, question, preview) {{
       <div style="color:#8b949e;font-size:0.85em">Not viable — loser outcomes lack bids.</div>
     </div>`;
 
+  // Budget override: input pre-filled with the effective budget (which
+  // already reflects any prior override). `globalMax` is the hard cap —
+  // typing higher than this still gets clamped server-side, but the
+  // input's max attribute keeps the spinner sane.
+  const globalMax = preview.global_max_trade || budget;
+  const escQ = JSON.stringify(question).replace(/"/g, '&quot;');
+  const escL = label.replace(/'/g, "\\\\'");
+
   body.innerHTML = `
     <div style="margin-bottom:1em">
       <div style="font-size:1.1em">${{question}}</div>
-      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">Winner: <b>${{label}}</b> · per-trade budget <b>$${{budget}}</b></div>
+      <div style="color:#8b949e;font-size:0.85em;margin-top:0.25em">Winner: <b>${{label}}</b> · per-trade budget <b>$${{budget}}</b> <span style="color:#666">(global cap $${{globalMax}})</span></div>
+    </div>
+    <div style="background:#1f2d3d;padding:0.5em 0.75em;border-radius:4px;margin-bottom:1em;display:flex;gap:0.5em;align-items:center">
+      <span style="color:#c9d1d9;font-size:0.9em">Budget override:</span>
+      <span style="color:#8b949e">$</span>
+      <input id="harvest-budget-input" type="number" min="0.01" step="0.01" max="${{globalMax}}"
+             value="${{budget}}"
+             style="width:7em;padding:0.25em 0.4em;background:#0d1117;color:#58a6ff;border:1px solid #30363d;border-radius:3px;font-family:inherit;font-weight:600">
+      <button class="action-btn" style="padding:0.25em 0.7em" onclick="applyHarvestBudget(${{marketIdx}},${{winnerIdx}},'${{escL}}',${{escQ}})">Apply</button>
+      <span style="color:#8b949e;font-size:0.8em">— shrink-only; clamped to global cap</span>
     </div>
     <div style="display:flex;gap:1em;flex-wrap:wrap">
       ${{buyCard}}
@@ -10655,18 +10990,27 @@ function closeStrategyModal() {{
 }}
 
 async function executeHarvest(marketIdx, winnerIdx, label, question, strategy) {{
+  // Capture the budget override BEFORE closing the modal — the input
+  // disappears with the modal. Empty / invalid → server uses the
+  // configured per-trade cap (state.max_trade).
+  const budgetEl = document.getElementById('harvest-budget-input');
+  const budgetVal = budgetEl ? parseFloat(budgetEl.value) : NaN;
+  const body = {{
+    market_idx: marketIdx,
+    winner_idx: winnerIdx,
+    label: label,
+    market_question: question,
+    strategy: strategy,
+  }};
+  if (Number.isFinite(budgetVal) && budgetVal > 0) {{
+    body.max_cost_usd = String(budgetVal);
+  }}
   closeStrategyModal();
   try {{
     const resp = await fetch('/api/harvest', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{
-        market_idx: marketIdx,
-        winner_idx: winnerIdx,
-        label: label,
-        market_question: question,
-        strategy: strategy,
-      }}),
+      body: JSON.stringify(body),
     }});
     const data = await resp.json();
     if (data.ok) {{

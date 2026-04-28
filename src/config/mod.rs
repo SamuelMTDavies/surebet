@@ -433,11 +433,16 @@ fn default_resolution_ahead_hours() -> i64 {
 fn default_ctf_address() -> String {
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string()
 }
+// V2 exchange addresses (post-Polymarket V2 migration). The legacy V1
+// contracts (0xC5d563...20f80a and 0x4bFb41...8982E) still exist on-chain for
+// historical orders but reject new signatures — V2 bumped the EIP-712 domain
+// version to "2" and rewrote the exchange contracts.
+// Source: https://docs.polymarket.com/v2-migration
 fn default_neg_risk_ctf_exchange() -> String {
-    "0xC5d563A36AE78145C45a50134d48A1215220f80a".to_string()
+    "0xe2222d279d744050d28e00520010520000310F59".to_string()
 }
 fn default_ctf_exchange() -> String {
-    "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".to_string()
+    "0xE111180000d2663C0091e4f400237545B87B996B".to_string()
 }
 fn default_neg_risk_adapter() -> String {
     "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".to_string()

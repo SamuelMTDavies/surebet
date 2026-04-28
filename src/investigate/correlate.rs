@@ -12,7 +12,7 @@ use std::time::Duration;
 use alloy::primitives::{b256, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
-use polymarket_client_sdk::data::types::Side;
+use polymarket_client_sdk_v2::data::types::Side;
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
@@ -234,7 +234,7 @@ fn find_nearest(event_timestamps: &[u64], trade_ts: i64) -> Option<(u64, i64)> {
 async fn fetch_all_market_events(
     rpc_url: &str,
     trades_by_cid: &HashMap<String, Vec<usize>>,
-    trades: &[polymarket_client_sdk::data::types::response::Trade],
+    trades: &[polymarket_client_sdk_v2::data::types::response::Trade],
 ) -> Result<HashMap<String, MarketEvents>> {
     // Connect to RPC
     info!(rpc_url, "connecting to Polygon RPC");
