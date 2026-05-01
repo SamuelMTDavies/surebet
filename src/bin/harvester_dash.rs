@@ -25,6 +25,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use polymarket_client_sdk_v2::auth::Normal as NormalAuth;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::{Credentials as SdkCredentials, Uuid as SdkUuid};
 use polymarket_client_sdk_v2::clob::types::{OrderType as SdkOrderType, Side as SdkSide};
 use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkClobConfig};
 use polymarket_client_sdk_v2::ctf::types::{
@@ -504,12 +505,17 @@ struct OrderClient {
 }
 
 impl OrderClient {
-    /// Build the authenticated SDK client from a private key.
-    async fn new(host: &str, private_key: &str) -> anyhow::Result<Self> {
+    /// Build the authenticated SDK client from a private key + pre-derived L2
+    /// credentials. Passing the credentials skips the SDK's `POST /auth/api-key`
+    /// call, which Cloudflare's WAF on `clob.polymarket.com` blocks for
+    /// non-browser TLS fingerprints. Once authenticated, the SDK only signs
+    /// `/order`, `/orders`, `/trades` etc., which pass through Cloudflare fine.
+    async fn new(host: &str, private_key: &str, creds: SdkCredentials) -> anyhow::Result<Self> {
         let signer = LocalSigner::from_str(private_key)?.with_chain_id(Some(POLYGON));
         let config = SdkClobConfig::builder().use_server_time(true).build();
         let client = SdkClobClient::new(host, config)?
             .authentication_builder(&signer)
+            .credentials(creds)
             .authenticate()
             .await
             .map_err(|e| anyhow::anyhow!("SDK authenticate failed: {}", e))?;
@@ -1080,18 +1086,36 @@ async fn main() -> Result<()> {
     // requirement. Requires POLYMARKET_PRIVATE_KEY in the environment.
     let order_client: Option<Arc<OrderClient>> = if live_mode && api.is_some() {
         match std::env::var("POLYMARKET_PRIVATE_KEY") {
-            Ok(pk) => match OrderClient::new(&clob_url, &pk).await {
-                Ok(oc) => {
-                    println!("  SDK order client ready (EIP-712 signing enabled)");
-                    Some(Arc::new(oc))
+            Ok(pk) => {
+                let sdk_creds = match SdkUuid::parse_str(&config.polymarket.api_key) {
+                    Ok(uuid) => Some(SdkCredentials::new(
+                        uuid,
+                        config.polymarket.api_secret.clone(),
+                        config.polymarket.api_passphrase.clone(),
+                    )),
+                    Err(e) => {
+                        println!(
+                            "WARNING: POLY_API_KEY is not a valid UUID ({e}) — order placement disabled"
+                        );
+                        None
+                    }
+                };
+                match sdk_creds {
+                    Some(c) => match OrderClient::new(&clob_url, &pk, c).await {
+                        Ok(oc) => {
+                            println!("  SDK order client ready (EIP-712 signing enabled)");
+                            Some(Arc::new(oc))
+                        }
+                        Err(e) => {
+                            println!(
+                                "WARNING: SDK order client init failed: {e} — order placement disabled"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
                 }
-                Err(e) => {
-                    println!(
-                        "WARNING: SDK order client init failed: {e} — order placement disabled"
-                    );
-                    None
-                }
-            },
+            }
             Err(_) => {
                 println!(
                     "WARNING: POLYMARKET_PRIVATE_KEY not set — order placement disabled"
